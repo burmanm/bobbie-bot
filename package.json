@@ -7,7 +7,11 @@
   "engines": {
     "node": ">=22.19.0"
   },
+  "bin": {
+    "review-bot": "src/cli/main.ts"
+  },
   "scripts": {
+    "review-bot": "node src/cli/main.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test \"src/**/*.test.ts\" \"pi-review/**/*.test.ts\""
   },
