@@ -1,0 +1,350 @@
+{
+  "reviewer": [
+    {
+      "toolCalls": [
+        {
+          "name": "report_finding",
+          "arguments": {
+            "traced": [
+              "pkg/store/store.go:24-32 Reset and Put",
+              "pkg/store/store.go:10-13 New"
+            ],
+            "assumed": [],
+            "mechanizable": {
+              "possible": false
+            },
+            "confidence": 0.9,
+            "tag": "important",
+            "category": "correctness",
+            "locations": [
+              {
+                "path": "pkg/store/store.go",
+                "startLine": 31,
+                "endLine": 31
+              },
+              {
+                "path": "pkg/store/store.go",
+                "startLine": 26,
+                "endLine": 26
+              }
+            ],
+            "title": "Put after Reset panics on a nil map",
+            "body": "Reset sets s.items to nil, and Put writes to s.items without re-creating it. Any caller that calls Put after Reset panics with \"assignment to entry in nil map\". Every Reset followed by a Put triggers it.",
+            "evidence": [
+              {
+                "root": "head",
+                "path": "pkg/store/store.go",
+                "startLine": 26,
+                "endLine": 26,
+                "quote": "s.items = nil"
+              },
+              {
+                "root": "head",
+                "path": "pkg/store/store.go",
+                "startLine": 31,
+                "endLine": 31,
+                "quote": "s.items[key] = value"
+              }
+            ],
+            "suggestion": "\tif s.items == nil {\n\t\ts.items = map[string]string{}\n\t}\n\ts.items[key] = value",
+            "ruleRefs": [
+              "REVIEW.md: Focus on 1"
+            ]
+          }
+        },
+        {
+          "name": "report_finding",
+          "arguments": {
+            "traced": [],
+            "assumed": [],
+            "mechanizable": {
+              "possible": false
+            },
+            "confidence": 0.4,
+            "tag": "important",
+            "category": "correctness",
+            "locations": [
+              {
+                "path": "pkg/store/store.go",
+                "startLine": 26,
+                "endLine": 26
+              }
+            ],
+            "title": "Get panics on a reset store",
+            "body": "After Reset, Get reads from a nil map and panics.",
+            "evidence": [
+              {
+                "root": "head",
+                "path": "pkg/store/store.go",
+                "startLine": 17,
+                "endLine": 17,
+                "quote": "v, ok := s.items[key]"
+              }
+            ]
+          }
+        },
+        {
+          "name": "report_finding",
+          "arguments": {
+            "traced": [],
+            "assumed": [],
+            "mechanizable": {
+              "possible": false
+            },
+            "confidence": 0.7,
+            "tag": "nit",
+            "category": "docs",
+            "locations": [
+              {
+                "path": "pkg/store/store.go",
+                "startLine": 24,
+                "endLine": 24
+              }
+            ],
+            "title": "Reset's comment does not say whether the store stays usable",
+            "body": "Callers cannot tell from the comment whether Put works after Reset.",
+            "evidence": [
+              {
+                "root": "head",
+                "path": "pkg/store/store.go",
+                "startLine": 24,
+                "endLine": 24,
+                "quote": "// Reset drops all values."
+              }
+            ]
+          }
+        },
+        {
+          "name": "report_finding",
+          "arguments": {
+            "traced": [],
+            "assumed": [],
+            "mechanizable": {
+              "possible": false
+            },
+            "confidence": 0.7,
+            "tag": "nit",
+            "category": "docs",
+            "locations": [
+              {
+                "path": "pkg/store/store.go",
+                "startLine": 29,
+                "endLine": 29
+              }
+            ],
+            "title": "Put's comment repeats the code",
+            "body": "The comment restates the signature.",
+            "evidence": [
+              {
+                "root": "head",
+                "path": "pkg/store/store.go",
+                "startLine": 29,
+                "endLine": 29,
+                "quote": "// Put stores value under key"
+              }
+            ]
+          }
+        },
+        {
+          "name": "report_finding",
+          "arguments": {
+            "traced": [],
+            "assumed": [],
+            "mechanizable": {
+              "possible": false
+            },
+            "confidence": 0.7,
+            "tag": "pre-existing",
+            "category": "error-handling",
+            "locations": [
+              {
+                "path": "pkg/store/store.go",
+                "startLine": 19,
+                "endLine": 19
+              }
+            ],
+            "title": "Get returns an untyped not-found error",
+            "body": "Callers cannot tell a missing key from another failure without comparing strings.",
+            "evidence": [
+              {
+                "root": "head",
+                "path": "pkg/store/store.go",
+                "startLine": 19,
+                "endLine": 19,
+                "quote": "return \"\", errors.New(\"not found\")"
+              }
+            ],
+            "proposedIssue": "store.Get returns an untyped not-found error (existing issues not checked)"
+          }
+        },
+        {
+          "name": "report_finding",
+          "arguments": {
+            "traced": [],
+            "assumed": [],
+            "mechanizable": {
+              "possible": false
+            },
+            "confidence": 0.7,
+            "tag": "important",
+            "category": "correctness",
+            "locations": [
+              {
+                "path": "pkg/store/store.go",
+                "startLine": 30,
+                "endLine": 30
+              }
+            ],
+            "title": "Put drops the value when key is empty",
+            "body": "An empty key is silently ignored.",
+            "evidence": [
+              {
+                "root": "head",
+                "path": "pkg/store/store.go",
+                "startLine": 30,
+                "endLine": 30,
+                "quote": "if key == \"\" { return }"
+              }
+            ]
+          }
+        },
+        {
+          "name": "report_finding",
+          "arguments": {
+            "traced": [],
+            "assumed": [],
+            "mechanizable": {
+              "possible": false
+            },
+            "confidence": 0.7,
+            "tag": "nit",
+            "category": "tests",
+            "locations": [
+              {
+                "path": "pkg/store/store_test.go",
+                "startLine": 7,
+                "endLine": 7
+              }
+            ],
+            "title": "The test does not cover Reset",
+            "body": "TestPutGet never calls Reset.",
+            "evidence": [
+              {
+                "root": "head",
+                "path": "pkg/store/store_test.go",
+                "startLine": 7,
+                "endLine": 7,
+                "quote": "s.Put(\"a\", \"1\")"
+              }
+            ]
+          }
+        },
+        {
+          "name": "report_finding",
+          "arguments": {
+            "tag": "critical",
+            "category": "correctness",
+            "locations": [
+              {
+                "path": "pkg/store/store.go",
+                "startLine": 26,
+                "endLine": 26
+              }
+            ],
+            "title": "bad",
+            "body": "bad",
+            "evidence": [],
+            "traced": [],
+            "assumed": [],
+            "mechanizable": {
+              "possible": false
+            },
+            "confidence": 1
+          }
+        },
+        {
+          "name": "ask_question",
+          "arguments": {
+            "locations": [
+              {
+                "path": "pkg/store/store.go",
+                "startLine": 30,
+                "endLine": 30
+              }
+            ],
+            "body": "Put replaces an existing value without a warning (a stated trade-off). Can a caller rely on the old value still being there?"
+          }
+        },
+        {
+          "name": "note_needs_human",
+          "arguments": {
+            "what": "changed test data",
+            "locations": [
+              {
+                "path": "pkg/store/store_test.go",
+                "startLine": 7,
+                "endLine": 7
+              }
+            ],
+            "explainedInDescription": false
+          }
+        },
+        {
+          "name": "note_checked",
+          "arguments": {
+            "item": "Callers of Put and Reset: none outside pkg/store."
+          }
+        },
+        {
+          "name": "note_not_run",
+          "arguments": {
+            "item": "go test ./pkg/store/ (the bot never runs code)."
+          }
+        }
+      ]
+    },
+    {
+      "text": "Reviewed every file in the change map."
+    }
+  ],
+  "verifier": [
+    {
+      "toolCalls": [
+        {
+          "name": "submit_verdict",
+          "arguments": {
+            "verdict": "confirmed",
+            "reasoning": "Reset assigns nil and Put writes without re-creating the map.",
+            "evidence": []
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    },
+    {
+      "toolCalls": [
+        {
+          "name": "submit_verdict",
+          "arguments": {
+            "verdict": "refuted",
+            "reasoning": "Reading a nil map returns the zero value; Get only reads.",
+            "evidence": [
+              {
+                "root": "head",
+                "path": "pkg/store/store.go",
+                "startLine": 17,
+                "endLine": 17,
+                "quote": "v, ok := s.items[key]"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "text": "Done."
+    }
+  ]
+}

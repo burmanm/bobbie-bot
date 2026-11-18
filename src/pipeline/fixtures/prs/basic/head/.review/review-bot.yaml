@@ -1,0 +1,6 @@
+# Bot settings only (A-5). No models here: the tests pass them as inputs.
+limits:
+  verifier:
+    maxTurns: 20
+skip:
+  labels: [round-cap, ai-review/skip]
