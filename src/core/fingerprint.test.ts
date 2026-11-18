@@ -28,7 +28,7 @@ test("sliceLines handles CRLF, trailing newline, no trailing newline, out of ran
 });
 
 test("fingerprintFinding reads the anchor from head; same code moved keeps the fingerprint", () => {
-  const v1: FileLookup = (root, path) => (root === "head" && path === "pkg/a.go" ? "x\ny\nm[k] = v\n" : undefined);
+  const v1: FileLookup = (root, path) => (root === "head" && path === "pkg/a.go" ? "x\ny\nz\nm[k] = v\n" : undefined);
   const v2: FileLookup = (root, path) => (root === "head" && path === "pkg/a.go" ? "x\ny\nnew\n\n  m[k]  =  v\n" : undefined);
   const f1 = producer();
   const f2 = producer({ locations: [{ path: "pkg/a.go", startLine: 5, endLine: 5 }] });

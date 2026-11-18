@@ -5,10 +5,10 @@ export function producer(over: Partial<ProducerFinding> = {}): ProducerFinding {
   return {
     tag: "important",
     category: "correctness",
-    locations: [{ path: "pkg/a.go", startLine: 3, endLine: 3 }],
+    locations: [{ path: "pkg/a.go", startLine: 4, endLine: 4 }],
     title: "Nil map write",
     body: "Writing to a nil map panics on every reconcile of a new datacenter.",
-    evidence: [{ root: "head", path: "pkg/a.go", startLine: 3, endLine: 3, quote: "m[k] = v" }],
+    evidence: [{ root: "head", path: "pkg/a.go", startLine: 4, endLine: 4, quote: "m[k] = v" }],
     traced: ["pkg/a.go:1-5"],
     assumed: [],
     mechanizable: { possible: false },
