@@ -37,6 +37,11 @@ export interface ReadRoots {
   head: string;
   base?: string;
   modcache?: string;
+  /**
+   * Run-directory inputs the orchestrator prepared for the step (S-0, S-3):
+   * `context.md` and `patches/`. Readable, never citable as evidence.
+   */
+  inputs?: string;
 }
 
 export interface StepLimits {

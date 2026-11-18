@@ -269,3 +269,31 @@ describe("configuration errors fail before any model call", () => {
     }
   });
 });
+
+describe("inputs root (S-0, S-3)", () => {
+  test("files under the inputs root are readable; the root is named in the system prompt", async () => {
+    const inputs = realpathSync(mkdtempSync(join(tmpdir(), "review-bot-inputs-")));
+    writeFileSync(join(inputs, "context.md"), "INPUTS-MARKER-3301\n");
+    let seen: ReturnType<typeof toolResultsIn> = [];
+    let system = "";
+    try {
+      const { step, request } = setup([
+        (context) => {
+          system = JSON.stringify(context.messages);
+          return fauxAssistantMessage([fauxToolCall("read", { path: join(inputs, "context.md") }, { id: "r1" })], { stopReason: "toolUse" });
+        },
+        (context) => {
+          seen = toolResultsIn(context);
+          return fauxAssistantMessage(fauxText("DONE"));
+        },
+      ]);
+      const result = await step.run(request({ roots: { head, inputs } }));
+      assert.equal(result.outcome, "ok", JSON.stringify(result.error));
+      assert.equal(seen.find((r) => r.toolCallId === "r1")?.isError, false);
+      assert.match(seen.find((r) => r.toolCallId === "r1")?.text ?? "", /INPUTS-MARKER-3301/);
+      assert.match(system, new RegExp(`inputs: ${inputs.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    } finally {
+      rmSync(inputs, { recursive: true, force: true });
+    }
+  });
+});
