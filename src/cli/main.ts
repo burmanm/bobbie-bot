@@ -139,6 +139,7 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
     // PR source and snapshots.
     let reader: PrReader;
     let snapshots: SnapshotSource;
+    let prRef: { repo: string; number: number } | undefined;
     if (args.fixture !== undefined) {
       const fixture = new FixturePrReader(resolve(args.fixture));
       reader = fixture;
@@ -146,6 +147,7 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
     } else {
       const ref = parsePrRef(args.pr!);
       if (ref === undefined) throw new UsageError(`cannot parse --pr ${args.pr}; use owner/repo#123 or a PR URL`);
+      prRef = ref;
       reader = new GhPrReader(ref.repo, ref.number);
       snapshots = args["repo-dir"] !== undefined ? new GitArchiveSnapshots(resolve(args["repo-dir"])) : new GhTarballSnapshots(ref.repo);
     }
@@ -198,6 +200,7 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       ...(modcache === undefined ? {} : { modcache }),
       runsDir: resolve(args["runs-dir"] ?? join(tmpdir(), "review-bot-runs")),
       trigger: "cli-dry-run",
+      ...(prRef === undefined ? {} : { prRef }),
       signal: controller.signal,
       log,
     });

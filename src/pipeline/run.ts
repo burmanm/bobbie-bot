@@ -84,6 +84,8 @@ export interface ReviewRunOptions {
   log?: (line: string) => void;
   /** Where the pi package lives (method skill and prompts). */
   methodDir?: string;
+  /** The PR as the caller named it, so a record has an identity even when reading the PR fails (S-9). */
+  prRef?: { repo: string; number: number };
 }
 
 export interface ReviewRunResult {
@@ -665,7 +667,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     return {
       tool: RUN_RECORD_TOOL,
       toolVersion: BOT_VERSION,
-      repo: pr?.repo ?? "",
+      repo: pr?.repo ?? o.prRef?.repo ?? "",
       generatedAt: finishedAt.toISOString(),
       metrics: runMetrics(findings, steps, Math.round(performance.now() - started)),
       findings,
@@ -673,7 +675,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       needsHuman,
       run: {
         schemaVersion: RUN_RECORD_SCHEMA_VERSION,
-        prNumber: pr?.number ?? 0,
+        prNumber: pr?.number ?? o.prRef?.number ?? 0,
         baseSha: pr?.baseSha ?? "",
         headSha: pr?.headSha ?? "",
         runId,
