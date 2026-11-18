@@ -66,8 +66,8 @@
             "locations": [
               {
                 "path": "pkg/store/store.go",
-                "startLine": 26,
-                "endLine": 26
+                "startLine": 25,
+                "endLine": 25
               }
             ],
             "title": "Get panics on a reset store",

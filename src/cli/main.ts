@@ -74,14 +74,24 @@ function pairs(values: string[] | undefined, what: string): Map<PipelineRole, st
   return out;
 }
 
-export async function main(argv: string[]): Promise<number> {
+export interface Io {
+  stdout(text: string): void;
+  stderr(text: string): void;
+}
+
+const processIo: Io = {
+  stdout: (t) => void process.stdout.write(t),
+  stderr: (t) => void process.stderr.write(t),
+};
+
+export async function main(argv: string[], io: Io = processIo): Promise<number> {
   const [command, ...rest] = argv;
   if (command === undefined || command === "--help" || command === "-h") {
-    process.stdout.write(USAGE);
+    io.stdout(USAGE);
     return command === undefined ? 2 : 0;
   }
   if (command !== "review") {
-    process.stderr.write(`unknown command: ${command}\n\n${USAGE}`);
+    io.stderr(`unknown command: ${command}\n\n${USAGE}`);
     return 2;
   }
 
@@ -113,11 +123,11 @@ export async function main(argv: string[]): Promise<number> {
       allowPositionals: false,
     }).values;
   } catch (e) {
-    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n\n${USAGE}`);
+    io.stderr(`${e instanceof Error ? e.message : String(e)}\n\n${USAGE}`);
     return 2;
   }
   if (args.help) {
-    process.stdout.write(USAGE);
+    io.stdout(USAGE);
     return 0;
   }
 
@@ -176,7 +186,7 @@ export async function main(argv: string[]): Promise<number> {
     const onSignal = () => controller.abort();
     process.once("SIGINT", onSignal);
     process.once("SIGTERM", onSignal);
-    const log = args.quiet ? () => {} : (line: string) => process.stderr.write(`[review-bot] ${line}\n`);
+    const log = args.quiet ? () => {} : (line: string) => io.stderr(`[review-bot] ${line}\n`);
 
     const result = await runReview({
       platform,
@@ -195,14 +205,14 @@ export async function main(argv: string[]): Promise<number> {
     process.off("SIGTERM", onSignal);
 
     const payload = JSON.stringify(platform.output, null, 2) + "\n";
-    process.stdout.write(payload);
+    io.stdout(payload);
     if (args.out !== undefined) writeFileSync(resolve(args.out), payload);
     log(`check ${result.conclusion}: ${result.checkSummary}`);
     if (result.runDir) log(`run directory ${result.runDir}`);
     return result.conclusion === "neutral" ? 1 : 0;
   } catch (e) {
     if (e instanceof UsageError) {
-      process.stderr.write(`${e.message}\n\n${USAGE}`);
+      io.stderr(`${e.message}\n\n${USAGE}`);
       return 2;
     }
     throw e;

@@ -16,7 +16,7 @@ const KNOWLEDGE = "knowledge-file";
 /** Neutralize anything that could open or close one of our delimiters, and HTML comments. */
 export function neutralizeDelimiters(text: string): string {
   return text
-    .replace(/<(\/?)\s*(untrusted-data|knowledge-file)/gi, "&lt;$1$2")
+    .replace(/<\s*(\/?)\s*(untrusted-data|knowledge-file)/gi, "&lt;$1$2")
     .replace(/<!--/g, "&lt;!--");
 }
 
@@ -25,7 +25,7 @@ function untrusted(label: string, text: string): string {
 }
 
 function knowledgeBlock(f: KnowledgeFile): string {
-  return `<${KNOWLEDGE} path="${f.path}">\n${f.text.replace(/<(\/?)\s*knowledge-file/gi, "&lt;$1knowledge-file").trimEnd()}\n</${KNOWLEDGE}>`;
+  return `<${KNOWLEDGE} path="${f.path}">\n${f.text.replace(/<\s*(\/?)\s*knowledge-file/gi, "&lt;$1knowledge-file").trimEnd()}\n</${KNOWLEDGE}>`;
 }
 
 export interface ContextInput {
