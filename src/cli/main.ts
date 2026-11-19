@@ -17,6 +17,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { PreparedSnapshots, preparedModcache } from "../ci/snapshot.ts";
+import { CI_COMMANDS, CI_USAGE, type CiCommand, runCi } from "./ci.ts";
 import {
   type AcpAgentConfig,
   type AgentStep,
@@ -39,8 +41,6 @@ import {
   type SnapshotSource,
 } from "../platform/index.ts";
 import { type ConfigInputs, PIPELINE_ROLES, type PipelineRole, runReview } from "../pipeline/index.ts";
-import { PreparedSnapshots, preparedModcache } from "../ci/snapshot.ts";
-import { CI_COMMANDS, CI_USAGE, type CiCommand, runCi } from "./ci.ts";
 
 const USAGE = `Usage:
   review-bot review --dry-run --pr <owner/repo#N | PR URL> [options]
