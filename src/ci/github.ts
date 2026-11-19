@@ -1,6 +1,7 @@
 /**
  * The few GitHub REST calls the CI jobs make outside the review pipeline
- * (C-4 gate, S-9 always-run check completion, C-4 label removal).
+ * (C-4 gate, C-9 waiting for CI, S-9 always-run check completion, C-4
+ * label removal).
  *
  * Deliberately small and separate from `src/platform/`: the gate runs
  * before any snapshot exists and needs calls the `Platform` interface does
@@ -34,6 +35,8 @@ export interface PullSummary {
   labels: string[];
   headSha: string;
   baseSha: string;
+  /** Base branch name (C-9 `required` reads its protection). */
+  baseRef: string;
 }
 
 export interface LabelEvent {
@@ -48,7 +51,34 @@ export interface CheckRunSummary {
   status: string;
   conclusion: string | null;
   app?: string;
+  startedAt?: string;
 }
+
+interface PullJson {
+  number: number;
+  state: string;
+  draft?: boolean;
+  user?: { login?: string; type?: string } | null;
+  labels?: Array<{ name?: string }>;
+  head: { sha: string };
+  base: { sha: string; ref?: string };
+}
+
+function pullSummary(pr: PullJson): PullSummary {
+  return {
+    number: pr.number,
+    state: pr.state === "open" ? "open" : "closed",
+    draft: pr.draft === true,
+    author: { login: pr.user?.login ?? "ghost", type: pr.user?.type ?? "User" },
+    labels: (pr.labels ?? []).map((l) => l.name ?? "").filter((n) => n !== ""),
+    headSha: pr.head.sha,
+    baseSha: pr.base.sha,
+    baseRef: pr.base.ref ?? "",
+  };
+}
+
+/** Pages read at most by one list call (100 items each). */
+const MAX_PAGES = 30;
 
 export interface CheckRunOutput {
   title: string;
@@ -126,25 +156,94 @@ export class Github {
     return `/repos/${this.repo}`;
   }
 
+  /**
+   * GET every page of a list. `pick` takes the items out of one page (an
+   * array, or the array inside an object such as `check_runs`).
+   */
+  private async pages<T>(path: string, pick: (page: unknown) => T[] | undefined): Promise<T[]> {
+    const out: T[] = [];
+    let next: string | undefined = path;
+    for (let page = 0; next !== undefined && page < MAX_PAGES; page++) {
+      const res = await this.call("GET", next);
+      const text = await res.text();
+      if (res.status !== 200) {
+        let message = "";
+        try {
+          message = (JSON.parse(text) as { message?: string }).message ?? "";
+        } catch {
+          message = "";
+        }
+        throw new GithubError(`GET ${next.replace(/^https?:\/\/[^/]+/, "").replace(/\?.*$/, "")}: HTTP ${res.status}${message ? ` ${message}` : ""}`, res.status);
+      }
+      out.push(...(pick(JSON.parse(text) as unknown) ?? []));
+      next = nextLink(res.headers.get("link"));
+    }
+    return out;
+  }
+
   async getPull(number: number): Promise<PullSummary> {
-    const pr = (await this.json<{
-      number: number;
-      state: string;
-      draft?: boolean;
-      user?: { login?: string; type?: string } | null;
-      labels?: Array<{ name?: string }>;
-      head: { sha: string };
-      base: { sha: string };
-    }>("GET", `${this.base()}/pulls/${number}`))!;
-    return {
-      number: pr.number,
-      state: pr.state === "open" ? "open" : "closed",
-      draft: pr.draft === true,
-      author: { login: pr.user?.login ?? "ghost", type: pr.user?.type ?? "User" },
-      labels: (pr.labels ?? []).map((l) => l.name ?? "").filter((n) => n !== ""),
-      headSha: pr.head.sha,
-      baseSha: pr.base.sha,
-    };
+    return pullSummary((await this.json<PullJson>("GET", `${this.base()}/pulls/${number}`))!);
+  }
+
+  /** Open PRs, oldest first (C-9: a `workflow_run` or `status` event names only a SHA). */
+  async listOpenPulls(): Promise<PullSummary[]> {
+    const all = await this.pages<PullJson>(`${this.base()}/pulls?state=open&sort=created&direction=asc&per_page=100`, (p) => p as PullJson[]);
+    return all.map(pullSummary);
+  }
+
+  /**
+   * Required status checks of classic branch protection, as the branch
+   * reports them to any reader (`protection.required_status_checks`).
+   */
+  async getBranchRequiredChecks(branch: string): Promise<string[]> {
+    const b = await this.json<{
+      protection?: { required_status_checks?: { contexts?: string[]; checks?: Array<{ context?: string }> } | null } | null;
+    }>("GET", `${this.base()}/branches/${branch.split("/").map(encodeURIComponent).join("/")}`, undefined, true);
+    const r = b?.protection?.required_status_checks;
+    if (!r) return [];
+    return [...(r.contexts ?? []), ...(r.checks ?? []).map((c) => c.context ?? "")].filter((n) => n !== "");
+  }
+
+  /** Required status checks from rulesets that apply to the branch. */
+  async getRulesetRequiredChecks(branch: string): Promise<string[]> {
+    const rules = await this.pages<{ type?: string; parameters?: { required_status_checks?: Array<{ context?: string }> } }>(
+      `${this.base()}/rules/branches/${branch.split("/").map(encodeURIComponent).join("/")}?per_page=100`,
+      (p) => p as never,
+    ).catch((e: unknown) => {
+      if (e instanceof GithubError && e.status === 404) return [];
+      throw e;
+    });
+    return rules
+      .filter((r) => r.type === "required_status_checks")
+      .flatMap((r) => (r.parameters?.required_status_checks ?? []).map((c) => c.context ?? ""))
+      .filter((n) => n !== "");
+  }
+
+  /** Every check run on the SHA (the latest of each), any name. */
+  async listCheckRuns(sha: string): Promise<Array<{ name: string; status: string; conclusion: string | null; completedAt?: string }>> {
+    const runs = await this.pages<{ name: string; status: string; conclusion: string | null; completed_at?: string | null }>(
+      `${this.base()}/commits/${encodeURIComponent(sha)}/check-runs?filter=latest&per_page=100`,
+      (p) => (p as { check_runs?: never[] }).check_runs,
+    );
+    return runs.map((r) => ({ name: r.name, status: r.status, conclusion: r.conclusion, ...(r.completed_at ? { completedAt: r.completed_at } : {}) }));
+  }
+
+  /** The latest commit status of each context on the SHA. */
+  async listStatuses(sha: string): Promise<Array<{ context: string; state: string; updatedAt?: string }>> {
+    const statuses = await this.pages<{ context: string; state: string; updated_at?: string }>(
+      `${this.base()}/commits/${encodeURIComponent(sha)}/status?per_page=100`,
+      (p) => (p as { statuses?: never[] }).statuses,
+    );
+    return statuses.map((s) => ({ context: s.context, state: s.state, ...(s.updated_at ? { updatedAt: s.updated_at } : {}) }));
+  }
+
+  /** Workflow runs for the SHA (needs `actions: read`). */
+  async listWorkflowRuns(sha: string): Promise<Array<{ id: number; name: string; status: string; conclusion: string | null; updatedAt?: string }>> {
+    const runs = await this.pages<{ id: number; name?: string | null; status: string; conclusion: string | null; updated_at?: string }>(
+      `${this.base()}/actions/runs?head_sha=${encodeURIComponent(sha)}&per_page=100`,
+      (p) => (p as { workflow_runs?: never[] }).workflow_runs,
+    );
+    return runs.map((r) => ({ id: r.id, name: r.name ?? "", status: r.status, conclusion: r.conclusion, ...(r.updated_at ? { updatedAt: r.updated_at } : {}) }));
   }
 
   /**
@@ -209,13 +308,29 @@ export class Github {
     return r!.id;
   }
 
+  /**
+   * C-9: `ai-review/<name>` as *queued* while the PR waits for CI. Its
+   * `started_at` is when the bot first saw the head SHA; the sweep times
+   * the wait from it.
+   */
+  async createQueuedCheck(name: string, headSha: string, output: CheckRunOutput, startedAt: string): Promise<number> {
+    const r = await this.json<{ id: number }>("POST", `${this.base()}/check-runs`, { name, head_sha: headSha, status: "queued", started_at: startedAt, output });
+    return r!.id;
+  }
+
+  /** Changes an open check run's status and text (not its conclusion). */
+  async updateCheck(id: number, status: "queued" | "in_progress", output: CheckRunOutput): Promise<void> {
+    await this.json("PATCH", `${this.base()}/check-runs/${id}`, { status, output });
+  }
+
   /** Check runs called `name` on `sha`, newest first. */
   async listChecks(sha: string, name: string): Promise<CheckRunSummary[]> {
-    const r = await this.json<{ check_runs?: Array<{ id: number; status: string; conclusion: string | null; app?: { slug?: string } | null }> }>(
-      "GET",
-      `${this.base()}/commits/${encodeURIComponent(sha)}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest&per_page=100`,
-    );
-    return (r?.check_runs ?? []).map((c) => ({ id: c.id, status: c.status, conclusion: c.conclusion, ...(c.app?.slug ? { app: c.app.slug } : {}) }));
+    const r = await this.json<{
+      check_runs?: Array<{ id: number; status: string; conclusion: string | null; started_at?: string | null; app?: { slug?: string } | null }>;
+    }>("GET", `${this.base()}/commits/${encodeURIComponent(sha)}/check-runs?check_name=${encodeURIComponent(name)}&filter=latest&per_page=100`);
+    return (r?.check_runs ?? [])
+      .map((c) => ({ id: c.id, status: c.status, conclusion: c.conclusion, ...(c.app?.slug ? { app: c.app.slug } : {}), ...(c.started_at ? { startedAt: c.started_at } : {}) }))
+      .sort((a, b) => b.id - a.id);
   }
 
   async completeCheck(id: number, conclusion: string, output: CheckRunOutput): Promise<void> {
