@@ -44,10 +44,10 @@ test("review --dry-run --fixture --script prints and writes the would-be review"
   assert.equal(payload.check_run.conclusion, "success");
 });
 
-test("usage errors: no --dry-run, both sources, a bad role", async () => {
+test("usage errors: a fixture without --dry-run, both sources, a bad role", async () => {
   const cap = io();
   assert.equal(await main(["review", "--fixture", FIXTURE], cap.io), 2);
-  assert.match(cap.out.stderr, /only --dry-run is supported/);
+  assert.match(cap.out.stderr, /--fixture needs --dry-run/);
   assert.equal(await main(["review", "--dry-run", "--fixture", FIXTURE, "--pr", "o/r#1"], cap.io), 2);
   assert.equal(await main(["review", "--dry-run", "--fixture", FIXTURE, "--model", "judge=openrouter/x/y"], cap.io), 2);
 });
