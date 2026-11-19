@@ -148,6 +148,10 @@ test("not a tar archive, truncated archive, non-empty destination", async () => 
   const { gunzipSync } = await import("node:zlib");
   writeFileSync(cut, gzipSync(gunzipSync(full).subarray(0, 1500)));
   await assert.rejects(unpackTarGz(cut, fresh()), /truncated/);
+  await assert.rejects(unpackTarGz(join(work, "missing.tar.gz"), fresh()), /ENOENT/);
+  const notGzip = join(work, "plain.txt");
+  writeFileSync(notGzip, "not gzip");
+  await assert.rejects(unpackTarGz(notGzip, fresh()), /incorrect header check|unexpected end/i);
   const busy = fresh();
   mkdirSync(busy);
   writeFileSync(join(busy, "x"), "");

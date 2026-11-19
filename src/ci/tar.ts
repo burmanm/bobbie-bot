@@ -185,7 +185,11 @@ export async function unpackTarGz(archive: string, dest: string, o: UnpackOption
     mkdirSync(dest, { recursive: true, mode: 0o755 });
   }
 
-  const reader = new ByteReader(createReadStream(archive).pipe(createGunzip()));
+  // A read error (missing file) must reject the iteration, not crash the process.
+  const gunzip = createGunzip();
+  const file = createReadStream(archive);
+  file.on("error", (e) => gunzip.destroy(e));
+  const reader = new ByteReader(file.pipe(gunzip));
   const stats: UnpackStats = { files: 0, dirs: 0, symlinks: 0, bytes: 0 };
   const seen = new Set<string>();
   let entries = 0;
