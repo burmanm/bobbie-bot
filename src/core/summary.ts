@@ -9,7 +9,7 @@
  *   4. Pre-existing items, each with a proposed tech-debt issue or a link.
  *   5. Questions for the author.
  *   6. Checked, nothing found.
- *   7. Not run / partial-run note.
+ *   7. CI note (C-9), not run / partial-run note.
  *   8. How to resolve: [wrong] / [intentional] / [not-worth-it].
  *   9. Needs human lines.
  *
@@ -53,6 +53,8 @@ export interface SummaryParts {
   notRun?: string[];
   /** Set when the run was partial (S-9); says what is missing. */
   partial?: string;
+  /** C-9: the review ran although CI failed or could not be read. */
+  ci?: string;
   needsHuman?: NeedsHumanNote[];
   marker: SummaryMarker;
 }
@@ -171,6 +173,7 @@ export function renderSummary(p: SummaryParts): string {
   }
 
   const notRun: string[] = [];
+  if (p.ci !== undefined) notRun.push(`**CI:** ${text(p.ci)}`);
   if (p.partial !== undefined) notRun.push(`**Partial review:** ${text(p.partial)}`);
   if (p.notRun?.length) notRun.push(["**Not run:**", ...p.notRun.map((n) => `- ${text(n)}`)].join("\n"));
   if (notRun.length) blocks.push(notRun.join("\n\n"));
