@@ -151,7 +151,7 @@ describe("live run end to end", () => {
     assert.deepEqual([gh.checkRuns[0]!.head_sha, gh.checkRuns[0]!.conclusion, gh.checkRuns[0]!.output?.title], [PR.headSha, "neutral", "Superseded by a newer push"]);
   });
 
-  test("the CLI posts with GITHUB_TOKEN and prints what it did; refuses a PAT and a fixture", async () => {
+  test("the CLI posts with GH_TOKEN and prints what it did; refuses a PAT and a fixture", async () => {
     const gh = fakeGitHub();
     const out = { stdout: "", stderr: "" };
     const io = { stdout: (s: string) => void (out.stdout += s), stderr: (s: string) => void (out.stderr += s) };
@@ -160,14 +160,14 @@ describe("live run end to end", () => {
     assert.equal(await main(args, io, { env: { GITHUB_TOKEN: "ghp_x" }, fetch: gh.fetch }), 2);
     assert.match(out.stderr, /personal access token/);
     assert.equal(await main(args, io, { env: {}, fetch: gh.fetch }), 2);
-    assert.match(out.stderr, /GITHUB_TOKEN is not set/);
+    assert.match(out.stderr, /neither GH_TOKEN nor GITHUB_TOKEN is set/);
     assert.equal(await main(["review", "--fixture", BASIC], io, { env: { GITHUB_TOKEN: "ghs_x" } }), 2);
     assert.match(out.stderr, /--fixture needs --dry-run/);
     assert.equal(gh.requests.length, 0);
 
     // Live with no model configured: the check opens and completes neutral (P-4); the snapshot is never needed.
     out.stdout = "";
-    const env = { GITHUB_TOKEN: "ghs_x", GITHUB_API_URL: gh.origin, GITHUB_SERVER_URL: "https://github.test", GITHUB_REPOSITORY: PR.repo, GITHUB_RUN_ID: "99" };
+    const env = { GH_TOKEN: "ghs_x", GITHUB_API_URL: gh.origin, GITHUB_SERVER_URL: "https://github.test", GITHUB_REPOSITORY: PR.repo, GITHUB_RUN_ID: "99" };
     const code = await main(args, io, { env, fetch: gh.fetch });
     assert.equal(code, 1, out.stderr);
     const report = JSON.parse(out.stdout) as { live: boolean; check_run: { conclusion: string } };

@@ -59,7 +59,11 @@ describe("client: identity and token handling (C-5)", () => {
     for (const t of ["ghp_x", "github_pat_x", "gho_x", "ghu_x", "ghr_x"]) assert.throws(() => assertInstallationToken(t), /accepts only the Actions GITHUB_TOKEN or a GitHub App installation token/);
     assert.throws(() => assertInstallationToken(" "), /empty/);
     assert.doesNotThrow(() => assertInstallationToken("ghs_abc"));
-    assert.throws(() => gitHubClientFromEnv({}), /GITHUB_TOKEN is not set/);
+    assert.throws(() => gitHubClientFromEnv({}), /neither GH_TOKEN nor GITHUB_TOKEN is set/);
+    // GH_TOKEN wins, as in gh; an empty one falls through.
+    assert.throws(() => gitHubClientFromEnv({ GH_TOKEN: "ghp_user", GITHUB_TOKEN: "ghs_x" }), /personal access token/);
+    assert.doesNotThrow(() => gitHubClientFromEnv({ GH_TOKEN: "ghs_app", GITHUB_TOKEN: "ghp_user" }));
+    assert.doesNotThrow(() => gitHubClientFromEnv({ GH_TOKEN: "", GITHUB_TOKEN: "ghs_x" }));
     const c = gitHubClientFromEnv({ GITHUB_TOKEN: "ghs_x", GITHUB_API_URL: "https://ghe.example/api/v3" });
     assert.equal(c.apiUrl, "https://ghe.example/api/v3");
     assert.equal(c.graphqlUrl, "https://ghe.example/api/v3/graphql");

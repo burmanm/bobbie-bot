@@ -8,7 +8,7 @@
  *
  * A dry run reads the PR (GitHub read-only through `gh`, or a fixture), runs
  * the pipeline, and prints the would-be review instead of posting it. A live
- * run posts it with the installation token in GITHUB_TOKEN (C-5) and prints
+ * run posts it with the installation token in GH_TOKEN or GITHUB_TOKEN (C-5) and prints
  * what it did. Logs go to stderr; the JSON goes to stdout and, with --out,
  * to a file.
  *
@@ -52,8 +52,8 @@ const USAGE = `Usage:
   review-bot review --dry-run --fixture <dir> [options]
 
 Without --dry-run the review, thread replies and check run are posted to
-GitHub with the token in GITHUB_TOKEN: the Actions GITHUB_TOKEN or a GitHub
-App installation token (personal access tokens are refused). GITHUB_API_URL
+GitHub with the token in GH_TOKEN (else GITHUB_TOKEN): the Actions
+GITHUB_TOKEN or a GitHub App installation token (personal access tokens are refused). GITHUB_API_URL
 and GITHUB_GRAPHQL_URL are honoured.
 
 Source:

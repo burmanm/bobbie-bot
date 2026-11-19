@@ -307,17 +307,18 @@ export class GitHubClient {
 }
 
 /**
- * A client from the environment: `GITHUB_TOKEN` (the Actions token, or an
- * App installation token the workflow put there), `GITHUB_API_URL`,
- * `GITHUB_GRAPHQL_URL`.
+ * A client from the environment: the token from `GH_TOKEN`, else
+ * `GITHUB_TOKEN` (the same precedence as `gh`, which reads the snapshots
+ * with it): the Actions token, or an App installation token the workflow
+ * put there. Also `GITHUB_API_URL`, `GITHUB_GRAPHQL_URL`.
  */
 export function gitHubClientFromEnv(
   env: Record<string, string | undefined>,
   o: Omit<GitHubClientOptions, "token" | "apiUrl" | "graphqlUrl"> = {},
 ): GitHubClient {
-  const token = env.GITHUB_TOKEN;
+  const token = env.GH_TOKEN?.trim() ? env.GH_TOKEN : env.GITHUB_TOKEN;
   if (token === undefined || token.trim() === "") {
-    throw new Error("GITHUB_TOKEN is not set: give the Actions GITHUB_TOKEN or a GitHub App installation token (C-5)");
+    throw new Error("neither GH_TOKEN nor GITHUB_TOKEN is set: give the Actions GITHUB_TOKEN or a GitHub App installation token (C-5)");
   }
   return new GitHubClient({
     ...o,
