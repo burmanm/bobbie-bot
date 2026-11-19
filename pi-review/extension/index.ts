@@ -46,6 +46,12 @@ export interface ReviewExtensionOptions {
   /** Path to `rg`; default: found on PATH. */
   rgPath?: string;
   onReject?: (rejection: GuardRejection) => void;
+  /**
+   * Called with each provider request body just before it is sent
+   * (`before_provider_request`; real providers only). Observes; never
+   * changes the request.
+   */
+  onProviderRequest?: (payload: unknown) => void;
 }
 
 export function createReviewExtension(options: ReviewExtensionOptions): ExtensionFactory {
@@ -77,5 +83,16 @@ export function createReviewExtension(options: ReviewExtensionOptions): Extensio
       ...(options.onReject === undefined ? {} : { onReject: options.onReject }),
     });
     pi.on("tool_call", (event, ctx) => guard(event, ctx));
+    const onRequest = options.onProviderRequest;
+    if (onRequest !== undefined) {
+      pi.on("before_provider_request", (event) => {
+        try {
+          onRequest(event.payload);
+        } catch {
+          // Observation must never break a request.
+        }
+        return undefined;
+      });
+    }
   };
 }

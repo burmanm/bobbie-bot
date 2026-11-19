@@ -10,8 +10,9 @@
  */
 import type { Static, TSchema } from "typebox";
 import type { OutputTool, QueryTool, ReadToolName } from "../../pi-review/extension/index.ts";
+import type { ProviderRequestSummary } from "./request-summary.ts";
 
-export type { OutputTool, QueryTool, ReadToolName };
+export type { OutputTool, ProviderRequestSummary, QueryTool, ReadToolName };
 
 export type Role = "reviewer" | "verifier" | "learner";
 
@@ -149,6 +150,12 @@ export interface AgentStepResult<T extends OutputTool = OutputTool> {
   usage: StepUsage;
   /** `responseModel ?? model` per call, distinct, in first-seen order (A-6, C-6). */
   servedModels: string[];
+  /**
+   * One summary per request pi sent to the provider, in order (A-6), from
+   * `before_provider_request`. Empty for providers that do not report the
+   * request body (the scripted provider; ACP agents).
+   */
+  providerRequests: ProviderRequestSummary[];
   /**
    * True when the requested model id is not in pi's offline catalog and was
    * used as a custom id on the provider (C-6). Its context window and output

@@ -33,6 +33,7 @@ import {
 } from "../../pi-review/extension/index.ts";
 import { StepAccounting } from "./accounting.ts";
 import { stopReasonOf } from "./limits.ts";
+import { summarizeProviderRequest } from "./request-summary.ts";
 import type {
   AgentStep,
   AgentStepRequest,
@@ -146,6 +147,7 @@ function emptyResult<T extends OutputTool>(): AgentStepResult<T> {
       wallMs: 0,
     },
     servedModels: [],
+    providerRequests: [],
     harness: { name: "pi-sdk", version: PI_VERSION, extensions: [], tools: [] },
   };
 }
@@ -231,6 +233,10 @@ async function runStep<T extends OutputTool>(
       ...(request.queryTools === undefined ? {} : { queryTools: request.queryTools }),
       ...(options.rgPath === undefined ? {} : { rgPath: options.rgPath }),
       onReject: (r) => guardRejections.set(r.toolCallId, r),
+      onProviderRequest: (payload) => {
+        const previous = [...result.providerRequests].reverse().find((r) => r.toolNames !== undefined)?.toolNames;
+        result.providerRequests.push(summarizeProviderRequest(payload, previous));
+      },
     });
 
     // C-3a: in-memory settings with projectTrusted false keeps the

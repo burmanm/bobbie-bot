@@ -339,6 +339,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       usageComplete: result.usage.usageComplete,
       rejectedCalls: result.rejectedCalls.map((r) => ({ tool: r.tool, reason: `${r.kind}: ${r.reason}` })),
     };
+    if (result.providerRequests.length > 0) record.requests = result.providerRequests;
     const err = result.error
       ? `${result.error.kind}: ${result.error.message}${result.stoppedBy ? ` (stopped by ${result.stoppedBy})` : ""}`
       : result.stoppedBy

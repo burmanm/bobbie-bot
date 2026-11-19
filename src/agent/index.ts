@@ -5,3 +5,4 @@ export { createScriptedProvider, SCRIPTED_PROVIDER, type Script, type ScriptedPr
 export { ACP_PROVIDER, type AcpAgentConfig, type AcpAgentStepOptions, createAcpAgentStep } from "./acp/acp-step.ts";
 export { createRoutedAgentStep } from "./routed-step.ts";
 export { RUN_DEADLINE, stopReasonOf } from "./limits.ts";
+export { summarizeProviderRequest } from "./request-summary.ts";

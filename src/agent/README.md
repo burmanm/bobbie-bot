@@ -14,6 +14,7 @@ backed by the pi SDK; the guard and tools it loads live in
 | `acp/connection.ts` | Minimal ACP client: JSON-RPC 2.0, one message per line, over the agent's stdio |
 | `acp/outputs.ts` | Output tools described in the prompt; the agent's JSON block checked like tool calls |
 | `acp/fake-agent.ts` | Scripted ACP agent, tests only |
+| `request-summary.ts` | Summary of each provider request body for the run record (A-6) |
 | `limits.ts` | `RUN_DEADLINE`: the abort reason that stops a step as a run-deadline timeout |
 | `timeouts.test.ts` | Step timeout, inactivity, run deadline, hung provider, hung tool call, query tools |
 | `routed-step.ts` | Sends `acp/<agent>` models to the ACP step, everything else to pi |
@@ -42,6 +43,15 @@ backed by the pi SDK; the guard and tools it loads live in
   soon as the step is stopped even if `run` ignores its signal. The ACP
   step does not offer them (the agent cannot call our tools); its
   `harness.tools` does not list them.
+- **`providerRequests`** (R-2): one summary per request sent to the
+  provider (model, message count, tool names, max tokens, reasoning and
+  routing settings, body size and sha256; never message text or the key),
+  from pi's `before_provider_request` event. pi fires it for real providers:
+  every pi-ai API implementation calls `options.onPayload(params, model)`
+  just before sending, and the SDK routes `onPayload` to the extension
+  runner. The faux provider never calls `onPayload`, so it is empty in the
+  scripted tests (`request-summary.test.ts` wraps the faux provider to call
+  it, as `openai-completions` does). Empty for ACP agents.
 - **`abandoned`** is set when a stopped step did not settle within
   `abortGraceMs` (a provider or tool that ignores the abort). The step
   returns anyway, with `usageComplete: false`.

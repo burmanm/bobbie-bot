@@ -35,6 +35,27 @@ export const StepRecord = Type.Object({
   /** Aborted model calls report zero usage, so a timed-out step under-reports (A-6). */
   usageComplete: Type.Boolean(),
   rejectedCalls: Type.Array(Type.Object({ tool: Type.String(), reason: Type.String() })),
+  /**
+   * What was sent to the provider, one entry per model call: model, counts,
+   * settings, body size and hash; never message text or the key (A-6).
+   * Absent when the provider does not report the request body.
+   */
+  requests: Type.Optional(
+    Type.Array(
+      Type.Object({
+        model: Type.Optional(Type.String()),
+        messages: Type.Optional(Type.Integer({ minimum: 0 })),
+        toolCount: Type.Optional(Type.Integer({ minimum: 0 })),
+        toolNames: Type.Optional(Type.Array(Type.String())),
+        maxTokens: Type.Optional(Type.Number()),
+        temperature: Type.Optional(Type.Number()),
+        reasoning: Type.Optional(Type.String()),
+        routing: Type.Optional(Type.String()),
+        bytes: Type.Integer({ minimum: 0 }),
+        sha256: Type.String(),
+      }),
+    ),
+  ),
 });
 export type StepRecord = Static<typeof StepRecord>;
 
