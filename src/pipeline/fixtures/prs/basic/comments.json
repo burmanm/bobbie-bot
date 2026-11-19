@@ -1,0 +1,11 @@
+[
+  {
+    "id": "5001",
+    "kind": "review-comment",
+    "author": { "login": "maintainer", "type": "User" },
+    "body": "Could the test also cover Reset?",
+    "path": "pkg/store/store_test.go",
+    "line": 7,
+    "createdAt": "2026-11-17T10:00:00Z"
+  }
+]

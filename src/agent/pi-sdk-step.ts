@@ -92,8 +92,8 @@ export function createPiSdkAgentStep(options: PiSdkAgentStepOptions = {}): Agent
 class ConfigError extends Error {}
 
 function rootList(request: AgentStepRequest<OutputTool>): string[] {
-  const { head, base, modcache } = request.roots;
-  return [head, ...(base === undefined ? [] : [base]), ...(modcache === undefined ? [] : [modcache])];
+  const { head, base, modcache, inputs } = request.roots;
+  return [head, ...[base, modcache, inputs].filter((r): r is string => r !== undefined)];
 }
 
 function validateRequest(request: AgentStepRequest<OutputTool>, options: PiSdkAgentStepOptions): void {
@@ -118,10 +118,11 @@ function validateRequest(request: AgentStepRequest<OutputTool>, options: PiSdkAg
 }
 
 function composeSystemPrompt(request: AgentStepRequest<OutputTool>): string {
-  const { head, base, modcache } = request.roots;
+  const { head, base, modcache, inputs } = request.roots;
   const lines = [`head: ${head} (working directory; relative paths resolve here)`];
   if (base !== undefined) lines.push(`base: ${base}`);
   if (modcache !== undefined) lines.push(`modcache: ${modcache}`);
+  if (inputs !== undefined) lines.push(`inputs: ${inputs} (review inputs prepared for you, not part of the repository)`);
   return `${request.systemPrompt}\n\n<read_roots>\nThe read tools can reach only these directories. Use absolute paths for any root other than head.\n${lines.join("\n")}\n</read_roots>`;
 }
 

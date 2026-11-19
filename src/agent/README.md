@@ -34,6 +34,9 @@ backed by the pi SDK; the guard and tools it loads live in
   scripted step.
 - **`ModelRef.routing`** is accepted only for `openrouter`; for any other
   provider it is a configuration error rather than silently dropped.
+- **`roots.inputs`** (added for the pipeline): a run-directory folder with
+  `context.md` and `patches/` (S-0, S-3). Readable like the other roots, but
+  not an evidence root.
 - The read roots are appended to the system prompt in a `<read_roots>`
   section with their absolute paths, since `base` and `modcache` are reached
   by absolute path.

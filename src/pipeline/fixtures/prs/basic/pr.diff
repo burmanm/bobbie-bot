@@ -1,0 +1,52 @@
+diff --git a/go.sum b/go.sum
+index e285c9a..fb6d93d 100644
+--- a/go.sum
++++ b/go.sum
+@@ -1 +1,2 @@
+ example.com/dep v1.0.0 h1:aaaa
++example.com/dep v1.1.0 h1:bbbb
+diff --git a/pkg/store/store.go b/pkg/store/store.go
+index a74b005..3d15247 100644
+--- a/pkg/store/store.go
++++ b/pkg/store/store.go
+@@ -20,3 +20,13 @@ func (s *Store) Get(key string) (string, error) {
+ 	}
+ 	return v, nil
+ }
++
++// Reset drops all values.
++func (s *Store) Reset() {
++	s.items = nil
++}
++
++// Put stores value under key, replacing any earlier value.
++func (s *Store) Put(key, value string) {
++	s.items[key] = value
++}
+diff --git a/pkg/store/store_test.go b/pkg/store/store_test.go
+new file mode 100644
+index 0000000..5c90555
+--- /dev/null
++++ b/pkg/store/store_test.go
+@@ -0,0 +1,11 @@
++package store
++
++import "testing"
++
++func TestPutGet(t *testing.T) {
++	s := New()
++	s.Put("a", "1")
++	if v, _ := s.Get("a"); v != "1" {
++		t.Fatalf("got %q", v)
++	}
++}
+diff --git a/pkg/store/zz_generated.go b/pkg/store/zz_generated.go
+index 26b1b72..8518598 100644
+--- a/pkg/store/zz_generated.go
++++ b/pkg/store/zz_generated.go
+@@ -2,4 +2,4 @@ package store
+ 
+ // Code generated. DO NOT EDIT.
+ 
+-func (s *Store) deepCopy() *Store { return s }
++func (s *Store) deepCopy() *Store { c := *s; return &c }

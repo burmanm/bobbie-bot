@@ -7,14 +7,19 @@
   "engines": {
     "node": ">=22.19.0"
   },
+  "bin": {
+    "review-bot": "src/cli/main.ts"
+  },
   "scripts": {
+    "review-bot": "node src/cli/main.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test \"src/**/*.test.ts\" \"pi-review/**/*.test.ts\""
   },
   "dependencies": {
     "@earendil-works/pi-ai": "1.5.2",
     "@earendil-works/pi-coding-agent": "1.5.2",
-    "typebox": "1.3.27"
+    "typebox": "1.3.27",
+    "yaml": "2.9.0"
   },
   "devDependencies": {
     "@types/node": "22.20.5",
