@@ -13,8 +13,8 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Value } from "typebox/value";
-import type { AgentStep, AgentStepResult, ModelRef, OutputTool, ReadRoots } from "../agent/index.ts";
-import { PI_VERSION } from "../agent/index.ts";
+import type { AgentStep, AgentStepResult, ModelRef, OutputTool, QueryTool, ReadRoots } from "../agent/index.ts";
+import { PI_VERSION, RUN_DEADLINE } from "../agent/index.ts";
 import {
   applyVerdict,
   BOT_VERSION,
@@ -23,6 +23,7 @@ import {
   type Finding,
   FINGERPRINT_VERSION,
   fingerprintFinding,
+  type HistorySource,
   groundFindings,
   indexDiff,
   isInDiff,
@@ -31,6 +32,8 @@ import {
   parseDiff,
   parseReviewMd,
   preExistingItems,
+  areaNitCaps,
+  type ReviewArea,
   producerPart,
   type Question,
   quoteFound,
@@ -54,15 +57,26 @@ import {
   type PullRequestInfo,
   type SnapshotSource,
 } from "../platform/index.ts";
-import { type ConfigInputs, ConfigError, formatModel, type PipelineConfig, type PipelineRole, resolveConfig } from "./config.ts";
+import {
+  type ConfigInputs,
+  ConfigError,
+  DEFAULT_LIMITS,
+  formatDuration,
+  formatModel,
+  type PipelineConfig,
+  type PipelineRole,
+  resolveConfig,
+} from "./config.ts";
 import { buildContext } from "./context.ts";
+import { historyTools } from "./history-tools.ts";
 import { type Chunk, chunkByDirectory, deterministicPass, type DeterministicResult } from "./deterministic.ts";
-import { isKnowledgePath, type Knowledge, knowledgeFileList, type KnowledgeOverride, loadKnowledge } from "./knowledge.ts";
+import { isKnowledgePath, type Knowledge, knowledgeFileList, type KnowledgeOverride, loadAreaReviews, loadKnowledge } from "./knowledge.ts";
 import { snapshotLookup } from "./lookup.ts";
 import { loadMethod, type Method } from "./method.ts";
 import { buildReview, failureCommentBody, recheckReplyBody } from "./publish.ts";
 import { derivePriorState, openPriorFindings, type PriorFinding, type PriorState } from "./prior.ts";
 import { isValidRecheck, type Recheck, RECHECK_TOOLS, REVIEWER_TOOLS, VERIFIER_TOOLS } from "./tools.ts";
+import { dependencyLabelNote, dependencyOnlySkip, type SkipDecision, skipBeforeDiff } from "./skip.ts";
 
 export interface ReviewRunOptions {
   platform: Platform;
@@ -86,6 +100,16 @@ export interface ReviewRunOptions {
   methodDir?: string;
   /** The PR as the caller named it, so a record has an identity even when reading the PR fails (S-9). */
   prRef?: { repo: string; number: number };
+  /**
+   * Repository history and issue search for the model steps (S-4), served
+   * through the code host's API. Without it the reviewer has neither and
+   * the summary says so.
+   */
+  history?: {
+    source: HistorySource;
+    /** Replay cutoff, read once the PR is known (E-2, `--head`). */
+    asOf?: () => string | undefined;
+  };
 }
 
 export interface ReviewRunResult {
@@ -151,20 +175,53 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
   let conclusion: CheckConclusion = "neutral";
   let checkSummary = "Review did not start.";
   let skipReason: string | undefined;
+  let skipKind: SkipDecision["kind"] | undefined;
   let publication: Publication | undefined;
   let published = false;
   let checkCompleted = false;
   let spentUsd = 0;
   let publishedIds: string[] = [];
+  let partialNote: string | undefined;
+
+  // Run deadline (S-4 Limits, S-9). One signal for the whole run: aborted
+  // with the caller's reason on cancellation, or with RUN_DEADLINE when the
+  // run's time is up. Steps stop on it; non-model stages race it. The
+  // deadline comes from the inputs first and is re-armed once
+  // .review/review-bot.yaml is read, always measured from the run's start.
+  const runController = new AbortController();
+  const runSignal = runController.signal;
+  const onOuterAbort = () => runController.abort(o.signal?.reason ?? "cancelled");
+  if (o.signal?.aborted) onOuterAbort();
+  else o.signal?.addEventListener("abort", onOuterAbort, { once: true });
+  let deadlineMs = o.inputs.runTimeoutMs ?? DEFAULT_LIMITS.runTimeoutMs;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const armDeadline = (ms: number) => {
+    deadlineMs = ms;
+    clearTimeout(deadlineTimer);
+    if (runSignal.aborted) return;
+    const left = ms - (performance.now() - started);
+    const fire = () => {
+      if (runSignal.aborted) return;
+      log(`run deadline of ${formatDuration(deadlineMs)} reached: stopping the running step; what exists is published as partial`);
+      runController.abort(RUN_DEADLINE);
+    };
+    if (left <= 0) fire();
+    else deadlineTimer = setTimeout(fire, left);
+  };
+  armDeadline(deadlineMs);
+  const deadlineReached = () => runSignal.aborted && runSignal.reason === RUN_DEADLINE;
+  /** Why a step was not run: the deadline or the spend cap. */
+  let notRunWhy = "the run spend cap was reached";
 
   const stage = (file: string, data: unknown) => {
     if (runDir === undefined) return;
     writeFileSync(join(runDir, file), JSON.stringify(data, null, 2) + "\n");
   };
+  /** A non-model stage, bounded by the run signal: a hung read cannot hold the run past its deadline. */
   const timed = async <T>(label: string, fn: () => Promise<T>, detail?: (r: T) => string): Promise<T> => {
     const t = performance.now();
     try {
-      const r = await fn();
+      const r = await raceRun(label, fn());
       log(`${label} ok ${Math.round(performance.now() - t)}ms${detail ? ` ${detail(r)}` : ""}`);
       return r;
     } catch (e) {
@@ -173,7 +230,34 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     }
   };
   const checkCancelled = () => {
-    if (o.signal?.aborted) throw new RunFailure("cancelled");
+    if (deadlineReached()) throw new RunFailure(`the run deadline of ${formatDuration(deadlineMs)} was reached before the review started`);
+    if (runSignal.aborted) throw new RunFailure("cancelled");
+  };
+  const raceRun = <T>(label: string, p: Promise<T>): Promise<T> => {
+    if (runSignal.aborted) {
+      p.catch(() => {});
+      checkCancelled();
+    }
+    return new Promise<T>((resolvePromise, reject) => {
+      const onAbort = () => {
+        reject(
+          new RunFailure(
+            deadlineReached() ? `the run deadline of ${formatDuration(deadlineMs)} was reached during ${label}` : "cancelled",
+          ),
+        );
+      };
+      runSignal.addEventListener("abort", onAbort, { once: true });
+      p.then(
+        (v) => {
+          runSignal.removeEventListener("abort", onAbort);
+          resolvePromise(v);
+        },
+        (e: unknown) => {
+          runSignal.removeEventListener("abort", onAbort);
+          reject(e);
+        },
+      );
+    });
   };
 
   const complete = async (c: CheckConclusion, summary: string) => {
@@ -199,11 +283,17 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     stepName: string,
     role: PipelineRole,
     model: ModelRef,
-    req: { systemPrompt: string; prompt: string; roots: ReadRoots; outputTools: readonly T[] },
+    req: { systemPrompt: string; prompt: string; roots: ReadRoots; outputTools: readonly T[]; queryTools?: readonly QueryTool[] },
   ): Promise<AgentStepResult<T> | undefined> => {
+    if (deadlineReached()) {
+      notRunWhy = `the run deadline of ${formatDuration(deadlineMs)} was reached`;
+      log(`${stepName} not run: ${notRunWhy}`);
+      return undefined;
+    }
     checkCancelled();
     const remaining = config!.limits.runCostUsd - spentUsd;
     if (remaining <= 0) {
+      notRunWhy = "the run spend cap was reached";
       log(`${stepName} not run: run spend cap of $${config!.limits.runCostUsd} reached`);
       return undefined;
     }
@@ -219,8 +309,9 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       roots: req.roots,
       readTools: READ_TOOLS,
       outputTools: req.outputTools,
+      ...(req.queryTools === undefined || req.queryTools.length === 0 ? {} : { queryTools: req.queryTools }),
       limits: { ...roleLimits, maxCostUsd },
-      ...(o.signal === undefined ? {} : { signal: o.signal }),
+      signal: runSignal,
       onProgress: (p) => {
         // C-8 heartbeat, at most every 30 seconds.
         if (performance.now() - lastBeat < 30_000) return;
@@ -248,7 +339,12 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       usageComplete: result.usage.usageComplete,
       rejectedCalls: result.rejectedCalls.map((r) => ({ tool: r.tool, reason: `${r.kind}: ${r.reason}` })),
     };
-    const err = result.error ? `${result.error.kind}: ${result.error.message}` : result.stoppedBy ? `stopped by ${result.stoppedBy}` : undefined;
+    if (result.providerRequests.length > 0) record.requests = result.providerRequests;
+    const err = result.error
+      ? `${result.error.kind}: ${result.error.message}${result.stoppedBy ? ` (stopped by ${result.stoppedBy})` : ""}`
+      : result.stoppedBy
+        ? `stopped by ${result.stoppedBy}`
+        : undefined;
     if (err !== undefined) record.error = err;
     steps.push(record);
     if (result.uncataloguedModel) {
@@ -281,17 +377,15 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     await timed("S-1 base snapshot", () => o.snapshots.extract("base", currentPr.baseSha, heads.base));
     knowledge = loadKnowledge(heads.base, o.knowledgeOverride ?? {});
     config = resolveConfig(o.inputs, knowledge.botConfig?.text);
+    if (config.limits.runTimeoutMs !== deadlineMs) armDeadline(config.limits.runTimeoutMs);
     const prior: PriorState = derivePriorState(comments, botId);
     round = prior.rounds + 1;
 
-    const skip = ((): string | undefined => {
-      if (knowledge.review === undefined) return "the repository has no REVIEW.md on the base branch, so it is not onboarded for automated review (A-5)";
-      if (pr.draft && config.skip.draft) return "the pull request is a draft";
-      const label = pr.labels.find((l) => config!.skip.labels.includes(l));
-      if (label !== undefined) return `the pull request has the label "${label}"`;
-      if (prior.lastReviewedSha === pr.headSha) return `head ${short(pr.headSha)} was already reviewed (run is idempotent, C-1)`;
-      return undefined;
-    })();
+    // S-1 skip conditions (skip.ts); the deps-only one needs the diff and comes after it.
+    let skip: SkipDecision | undefined = skipBeforeDiff(pr, config.skip, {
+      hasReviewMd: knowledge.review !== undefined,
+      lastReviewedSha: prior.lastReviewedSha,
+    });
 
     let sinceSha: string | undefined;
     let reviewDiffText: string | undefined;
@@ -299,6 +393,12 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     if (skip === undefined) {
       fullDiffText = await timed("S-1 diff", () => o.platform.getDiff(), (d) => `${d?.length ?? 0} bytes`);
       if (fullDiffText === undefined) throw new RunFailure("the platform returned no diff");
+      const fullParsed = parseDiff(fullDiffText);
+      skip = dependencyOnlySkip(pr, fullParsed, config.skip);
+      const depsNote = skip === undefined ? dependencyLabelNote(pr, fullParsed, config.skip) : undefined;
+      if (depsNote !== undefined) log(`S-1 ${depsNote}`);
+    }
+    if (skip === undefined) {
       if (prior.lastReviewedSha !== undefined) {
         const since = prior.lastReviewedSha;
         const d = await timed("S-1 incremental diff", () => o.platform.getDiff(since), (x) => (x === undefined ? "unavailable, full review" : `${x.length} bytes`));
@@ -333,9 +433,10 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     });
 
     if (skip !== undefined) {
-      skipReason = skip;
-      log(`S-1 skipped: ${skip}`);
-      await complete("skipped", `Skipped: ${skip}.`);
+      skipReason = skip.reason;
+      skipKind = skip.kind;
+      log(`S-1 skipped (${skip.kind}): ${skip.reason}`);
+      await complete("skipped", `Skipped: ${skip.reason}.`);
       return await finish();
     }
 
@@ -349,8 +450,15 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
 
     // ---- S-2 deterministic pass ------------------------------------------
     const reviewMd = parseReviewMd(knowledge.review!.text);
-    const det: DeterministicResult = deterministicPass(reviewDiffText!, reviewMd, inputsDir);
-    const fullFiles = scope === "incremental" ? parseDiff(fullDiffText!) : det.all;
+    const reviewFiles = parseDiff(reviewDiffText!);
+    const fullFiles = scope === "incremental" ? parseDiff(fullDiffText!) : reviewFiles;
+    // Per-area REVIEW.md files above any file the PR changes (A-5).
+    loadAreaReviews(knowledge, [...new Set(fullFiles.flatMap((f) => [f.newPath, f.oldPath]).filter((p): p is string => p !== undefined))]);
+    const areas: ReviewArea[] = [
+      { dir: "", path: "REVIEW.md", parsed: reviewMd },
+      ...knowledge.areas.map((f) => ({ dir: f.path.slice(0, -"/REVIEW.md".length), path: f.path, parsed: parseReviewMd(f.text) })),
+    ];
+    const det: DeterministicResult = deterministicPass(reviewFiles, areas, inputsDir);
     const fullIndex = indexDiff(fullFiles.filter((f) => !f.binary));
     const excludedReason = new Map(det.excluded.map((e) => [e.path, e.reason]));
     files = det.all.map((f) => {
@@ -368,6 +476,13 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       scope,
       sinceSha,
       reviewMd: { skipEntries: reviewMd.skipEntries, nitCap: reviewMd.nitCap, found: reviewMd.found, unparsedSkipItems: reviewMd.unparsedSkipItems },
+      areaReviewMd: areas.slice(1).map((a) => ({
+        path: a.path,
+        appliesTo: `${a.dir}/`,
+        skipEntries: a.parsed.skipEntries,
+        nitCap: a.parsed.nitCap,
+        unparsedSkipItems: a.parsed.unparsedSkipItems,
+      })),
       patches: det.patches,
       excluded: det.excluded,
       softSkips: det.softSkips,
@@ -392,6 +507,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       excluded: det.excluded,
       softSkips: det.softSkips,
       knowledge,
+      areas,
       knowledgeSha: pr.baseSha,
       knowledgeEditedByPr,
       comments,
@@ -410,6 +526,12 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     const notRun: string[] = [];
     const checked: string[] = [];
     const partial: string[] = [];
+    const asOf = o.history?.asOf?.();
+    const queryTools: QueryTool[] =
+      o.history === undefined
+        ? []
+        : historyTools({ source: o.history.source, headSha: pr.headSha, baseSha: pr.baseSha, ...(asOf === undefined ? {} : { asOf }) });
+    let issueSearchOffered = false;
 
     // ---- S-4 review -------------------------------------------------------
     let findingSeq = 0;
@@ -427,11 +549,13 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
         prompt,
         roots,
         outputTools: REVIEWER_TOOLS,
+        queryTools,
       });
       if (result === undefined) {
-        partial.push(`the reviewer step for ${chunk.name === "all" ? "the change" : chunk.name} was not run: the run spend cap was reached`);
+        partial.push(`the reviewer step for ${chunk.name === "all" ? "the change" : chunk.name} was not run: ${notRunWhy}`);
         continue;
       }
+      if (result.harness.tools.includes("search_issues")) issueSearchOffered = true;
       reviewerOutputs += result.outputs.length;
       if (result.outcome === "ok") reviewerOk++;
       else {
@@ -471,7 +595,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       }
     }
     if (chunks.length > 0 && reviewerOk === 0 && reviewerOutputs === 0) {
-      throw new RunFailure(`the reviewer produced nothing: ${reviewerErrors.join("; ") || "no step could run within the spend cap"}`);
+      throw new RunFailure(`the reviewer produced nothing: ${reviewerErrors.join("; ") || `no step could run (${notRunWhy})`}`);
     }
     stage("04-review.json", { findings, questions, needsHuman, checked, notRun, partial });
 
@@ -506,10 +630,16 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
         prompt,
         roots: { head: heads.head, base: heads.base, ...(o.modcache === undefined ? {} : { modcache: o.modcache }) },
         outputTools: VERIFIER_TOOLS,
+        queryTools,
       });
       const verdict = result?.outputs.filter((x) => x.tool === "submit_verdict").map((x) => x.value as Verdict).pop();
       if (verdict === undefined) {
-        const why = result === undefined ? "the run spend cap was reached" : `${result.outcome}${result.error ? `: ${result.error.message}` : ""}`;
+        const why =
+          result === undefined
+            ? notRunWhy
+            : result.stoppedBy === "deadline"
+              ? `the run deadline of ${formatDuration(deadlineMs)} was reached`
+              : `${result.outcome}${result.error ? `: ${result.error.message}` : ""}`;
         findings[i] = { ...f, status: "unverified", statusReason: `verifier returned no verdict (${why})` };
         verifierGaps++;
         continue;
@@ -551,10 +681,11 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
         prompt: recheckPrompt(p, sinceSha, pr.headSha, det),
         roots,
         outputTools: RECHECK_TOOLS,
+        queryTools,
       });
       const r = result?.outputs.filter((x) => x.tool === "submit_recheck").map((x) => x.value).pop() as Recheck | undefined;
       if (r === undefined || !isValidRecheck(r)) {
-        const why = result === undefined ? "the run spend cap was reached" : result.outcome;
+        const why = result === undefined ? notRunWhy : result.stoppedBy === "deadline" ? "the run deadline was reached" : result.outcome;
         rechecks.push({ ...base, status: "inconclusive", by: "model", detail: `could not be re-checked (${why})` });
         continue;
       }
@@ -569,7 +700,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
 
     // ---- S-6 reconcile ----------------------------------------------------
     findings = dedupeAgainstComments(findings, prior.othersInline);
-    findings = reconcile(findings, { priorFingerprints: prior.fingerprints, nitCap: reviewMd.nitCap });
+    findings = reconcile(findings, { priorFingerprints: prior.fingerprints, nitCaps: areaNitCaps(areas) });
     stage("06-reconcile.json", { findings, rechecks });
     log(`S-6 reconcile ok publish=${findings.filter(isLive).length} duplicate=${findings.filter((f) => f.status === "duplicate").length} over-limit=${findings.filter((f) => f.status === "over-limit").length}`);
 
@@ -578,14 +709,20 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       notRun.push(`This PR edits ${knowledgeEditedByPr.map((p) => `\`${p}\``).join(", ")}; the review used the base branch's versions (C-3).`);
     }
     const preExisting = preExistingItems(findings);
-    if (preExisting.length > 0) notRun.push("Issue tracker search: not available to the reviewer, so existing `tech-debt` issues were not checked.");
+    if (preExisting.length > 0 && !issueSearchOffered) {
+      notRun.push("Issue tracker search: not available to the reviewer, so existing `tech-debt` issues were not checked.");
+    }
     const earlier = {
       stillOpen: rechecks
         .filter((r) => r.status !== "fixed")
         .map((r): EarlierFinding => ({ title: r.title, detail: r.status === "still-open" ? r.detail : `not confirmed fixed: ${r.detail}`, ...(r.tag ? { tag: r.tag } : {}) })),
       verifiedFixed: rechecks.filter((r) => r.status === "fixed").map((r): EarlierFinding => ({ title: r.title, detail: r.detail, ...(r.tag ? { tag: r.tag } : {}) })),
     };
+    if (deadlineReached()) {
+      partial.unshift(`the run deadline of ${formatDuration(deadlineMs)} was reached, so the review stopped early and later steps were not run`);
+    }
     const partialText = partial.length > 0 ? `${partial.join("; ")}.` : undefined;
+    partialNote = partialText;
     const summary = renderSummary({
       round: { number: round, headSha: pr.headSha, ...(sinceSha === undefined ? {} : { sinceSha }) },
       counts: summaryCounts(findings),
@@ -621,6 +758,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
   } catch (e) {
     // ---- S-9 failure behaviour ---------------------------------------------
     const reason = e instanceof RunFailure && e.message === "cancelled" ? "the run was cancelled" : errorMessage(e);
+    if (deadlineReached()) partialNote = `the run deadline of ${formatDuration(deadlineMs)} was reached`;
     log(`run failed: ${reason}`);
     if (!published && pr !== undefined) {
       publication = { threadReplies: [], resolveThreads: [], failureComment: failureCommentBody(pr.headSha, reason) };
@@ -638,6 +776,8 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
 
   // ---- S-8 record ----------------------------------------------------------
   async function finish(): Promise<ReviewRunResult> {
+    clearTimeout(deadlineTimer);
+    o.signal?.removeEventListener("abort", onOuterAbort);
     if (!checkCompleted) await complete(conclusion, checkSummary);
     const out: ReviewRunResult = { runId, conclusion, checkSummary };
     if (runDir !== undefined) out.runDir = runDir;
@@ -667,6 +807,9 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     for (const [k, v] of Object.entries(config?.roles ?? {})) roles[k] = formatModel(v);
     const result: RunRecord["run"]["result"] = { checkConclusion: conclusion, summary: checkSummary, publishedCommentIds: publishedIds };
     if (skipReason !== undefined) result.skipReason = skipReason;
+    if (skipKind !== undefined) result.skipKind = skipKind;
+    if (partialNote !== undefined) result.partial = partialNote;
+    if (deadlineReached()) result.deadlineReached = true;
     return {
       tool: RUN_RECORD_TOOL,
       toolVersion: BOT_VERSION,

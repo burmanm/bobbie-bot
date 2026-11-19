@@ -18,6 +18,7 @@ export function createRoutedAgentStep(steps: { pi: AgentStep; acp?: AgentStep })
         toolCalls: { total: 0, failed: 0 },
         usage: { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, costIsBilled: false, usageComplete: true, wallMs: 0 },
         servedModels: [],
+        providerRequests: [],
         harness: { name: "acp", version: "unknown", extensions: [], tools: [] },
       };
     },

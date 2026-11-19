@@ -92,6 +92,8 @@ export interface SoftSkip {
   path: string;
   glob: string;
   qualifier: string;
+  /** The area REVIEW.md the entry comes from; absent for the root file (A-5). */
+  source?: string;
 }
 
 export interface SkipResult {

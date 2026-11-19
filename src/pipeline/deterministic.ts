@@ -5,7 +5,7 @@
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { applySkips, type Exclusion, type FilePatch, parseDiff, type ReviewMd, type SoftSkip } from "../core/index.ts";
+import { applyAreaSkips, type Exclusion, type FilePatch, parseDiff, type ReviewArea, type SoftSkip } from "../core/index.ts";
 
 export interface PatchFile {
   path: string;
@@ -41,9 +41,13 @@ export function patchFileName(index: number, path: string): string {
   return `${String(index + 1).padStart(4, "0")}-${flat}.patch`;
 }
 
-export function deterministicPass(diffText: string, reviewMd: ReviewMd, inputsDir: string): DeterministicResult {
-  const all = parseDiff(diffText);
-  const { included, excluded, softSkips } = applySkips(all, reviewMd.skipEntries);
+/**
+ * `areas`: the root `REVIEW.md` (dir "") and any per-area ones (A-5); their
+ * skip entries combine as core/review-areas.ts says.
+ */
+export function deterministicPass(diff: string | FilePatch[], areas: readonly ReviewArea[], inputsDir: string): DeterministicResult {
+  const all = typeof diff === "string" ? parseDiff(diff) : diff;
+  const { included, excluded, softSkips } = applyAreaSkips(all, areas);
   const patchDir = join(inputsDir, "patches");
   mkdirSync(patchDir, { recursive: true });
   const patches = included.map((f, i): PatchFile => {

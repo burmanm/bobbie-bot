@@ -8,3 +8,5 @@ export { chunkByDirectory, deterministicPass, patchFileName, type Chunk, type Pa
 export { derivePriorState, openPriorFindings, parseCommentHead, type PriorFinding, type PriorState } from "./prior.ts";
 export { buildReview, findingCommentBody, inlineComment, recheckReplyBody } from "./publish.ts";
 export { snapshotLookup } from "./lookup.ts";
+export * from "./skip.ts";
+export { historyTools, HISTORY_TOOL_NAMES, type HistoryScope } from "./history-tools.ts";

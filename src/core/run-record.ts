@@ -35,6 +35,27 @@ export const StepRecord = Type.Object({
   /** Aborted model calls report zero usage, so a timed-out step under-reports (A-6). */
   usageComplete: Type.Boolean(),
   rejectedCalls: Type.Array(Type.Object({ tool: Type.String(), reason: Type.String() })),
+  /**
+   * What was sent to the provider, one entry per model call: model, counts,
+   * settings, body size and hash; never message text or the key (A-6).
+   * Absent when the provider does not report the request body.
+   */
+  requests: Type.Optional(
+    Type.Array(
+      Type.Object({
+        model: Type.Optional(Type.String()),
+        messages: Type.Optional(Type.Integer({ minimum: 0 })),
+        toolCount: Type.Optional(Type.Integer({ minimum: 0 })),
+        toolNames: Type.Optional(Type.Array(Type.String())),
+        maxTokens: Type.Optional(Type.Number()),
+        temperature: Type.Optional(Type.Number()),
+        reasoning: Type.Optional(Type.String()),
+        routing: Type.Optional(Type.String()),
+        bytes: Type.Integer({ minimum: 0 }),
+        sha256: Type.String(),
+      }),
+    ),
+  ),
 });
 export type StepRecord = Static<typeof StepRecord>;
 
@@ -79,6 +100,12 @@ export const RunInfo = Type.Object({
     summary: Type.String({ description: "One-line check-run summary" }),
     publishedCommentIds: Type.Array(Type.String()),
     skipReason: Type.Optional(Type.String()),
+    /** Which S-1 condition skipped the run: not-onboarded, draft, opt-out, round-cap, label, deps-only, already-reviewed. */
+    skipKind: Type.Optional(Type.String()),
+    /** Why the review is partial (S-9), as stated in the summary. */
+    partial: Type.Optional(Type.String()),
+    /** The whole-run deadline stopped the run (S-4 Limits). */
+    deadlineReached: Type.Optional(Type.Boolean()),
   }),
 });
 export type RunInfo = Static<typeof RunInfo>;

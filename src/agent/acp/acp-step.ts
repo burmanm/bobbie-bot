@@ -33,6 +33,7 @@ import type {
 } from "../types.ts";
 import { AcpConnection, AgentExitedError, AUTH_REQUIRED, INVALID_PARAMS, METHOD_NOT_FOUND, RESOURCE_NOT_FOUND, RpcError } from "./connection.ts";
 import { checkCall, describeOutputTools, extractCalls, OUTPUT_FORMAT } from "./outputs.ts";
+import { stopReasonOf } from "../limits.ts";
 
 /** The provider name that selects an ACP agent: model `acp/<agent name>`. */
 export const ACP_PROVIDER = "acp";
@@ -119,6 +120,7 @@ function emptyResult<T extends OutputTool>(): AgentStepResult<T> {
     toolCalls: { total: 0, failed: 0 },
     usage: { turns: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0, costIsBilled: false, usageComplete: false, wallMs: 0 },
     servedModels: [],
+    providerRequests: [],
     harness: { name: "acp", version: "unknown", extensions: [], tools: [] },
   };
 }
@@ -146,8 +148,8 @@ async function runStep<T extends OutputTool>(request: AgentStepRequest<T>, optio
     return finish();
   };
   if (request.signal?.aborted) {
-    result.outcome = "cancelled";
-    result.stoppedBy = "cancelled";
+    result.stoppedBy = stopReasonOf(request.signal);
+    result.outcome = result.stoppedBy === "deadline" ? "timeout" : "cancelled";
     return finish();
   }
 
@@ -293,7 +295,7 @@ async function runStep<T extends OutputTool>(request: AgentStepRequest<T>, optio
   };
 
   const timeout = setTimeout(() => stop("timeout"), limits.timeoutMs);
-  const onCancel = () => stop("cancelled");
+  const onCancel = () => stop(stopReasonOf(request.signal));
   request.signal?.addEventListener("abort", onCancel, { once: true });
   resetIdle();
 
@@ -427,8 +429,16 @@ async function runStep<T extends OutputTool>(request: AgentStepRequest<T>, optio
 
   function finishStopped(): AgentStepResult<T> {
     result.stoppedBy = stoppedBy!;
-    result.outcome = stoppedBy === "cancelled" ? "cancelled" : stoppedBy === "timeout" || stoppedBy === "idle" ? "timeout" : "truncated";
-    if (!settled) result.error = { kind: "internal", message: "ACP agent did not settle after cancel" };
+    result.outcome =
+      stoppedBy === "cancelled"
+        ? "cancelled"
+        : stoppedBy === "timeout" || stoppedBy === "idle" || stoppedBy === "deadline"
+          ? "timeout"
+          : "truncated";
+    if (!settled) {
+      result.abandoned = true;
+      result.error = { kind: "internal", message: "ACP agent did not settle after cancel" };
+    }
     return finish();
   }
 }

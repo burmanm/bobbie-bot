@@ -9,9 +9,10 @@
  * does. Those are outcomes.
  */
 import type { Static, TSchema } from "typebox";
-import type { OutputTool, ReadToolName } from "../../pi-review/extension/index.ts";
+import type { OutputTool, QueryTool, ReadToolName } from "../../pi-review/extension/index.ts";
+import type { ProviderRequestSummary } from "./request-summary.ts";
 
-export type { OutputTool, ReadToolName };
+export type { OutputTool, ProviderRequestSummary, QueryTool, ReadToolName };
 
 export type Role = "reviewer" | "verifier" | "learner";
 
@@ -50,7 +51,10 @@ export interface ReadRoots {
 export interface StepLimits {
   /** Whole step, wall clock. */
   timeoutMs: number;
-  /** No session event for this long. */
+  /**
+   * No session event (model output, tool start or end) for this long: a
+   * provider that stopped streaming, or a hung tool call.
+   */
   idleTimeoutMs?: number;
   /** Model calls. The step stops when another call would exceed it. */
   maxTurns: number;
@@ -77,8 +81,16 @@ export interface AgentStepRequest<T extends OutputTool = OutputTool> {
    * `core` and are plugged in by the caller.
    */
   outputTools: readonly T[];
+  /**
+   * Read-only queries answered by the orchestrator: history and issue
+   * search (S-4). Optional; a step without them has none.
+   */
+  queryTools?: readonly QueryTool[];
   limits: StepLimits;
-  /** Run cancellation (for example a newer push). */
+  /**
+   * Run cancellation (for example a newer push), or the run deadline when
+   * aborted with `RUN_DEADLINE` as the reason (limits.ts).
+   */
   signal?: AbortSignal;
   /** Heartbeat (C-8): after each model call and each tool call. */
   onProgress?: (progress: StepProgress) => void;
@@ -91,7 +103,7 @@ export type ToolOutput<T extends OutputTool> =
 export type StepOutcome = "ok" | "timeout" | "error" | "truncated" | "cancelled";
 
 /** Which limit or event ended the step early. */
-export type StoppedBy = "turns" | "cost" | "timeout" | "idle" | "output-length" | "cancelled";
+export type StoppedBy = "turns" | "cost" | "timeout" | "idle" | "deadline" | "output-length" | "cancelled";
 
 export interface RejectedCall {
   toolCallId: string;
@@ -99,8 +111,8 @@ export interface RejectedCall {
   /**
    * - guard: blocked by the tool_call guard (allowlist, path outside the roots)
    * - not-allowed: a tool that is not declared to the model at all
-   * - schema: arguments failed the output tool's schema
-   * - validator: arguments failed the output tool's cross-field rules
+   * - schema: arguments failed the output or query tool's schema
+   * - validator: arguments failed the output or query tool's cross-field rules
    */
   kind: "guard" | "not-allowed" | "schema" | "validator";
   reason: string;
@@ -139,12 +151,24 @@ export interface AgentStepResult<T extends OutputTool = OutputTool> {
   /** `responseModel ?? model` per call, distinct, in first-seen order (A-6, C-6). */
   servedModels: string[];
   /**
+   * One summary per request pi sent to the provider, in order (A-6), from
+   * `before_provider_request`. Empty for providers that do not report the
+   * request body (the scripted provider; ACP agents).
+   */
+  providerRequests: ProviderRequestSummary[];
+  /**
    * True when the requested model id is not in pi's offline catalog and was
    * used as a custom id on the provider (C-6). Its context window and output
    * limit are borrowed from another model of the provider, and cost comes
    * only from what the provider bills.
    */
   uncataloguedModel?: boolean;
+  /**
+   * Set when a step that was stopped did not settle within the grace period
+   * after the abort (pi still waiting on a provider or tool that ignores
+   * the abort). The step returned anyway; usage is incomplete.
+   */
+  abandoned?: boolean;
   harness: {
     /** `pi-sdk`: our pi session. `acp`: an external agent over ACP; `version` is the agent's. */
     name: "pi-sdk" | "acp";

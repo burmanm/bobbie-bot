@@ -11,6 +11,7 @@ import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { parse as parseYaml } from "yaml";
 import type { ModelRef, StepLimits, ThinkingLevel } from "../agent/index.ts";
+import { cloneSkipConfig, DEFAULT_SKIP, type SkipConfig } from "./skip.ts";
 
 export const PIPELINE_ROLES = ["reviewer", "verifier"] as const;
 export type PipelineRole = (typeof PIPELINE_ROLES)[number];
@@ -20,24 +21,28 @@ export interface PipelineConfig {
   limits: Record<PipelineRole, StepLimits> & {
     /** Whole-run spend cap (S-4 Limits). */
     runCostUsd: number;
+    /**
+     * Whole-run deadline, from the start of the run (S-4 Limits, S-9). When
+     * it passes, the running step is stopped, no further step starts, and
+     * what exists is published labelled partial with a neutral check. Set
+     * the CI job's own timeout a few minutes above it, so publishing fits.
+     */
+    runTimeoutMs: number;
     /** Above this many patch lines the review is chunked by directory (S-4 Phase 1). */
     chunkPatchLines: number;
   };
-  skip: {
-    draft: boolean;
-    /** A PR carrying any of these labels is skipped (S-1: opt-out, round cap). */
-    labels: string[];
-  };
+  /** S-1 skip conditions; see skip.ts. */
+  skip: SkipConfig;
 }
 
 export const DEFAULT_LIMITS: PipelineConfig["limits"] = {
   reviewer: { timeoutMs: 20 * 60_000, idleTimeoutMs: 3 * 60_000, maxTurns: 120 },
   verifier: { timeoutMs: 8 * 60_000, idleTimeoutMs: 3 * 60_000, maxTurns: 40 },
   runCostUsd: 5,
+  runTimeoutMs: 45 * 60_000,
   chunkPatchLines: 4000,
 };
 
-export const DEFAULT_SKIP: PipelineConfig["skip"] = { draft: true, labels: ["round-cap"] };
 
 export class ConfigError extends Error {
   override name = "ConfigError";
@@ -81,6 +86,8 @@ const RoleYaml = Type.Union([
   ),
 ]);
 
+const LabelList = Type.Array(Type.String({ minLength: 1 }));
+
 /** `.review/review-bot.yaml` (A-5). Bot settings only; never review guidance. */
 export const BotConfigYaml = Type.Object(
   {
@@ -91,6 +98,7 @@ export const BotConfigYaml = Type.Object(
           reviewer: Type.Optional(LimitsYaml),
           verifier: Type.Optional(LimitsYaml),
           runCostUsd: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
+          runTimeoutSeconds: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
           chunkPatchLines: Type.Optional(Type.Integer({ minimum: 1 })),
         },
         { additionalProperties: false },
@@ -98,7 +106,18 @@ export const BotConfigYaml = Type.Object(
     ),
     skip: Type.Optional(
       Type.Object(
-        { draft: Type.Optional(Type.Boolean()), labels: Type.Optional(Type.Array(Type.String({ minLength: 1 }))) },
+        {
+          draft: Type.Optional(Type.Boolean()),
+          labels: Type.Optional(LabelList),
+          optOutLabels: Type.Optional(LabelList),
+          roundCapLabels: Type.Optional(LabelList),
+          dependencies: Type.Optional(
+            Type.Object(
+              { labels: Type.Optional(LabelList), paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }))) },
+              { additionalProperties: false },
+            ),
+          ),
+        },
         { additionalProperties: false },
       ),
     ),
@@ -122,8 +141,11 @@ export interface ConfigInputs {
   /** role → OpenRouter provider slugs the model may be served by (routing `only`). */
   providers?: Partial<Record<PipelineRole, string[]>>;
   runCostUsd?: number;
+  runTimeoutMs?: number;
   chunkPatchLines?: number;
   skipDraft?: boolean;
+  /** S-1 skip labels and dependency paths (workflow inputs); each replaces its default. */
+  skip?: Partial<Omit<SkipConfig, "draft" | "dependencies">> & { dependencyLabels?: string[]; dependencyPaths?: string[] };
   /** Per-role step limits (workflow inputs). */
   limits?: Partial<Record<PipelineRole, Partial<StepLimits>>>;
 }
@@ -183,7 +205,7 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
   const config: PipelineConfig = {
     roles: {},
     limits: { ...DEFAULT_LIMITS, reviewer: { ...DEFAULT_LIMITS.reviewer }, verifier: { ...DEFAULT_LIMITS.verifier } },
-    skip: { ...DEFAULT_SKIP, labels: [...DEFAULT_SKIP.labels] },
+    skip: cloneSkipConfig(DEFAULT_SKIP),
   };
   for (const role of PIPELINE_ROLES) {
     const spec = inputs.models?.[role];
@@ -206,8 +228,15 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
     if (l !== undefined) config.limits[role] = { ...config.limits[role], ...(l as StepLimits) };
   }
   if (inputs.runCostUsd !== undefined) config.limits.runCostUsd = inputs.runCostUsd;
+  if (inputs.runTimeoutMs !== undefined) config.limits.runTimeoutMs = inputs.runTimeoutMs;
   if (inputs.chunkPatchLines !== undefined) config.limits.chunkPatchLines = inputs.chunkPatchLines;
   if (inputs.skipDraft !== undefined) config.skip.draft = inputs.skipDraft;
+  const sk = inputs.skip;
+  if (sk?.labels !== undefined) config.skip.labels = [...sk.labels];
+  if (sk?.optOutLabels !== undefined) config.skip.optOutLabels = [...sk.optOutLabels];
+  if (sk?.roundCapLabels !== undefined) config.skip.roundCapLabels = [...sk.roundCapLabels];
+  if (sk?.dependencyLabels !== undefined) config.skip.dependencies.labels = [...sk.dependencyLabels];
+  if (sk?.dependencyPaths !== undefined) config.skip.dependencies.paths = [...sk.dependencyPaths];
 
   if (yamlText !== undefined) {
     const y = parseBotConfigYaml(yamlText);
@@ -218,9 +247,14 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
     config.limits.reviewer = limitsFromYaml(config.limits.reviewer, y.limits?.reviewer);
     config.limits.verifier = limitsFromYaml(config.limits.verifier, y.limits?.verifier);
     if (y.limits?.runCostUsd !== undefined) config.limits.runCostUsd = y.limits.runCostUsd;
+    if (y.limits?.runTimeoutSeconds !== undefined) config.limits.runTimeoutMs = Math.round(y.limits.runTimeoutSeconds * 1000);
     if (y.limits?.chunkPatchLines !== undefined) config.limits.chunkPatchLines = y.limits.chunkPatchLines;
     if (y.skip?.draft !== undefined) config.skip.draft = y.skip.draft;
     if (y.skip?.labels !== undefined) config.skip.labels = y.skip.labels;
+    if (y.skip?.optOutLabels !== undefined) config.skip.optOutLabels = y.skip.optOutLabels;
+    if (y.skip?.roundCapLabels !== undefined) config.skip.roundCapLabels = y.skip.roundCapLabels;
+    if (y.skip?.dependencies?.labels !== undefined) config.skip.dependencies.labels = y.skip.dependencies.labels;
+    if (y.skip?.dependencies?.paths !== undefined) config.skip.dependencies.paths = y.skip.dependencies.paths;
   }
   for (const role of PIPELINE_ROLES) {
     const ref = config.roles[role];
@@ -229,4 +263,24 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
     }
   }
   return config;
+}
+
+/**
+ * A duration as given on the command line: "90" or "90s" (seconds), "20m",
+ * "1.5h". Returns milliseconds, or undefined when it is not one.
+ */
+export function parseDuration(text: string): number | undefined {
+  const m = /^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h)?\s*$/i.exec(text);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  const unit = (m[2] ?? "s").toLowerCase();
+  const ms = unit === "ms" ? n : unit === "s" ? n * 1000 : unit === "m" ? n * 60_000 : n * 3_600_000;
+  return ms > 0 && Number.isFinite(ms) ? Math.round(ms) : undefined;
+}
+
+export function formatDuration(ms: number): string {
+  if (ms >= 3_600_000 && ms % 3_600_000 === 0) return `${ms / 3_600_000} h`;
+  if (ms >= 60_000 && ms % 60_000 === 0) return `${ms / 60_000} min`;
+  if (ms >= 1000) return `${Math.round(ms / 1000)} s`;
+  return `${ms} ms`;
 }
