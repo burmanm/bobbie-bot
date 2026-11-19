@@ -251,6 +251,9 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     const err = result.error ? `${result.error.kind}: ${result.error.message}` : result.stoppedBy ? `stopped by ${result.stoppedBy}` : undefined;
     if (err !== undefined) record.error = err;
     steps.push(record);
+    if (result.uncataloguedModel) {
+      log(`${stepName}: model "${formatModel(model)}" is not in pi's offline catalog; used as a custom id (context window and output limit borrowed from another ${model.provider} model)`);
+    }
     log(
       `${stepName} ${result.outcome} ${Math.round(performance.now() - t)}ms turns=${result.usage.turns} outputs=${result.outputs.length} cost=$${result.usage.costUsd.toFixed(4)}${err ? ` (${err})` : ""}`,
     );

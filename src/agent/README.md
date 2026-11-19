@@ -43,7 +43,14 @@ backed by the pi SDK; the guard and tools it loads live in
 
 ## Behaviour worth knowing
 
-- **Configuration errors** (unknown model, missing root, no credentials,
+- **Model ids missing from pi's offline catalog** (C-6: models change
+  faster than pi releases) are used as custom ids, as pi's own CLI does:
+  transport settings come from another model of the same provider, the price
+  table is zeroed (no estimate from another model's prices; OpenRouter still
+  reports its billed cost), and the result has `uncataloguedModel: true`. A
+  wrong id fails at the provider as a `provider` error. An unknown provider
+  is still a configuration error.
+- **Configuration errors** (unknown provider, missing root, no credentials,
   missing `rg`, bad limits or tool names) return `outcome: "error"` with
   `error.kind: "config"` before any model call.
 - **Isolation is checked on the live session** before the first call: the
