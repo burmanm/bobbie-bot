@@ -94,6 +94,20 @@ test("timeout flags: bad durations and roles are usage errors; a short run deadl
   assert.match(payload.check_run.output.summary, /run deadline of 1 ms was reached/);
 });
 
+test("--head and --as-of: only with --pr, a SHA and a time", async () => {
+  const cases: Array<[string[], RegExp]> = [
+    [["--fixture", FIXTURE, "--head", "abc1234"], /--head and --as-of need --pr/],
+    [["--pr", "o/r#1", "--head", "main"], /invalid --head main/],
+    [["--pr", "o/r#1", "--as-of", "2024-01-01T00:00:00Z"], /--as-of needs --head/],
+    [["--pr", "o/r#1", "--head", "abc1234", "--as-of", "yesterday"], /invalid --as-of/],
+  ];
+  for (const [extra, message] of cases) {
+    const cap = io();
+    assert.equal(await main(["review", "--dry-run", ...extra], cap.io), 2, extra.join(" "));
+    assert.match(cap.out.stderr, message);
+  }
+});
+
 test("malformed --acp-agent and --acp-config are usage errors", async () => {
   const bad = io();
   assert.equal(await main(["review", "--dry-run", "--fixture", FIXTURE, "--acp-agent", "=node"], bad.io), 2);

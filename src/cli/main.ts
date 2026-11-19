@@ -39,6 +39,8 @@ import {
   type SnapshotSource,
 } from "../platform/index.ts";
 import { type ConfigInputs, parseDuration, PIPELINE_ROLES, type PipelineRole, runReview } from "../pipeline/index.ts";
+import { GhHistory } from "../platform/history-github.ts";
+import { AtHeadReader } from "../platform/history-head.ts";
 
 const USAGE = `Usage:
   review-bot review --dry-run --pr <owner/repo#N | PR URL> [options]
@@ -49,6 +51,13 @@ Source:
   --repo-dir <dir>         Extract trees with git archive from this clone
                            (default with --pr: download tarballs through gh)
   --fixture <dir>          Read the PR from a fixture directory
+  --head <sha>             With --pr: review the PR as it was at this earlier
+                           head (replays, E-2). Base = merge base; comments
+                           made after the head's commit time are left out
+  --as-of <time>           With --head: cutoff for comments and history
+                           (ISO 8601) instead of the head's commit time
+  --no-history             Do not offer git_log/git_blame/git_show/
+                           search_issues (default with --pr: offered via gh)
 
 Knowledge (default: AGENTS.md, REVIEW.md, .review/*-guidelines.md from the base tree):
   --knowledge-dir <dir>    Read AGENTS.md, REVIEW.md, .review/ from here instead
@@ -192,6 +201,9 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
         pr: { type: "string" },
         "repo-dir": { type: "string" },
         fixture: { type: "string" },
+        head: { type: "string" },
+        "as-of": { type: "string" },
+        "no-history": { type: "boolean" },
         "knowledge-dir": { type: "string" },
         guidelines: { type: "string", multiple: true },
         model: { type: "string", multiple: true },
@@ -234,6 +246,12 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
     let reader: PrReader;
     let snapshots: SnapshotSource;
     let prRef: { repo: string; number: number } | undefined;
+    let history: GhHistory | undefined;
+    let replay: AtHeadReader | undefined;
+    if (args.fixture !== undefined && (args.head !== undefined || args["as-of"] !== undefined)) {
+      throw new UsageError("--head and --as-of need --pr");
+    }
+    if (args["as-of"] !== undefined && args.head === undefined) throw new UsageError("--as-of needs --head");
     if (args.fixture !== undefined) {
       const fixture = new FixturePrReader(resolve(args.fixture));
       reader = fixture;
@@ -243,6 +261,16 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       if (ref === undefined) throw new UsageError(`cannot parse --pr ${args.pr}; use owner/repo#123 or a PR URL`);
       prRef = ref;
       reader = new GhPrReader(ref.repo, ref.number);
+      if (!args["no-history"] || args.head !== undefined) history = new GhHistory(ref.repo);
+      if (args.head !== undefined) {
+        if (!/^[0-9a-f]{7,40}$/.test(args.head)) throw new UsageError(`invalid --head ${args.head}: give a commit SHA`);
+        if (args["as-of"] !== undefined && Number.isNaN(Date.parse(args["as-of"]))) throw new UsageError(`invalid --as-of ${args["as-of"]}`);
+        replay = new AtHeadReader(reader, history!, args.head, {
+          ...(args["as-of"] === undefined ? {} : { asOf: args["as-of"] }),
+          ...(args.quiet ? {} : { log: (line: string) => io.stderr(`[review-bot] ${line}\n`) }),
+        });
+        reader = replay;
+      }
       snapshots = args["repo-dir"] !== undefined ? new GitArchiveSnapshots(resolve(args["repo-dir"])) : new GhTarballSnapshots(ref.repo);
     }
 
@@ -302,8 +330,11 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       knowledgeOverride,
       ...(modcache === undefined ? {} : { modcache }),
       runsDir: resolve(args["runs-dir"] ?? join(tmpdir(), "review-bot-runs")),
-      trigger: "cli-dry-run",
+      trigger: replay === undefined ? "cli-dry-run" : "cli-dry-run-replay",
       ...(prRef === undefined ? {} : { prRef }),
+      ...(history === undefined || args["no-history"]
+        ? {}
+        : { history: { source: history, ...(replay === undefined ? {} : { asOf: () => replay.cutoff }) } }),
       signal: controller.signal,
       log,
     });
