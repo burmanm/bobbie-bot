@@ -11,6 +11,7 @@ import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import { parse as parseYaml } from "yaml";
 import type { ModelRef, StepLimits, ThinkingLevel } from "../agent/index.ts";
+import { cloneSkipConfig, DEFAULT_SKIP, type SkipConfig } from "./skip.ts";
 
 export const PIPELINE_ROLES = ["reviewer", "verifier"] as const;
 export type PipelineRole = (typeof PIPELINE_ROLES)[number];
@@ -30,11 +31,8 @@ export interface PipelineConfig {
     /** Above this many patch lines the review is chunked by directory (S-4 Phase 1). */
     chunkPatchLines: number;
   };
-  skip: {
-    draft: boolean;
-    /** A PR carrying any of these labels is skipped (S-1: opt-out, round cap). */
-    labels: string[];
-  };
+  /** S-1 skip conditions; see skip.ts. */
+  skip: SkipConfig;
 }
 
 export const DEFAULT_LIMITS: PipelineConfig["limits"] = {
@@ -45,7 +43,6 @@ export const DEFAULT_LIMITS: PipelineConfig["limits"] = {
   chunkPatchLines: 4000,
 };
 
-export const DEFAULT_SKIP: PipelineConfig["skip"] = { draft: true, labels: ["round-cap"] };
 
 export class ConfigError extends Error {
   override name = "ConfigError";
@@ -89,6 +86,8 @@ const RoleYaml = Type.Union([
   ),
 ]);
 
+const LabelList = Type.Array(Type.String({ minLength: 1 }));
+
 /** `.review/review-bot.yaml` (A-5). Bot settings only; never review guidance. */
 export const BotConfigYaml = Type.Object(
   {
@@ -107,7 +106,18 @@ export const BotConfigYaml = Type.Object(
     ),
     skip: Type.Optional(
       Type.Object(
-        { draft: Type.Optional(Type.Boolean()), labels: Type.Optional(Type.Array(Type.String({ minLength: 1 }))) },
+        {
+          draft: Type.Optional(Type.Boolean()),
+          labels: Type.Optional(LabelList),
+          optOutLabels: Type.Optional(LabelList),
+          roundCapLabels: Type.Optional(LabelList),
+          dependencies: Type.Optional(
+            Type.Object(
+              { labels: Type.Optional(LabelList), paths: Type.Optional(Type.Array(Type.String({ minLength: 1 }))) },
+              { additionalProperties: false },
+            ),
+          ),
+        },
         { additionalProperties: false },
       ),
     ),
@@ -134,6 +144,8 @@ export interface ConfigInputs {
   runTimeoutMs?: number;
   chunkPatchLines?: number;
   skipDraft?: boolean;
+  /** S-1 skip labels and dependency paths (workflow inputs); each replaces its default. */
+  skip?: Partial<Omit<SkipConfig, "draft" | "dependencies">> & { dependencyLabels?: string[]; dependencyPaths?: string[] };
   /** Per-role step limits (workflow inputs). */
   limits?: Partial<Record<PipelineRole, Partial<StepLimits>>>;
 }
@@ -193,7 +205,7 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
   const config: PipelineConfig = {
     roles: {},
     limits: { ...DEFAULT_LIMITS, reviewer: { ...DEFAULT_LIMITS.reviewer }, verifier: { ...DEFAULT_LIMITS.verifier } },
-    skip: { ...DEFAULT_SKIP, labels: [...DEFAULT_SKIP.labels] },
+    skip: cloneSkipConfig(DEFAULT_SKIP),
   };
   for (const role of PIPELINE_ROLES) {
     const spec = inputs.models?.[role];
@@ -219,6 +231,12 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
   if (inputs.runTimeoutMs !== undefined) config.limits.runTimeoutMs = inputs.runTimeoutMs;
   if (inputs.chunkPatchLines !== undefined) config.limits.chunkPatchLines = inputs.chunkPatchLines;
   if (inputs.skipDraft !== undefined) config.skip.draft = inputs.skipDraft;
+  const sk = inputs.skip;
+  if (sk?.labels !== undefined) config.skip.labels = [...sk.labels];
+  if (sk?.optOutLabels !== undefined) config.skip.optOutLabels = [...sk.optOutLabels];
+  if (sk?.roundCapLabels !== undefined) config.skip.roundCapLabels = [...sk.roundCapLabels];
+  if (sk?.dependencyLabels !== undefined) config.skip.dependencies.labels = [...sk.dependencyLabels];
+  if (sk?.dependencyPaths !== undefined) config.skip.dependencies.paths = [...sk.dependencyPaths];
 
   if (yamlText !== undefined) {
     const y = parseBotConfigYaml(yamlText);
@@ -233,6 +251,10 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
     if (y.limits?.chunkPatchLines !== undefined) config.limits.chunkPatchLines = y.limits.chunkPatchLines;
     if (y.skip?.draft !== undefined) config.skip.draft = y.skip.draft;
     if (y.skip?.labels !== undefined) config.skip.labels = y.skip.labels;
+    if (y.skip?.optOutLabels !== undefined) config.skip.optOutLabels = y.skip.optOutLabels;
+    if (y.skip?.roundCapLabels !== undefined) config.skip.roundCapLabels = y.skip.roundCapLabels;
+    if (y.skip?.dependencies?.labels !== undefined) config.skip.dependencies.labels = y.skip.dependencies.labels;
+    if (y.skip?.dependencies?.paths !== undefined) config.skip.dependencies.paths = y.skip.dependencies.paths;
   }
   for (const role of PIPELINE_ROLES) {
     const ref = config.roles[role];

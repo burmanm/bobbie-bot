@@ -3,4 +3,5 @@ limits:
   verifier:
     maxTurns: 20
 skip:
-  labels: [round-cap, ai-review/skip]
+  roundCapLabels: [round-cap]
+  optOutLabels: [ai-review/skip]

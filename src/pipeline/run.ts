@@ -76,6 +76,7 @@ import { loadMethod, type Method } from "./method.ts";
 import { buildReview, failureCommentBody, recheckReplyBody } from "./publish.ts";
 import { derivePriorState, openPriorFindings, type PriorFinding, type PriorState } from "./prior.ts";
 import { isValidRecheck, type Recheck, RECHECK_TOOLS, REVIEWER_TOOLS, VERIFIER_TOOLS } from "./tools.ts";
+import { dependencyLabelNote, dependencyOnlySkip, type SkipDecision, skipBeforeDiff } from "./skip.ts";
 
 export interface ReviewRunOptions {
   platform: Platform;
@@ -174,6 +175,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
   let conclusion: CheckConclusion = "neutral";
   let checkSummary = "Review did not start.";
   let skipReason: string | undefined;
+  let skipKind: SkipDecision["kind"] | undefined;
   let publication: Publication | undefined;
   let published = false;
   let checkCompleted = false;
@@ -378,14 +380,11 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     const prior: PriorState = derivePriorState(comments, botId);
     round = prior.rounds + 1;
 
-    const skip = ((): string | undefined => {
-      if (knowledge.review === undefined) return "the repository has no REVIEW.md on the base branch, so it is not onboarded for automated review (A-5)";
-      if (pr.draft && config.skip.draft) return "the pull request is a draft";
-      const label = pr.labels.find((l) => config!.skip.labels.includes(l));
-      if (label !== undefined) return `the pull request has the label "${label}"`;
-      if (prior.lastReviewedSha === pr.headSha) return `head ${short(pr.headSha)} was already reviewed (run is idempotent, C-1)`;
-      return undefined;
-    })();
+    // S-1 skip conditions (skip.ts); the deps-only one needs the diff and comes after it.
+    let skip: SkipDecision | undefined = skipBeforeDiff(pr, config.skip, {
+      hasReviewMd: knowledge.review !== undefined,
+      lastReviewedSha: prior.lastReviewedSha,
+    });
 
     let sinceSha: string | undefined;
     let reviewDiffText: string | undefined;
@@ -393,6 +392,12 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     if (skip === undefined) {
       fullDiffText = await timed("S-1 diff", () => o.platform.getDiff(), (d) => `${d?.length ?? 0} bytes`);
       if (fullDiffText === undefined) throw new RunFailure("the platform returned no diff");
+      const fullParsed = parseDiff(fullDiffText);
+      skip = dependencyOnlySkip(pr, fullParsed, config.skip);
+      const depsNote = skip === undefined ? dependencyLabelNote(pr, fullParsed, config.skip) : undefined;
+      if (depsNote !== undefined) log(`S-1 ${depsNote}`);
+    }
+    if (skip === undefined) {
       if (prior.lastReviewedSha !== undefined) {
         const since = prior.lastReviewedSha;
         const d = await timed("S-1 incremental diff", () => o.platform.getDiff(since), (x) => (x === undefined ? "unavailable, full review" : `${x.length} bytes`));
@@ -427,9 +432,10 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     });
 
     if (skip !== undefined) {
-      skipReason = skip;
-      log(`S-1 skipped: ${skip}`);
-      await complete("skipped", `Skipped: ${skip}.`);
+      skipReason = skip.reason;
+      skipKind = skip.kind;
+      log(`S-1 skipped (${skip.kind}): ${skip.reason}`);
+      await complete("skipped", `Skipped: ${skip.reason}.`);
       return await finish();
     }
 
@@ -800,6 +806,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     for (const [k, v] of Object.entries(config?.roles ?? {})) roles[k] = formatModel(v);
     const result: RunRecord["run"]["result"] = { checkConclusion: conclusion, summary: checkSummary, publishedCommentIds: publishedIds };
     if (skipReason !== undefined) result.skipReason = skipReason;
+    if (skipKind !== undefined) result.skipKind = skipKind;
     if (partialNote !== undefined) result.partial = partialNote;
     if (deadlineReached()) result.deadlineReached = true;
     return {

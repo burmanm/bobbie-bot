@@ -136,8 +136,31 @@ limits:
   chunkPatchLines: 4000
 skip:
   draft: true
-  labels: [round-cap]
+  optOutLabels: [ai-review/skip]
+  roundCapLabels: [round-cap]
+  labels: []
+  dependencies:
+    labels: [deps]
+    paths: [go.mod, go.sum, "vendor/**"]
 ```
+
+**Skip conditions** (S-1). Each completes the check as *skipped* with the
+reason in its summary and writes a run record (`result.skipKind`,
+`result.skipReason`); no model is called. In order:
+
+| Condition | Default | `skipKind` |
+|---|---|---|
+| No root `REVIEW.md` on the base branch | always | `not-onboarded` |
+| Draft | `draft: true` (`--include-drafts` turns it off) | `draft` |
+| Opt-out label | `optOutLabels: [ai-review/skip]` | `opt-out` |
+| Round-cap label (set by the review-process workflow) | `roundCapLabels: [round-cap]` | `round-cap` |
+| Any other label listed | `labels: []` | `label` |
+| Dependency-label PR that changes only dependency files | `dependencies.labels: [deps]`; `dependencies.paths`: Go, npm, Cargo, pip/Poetry, Bundler, Maven and Gradle manifests and lock files, `vendor/**` | `deps-only` |
+| This head was already reviewed | always | `already-reviewed` |
+
+Labels match case-insensitively. A `deps`-labelled PR that also changes
+anything else is reviewed in full (the log says why). Each list replaces
+its default; `[]` turns a condition off.
 
 `providers` (OpenRouter models only) restricts which upstream providers may
 serve the model: it becomes OpenRouter's routing `only` with fallbacks off,

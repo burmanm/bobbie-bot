@@ -79,6 +79,8 @@ export const RunInfo = Type.Object({
     summary: Type.String({ description: "One-line check-run summary" }),
     publishedCommentIds: Type.Array(Type.String()),
     skipReason: Type.Optional(Type.String()),
+    /** Which S-1 condition skipped the run: not-onboarded, draft, opt-out, round-cap, label, deps-only, already-reviewed. */
+    skipKind: Type.Optional(Type.String()),
     /** Why the review is partial (S-9), as stated in the summary. */
     partial: Type.Optional(Type.String()),
     /** The whole-run deadline stopped the run (S-4 Limits). */
