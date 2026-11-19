@@ -204,9 +204,10 @@ checks out the PR, and nothing from the PR is executed anywhere.
   extracted where no `.git`, `AGENTS.md` or `CLAUDE.md` exists in any
   parent. The repository's `AGENTS.md` reaches the model from the **base**
   branch as delimited data, never as instructions to pi.
-- **No downloads at review time.** `rg` and `fd` are built into the action
-  image from pinned release assets verified by SHA-256; `PI_OFFLINE=1` stops
-  pi from fetching them or refreshing its model catalog. The image itself is
+- **No downloads at review time.** `rg` and `fd` (pi's search) and `gh` (the
+  read-only history tools) are built into the action image from pinned
+  release assets verified by SHA-256; `PI_OFFLINE=1` stops pi from fetching
+  binaries or refreshing its model catalog. The image itself is
   built at the start of each job from the pinned action commit: base image
   pinned by digest, npm dependencies from the lockfile with
   `--ignore-scripts`, no `apt-get`.

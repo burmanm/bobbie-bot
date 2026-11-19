@@ -155,7 +155,7 @@ test("the image: pinned base by digest, pinned checksummed tools, npm ci --ignor
   assert.match(docker, /npm ci --ignore-scripts/);
   assert.match(docker, /PI_OFFLINE=1/);
   const tools = JSON.parse(read("action/tools.json")) as { tools: Array<{ name: string; version: string; assets: Record<string, { url: string; sha256: string; member: string }> }> };
-  assert.deepEqual(tools.tools.map((t) => t.name).sort(), ["fd", "rg"]);
+  assert.deepEqual(tools.tools.map((t) => t.name).sort(), ["fd", "gh", "rg"]);
   for (const t of tools.tools) {
     assert.deepEqual(Object.keys(t.assets).sort(), ["arm64", "x64"]);
     for (const a of Object.values(t.assets)) {
