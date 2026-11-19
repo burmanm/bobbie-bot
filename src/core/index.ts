@@ -14,3 +14,4 @@ export * from "./grounding.ts";
 export * from "./reconcile.ts";
 export * from "./summary.ts";
 export { BOT_VERSION } from "./version.ts";
+export * from "./history.ts";

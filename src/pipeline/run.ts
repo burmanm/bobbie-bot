@@ -13,7 +13,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Value } from "typebox/value";
-import type { AgentStep, AgentStepResult, ModelRef, OutputTool, ReadRoots } from "../agent/index.ts";
+import type { AgentStep, AgentStepResult, ModelRef, OutputTool, QueryTool, ReadRoots } from "../agent/index.ts";
 import { PI_VERSION, RUN_DEADLINE } from "../agent/index.ts";
 import {
   applyVerdict,
@@ -23,6 +23,7 @@ import {
   type Finding,
   FINGERPRINT_VERSION,
   fingerprintFinding,
+  type HistorySource,
   groundFindings,
   indexDiff,
   isInDiff,
@@ -65,6 +66,7 @@ import {
   resolveConfig,
 } from "./config.ts";
 import { buildContext } from "./context.ts";
+import { historyTools } from "./history-tools.ts";
 import { type Chunk, chunkByDirectory, deterministicPass, type DeterministicResult } from "./deterministic.ts";
 import { isKnowledgePath, type Knowledge, knowledgeFileList, type KnowledgeOverride, loadKnowledge } from "./knowledge.ts";
 import { snapshotLookup } from "./lookup.ts";
@@ -95,6 +97,16 @@ export interface ReviewRunOptions {
   methodDir?: string;
   /** The PR as the caller named it, so a record has an identity even when reading the PR fails (S-9). */
   prRef?: { repo: string; number: number };
+  /**
+   * Repository history and issue search for the model steps (S-4), served
+   * through the code host's API. Without it the reviewer has neither and
+   * the summary says so.
+   */
+  history?: {
+    source: HistorySource;
+    /** Replay cutoff, read once the PR is known (E-2, `--head`). */
+    asOf?: () => string | undefined;
+  };
 }
 
 export interface ReviewRunResult {
@@ -267,7 +279,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     stepName: string,
     role: PipelineRole,
     model: ModelRef,
-    req: { systemPrompt: string; prompt: string; roots: ReadRoots; outputTools: readonly T[] },
+    req: { systemPrompt: string; prompt: string; roots: ReadRoots; outputTools: readonly T[]; queryTools?: readonly QueryTool[] },
   ): Promise<AgentStepResult<T> | undefined> => {
     if (deadlineReached()) {
       notRunWhy = `the run deadline of ${formatDuration(deadlineMs)} was reached`;
@@ -293,6 +305,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       roots: req.roots,
       readTools: READ_TOOLS,
       outputTools: req.outputTools,
+      ...(req.queryTools === undefined || req.queryTools.length === 0 ? {} : { queryTools: req.queryTools }),
       limits: { ...roleLimits, maxCostUsd },
       signal: runSignal,
       onProgress: (p) => {
@@ -489,6 +502,12 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     const notRun: string[] = [];
     const checked: string[] = [];
     const partial: string[] = [];
+    const asOf = o.history?.asOf?.();
+    const queryTools: QueryTool[] =
+      o.history === undefined
+        ? []
+        : historyTools({ source: o.history.source, headSha: pr.headSha, baseSha: pr.baseSha, ...(asOf === undefined ? {} : { asOf }) });
+    let issueSearchOffered = false;
 
     // ---- S-4 review -------------------------------------------------------
     let findingSeq = 0;
@@ -506,11 +525,13 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
         prompt,
         roots,
         outputTools: REVIEWER_TOOLS,
+        queryTools,
       });
       if (result === undefined) {
         partial.push(`the reviewer step for ${chunk.name === "all" ? "the change" : chunk.name} was not run: ${notRunWhy}`);
         continue;
       }
+      if (result.harness.tools.includes("search_issues")) issueSearchOffered = true;
       reviewerOutputs += result.outputs.length;
       if (result.outcome === "ok") reviewerOk++;
       else {
@@ -585,6 +606,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
         prompt,
         roots: { head: heads.head, base: heads.base, ...(o.modcache === undefined ? {} : { modcache: o.modcache }) },
         outputTools: VERIFIER_TOOLS,
+        queryTools,
       });
       const verdict = result?.outputs.filter((x) => x.tool === "submit_verdict").map((x) => x.value as Verdict).pop();
       if (verdict === undefined) {
@@ -635,6 +657,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
         prompt: recheckPrompt(p, sinceSha, pr.headSha, det),
         roots,
         outputTools: RECHECK_TOOLS,
+        queryTools,
       });
       const r = result?.outputs.filter((x) => x.tool === "submit_recheck").map((x) => x.value).pop() as Recheck | undefined;
       if (r === undefined || !isValidRecheck(r)) {
@@ -662,7 +685,9 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       notRun.push(`This PR edits ${knowledgeEditedByPr.map((p) => `\`${p}\``).join(", ")}; the review used the base branch's versions (C-3).`);
     }
     const preExisting = preExistingItems(findings);
-    if (preExisting.length > 0) notRun.push("Issue tracker search: not available to the reviewer, so existing `tech-debt` issues were not checked.");
+    if (preExisting.length > 0 && !issueSearchOffered) {
+      notRun.push("Issue tracker search: not available to the reviewer, so existing `tech-debt` issues were not checked.");
+    }
     const earlier = {
       stillOpen: rechecks
         .filter((r) => r.status !== "fixed")
