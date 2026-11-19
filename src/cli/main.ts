@@ -20,6 +20,8 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { PreparedSnapshots, preparedModcache } from "../ci/snapshot.ts";
+import { CI_COMMANDS, CI_USAGE, type CiCommand, runCi } from "./ci.ts";
 import {
   type AcpAgentConfig,
   type AgentStep,
@@ -60,6 +62,8 @@ Source:
   --pr <ref>               The PR on GitHub (dry run: read-only through gh)
   --repo-dir <dir>         Extract trees with git archive from this clone
                            (default with --pr: download tarballs through gh)
+  --snapshot-dir <dir>     Use trees prepared by the CI prepare job
+                           (manifest.json, base/, head/, modcache/), C-4
   --fixture <dir>          Read the PR from a fixture directory
 
 Knowledge (default: AGENTS.md, REVIEW.md, .review/*-guidelines.md from the base tree):
@@ -91,7 +95,8 @@ Run:
   --include-drafts         Review draft PRs too
   --out <file>             Also write the would-be review JSON here
   --quiet                  No progress log on stderr
-`;
+
+${CI_USAGE}`;
 
 class UsageError extends Error {}
 
@@ -166,6 +171,7 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
     io.stdout(USAGE);
     return command === undefined ? 2 : 0;
   }
+  if ((CI_COMMANDS as readonly string[]).includes(command)) return runCi(command as CiCommand, rest, io);
   if (command !== "review") {
     io.stderr(`unknown command: ${command}\n\n${USAGE}`);
     return 2;
@@ -179,6 +185,7 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
         "dry-run": { type: "boolean" },
         pr: { type: "string" },
         "repo-dir": { type: "string" },
+        "snapshot-dir": { type: "string" },
         fixture: { type: "string" },
         "knowledge-dir": { type: "string" },
         guidelines: { type: "string", multiple: true },
@@ -231,6 +238,17 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
       reader = new GhPrReader(ref.repo, ref.number);
       snapshots = args["repo-dir"] !== undefined ? new GitArchiveSnapshots(resolve(args["repo-dir"])) : new GhTarballSnapshots(ref.repo);
     }
+    let preparedCache: string | undefined;
+    if (args["snapshot-dir"] !== undefined) {
+      // Trees prepared by the CI prepare job (C-4); only the SHAs in its manifest are handed out.
+      if (args["repo-dir"] !== undefined) throw new UsageError("give at most one of --repo-dir and --snapshot-dir");
+      const prepared = new PreparedSnapshots(resolve(args["snapshot-dir"]));
+      if (prRef !== undefined) prepared.assertFor(prRef.repo, prRef.number);
+      snapshots = prepared;
+      preparedCache = preparedModcache(prepared.dir, prepared.manifest);
+      const m = prepared.manifest.modcache;
+      if (preparedCache === undefined && !args.quiet) io.stderr(`[review-bot] no module cache from the prepare job: ${m.status}${m.detail ? ` (${m.detail})` : ""}\n`);
+    }
 
     // Models: plain configuration, never a default (P-4).
     const models = pairs(args.model, "--model");
@@ -265,7 +283,13 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
     }
     if (args["include-drafts"]) inputs.skipDraft = false;
 
-    const modcache = args["no-modcache"] ? undefined : args.modcache !== undefined ? resolve(args.modcache) : defaultModcache();
+    const modcache = args["no-modcache"]
+      ? undefined
+      : args.modcache !== undefined
+        ? resolve(args.modcache)
+        : args["snapshot-dir"] !== undefined
+          ? preparedCache
+          : defaultModcache();
     const knowledgeOverride = {
       ...(args["knowledge-dir"] === undefined ? {} : { dir: resolve(args["knowledge-dir"]) }),
       ...(args.guidelines === undefined ? {} : { guidelines: args.guidelines.map((g) => resolve(g)) }),

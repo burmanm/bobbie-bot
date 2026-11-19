@@ -1,0 +1,164 @@
+# review-bot GitHub Action (A-8, C-2). One action for every job of the
+# reference workflow (workflows/review-bot.yml); `command` picks the job's
+# part. Pin it by full commit SHA. Setup and the security model:
+# docs/installing.md.
+#
+# gate, review, complete-check, remove-label run in a locked-down container
+# built from action/Dockerfile (Node, pinned dependencies, pinned and
+# checksum-verified rg and fd; PI_OFFLINE=1). prepare runs on the runner
+# with Go and never sees a secret.
+name: review-bot
+description: Automated pull-request review (gate, prepare, review, complete-check, remove-label)
+author: review-bot
+
+inputs:
+  command:
+    description: "gate | prepare | review | complete-check | remove-label"
+    required: true
+  token:
+    description: >-
+      GitHub token for this job: the job's GITHUB_TOKEN, or an App
+      installation token from actions/create-github-app-token. Use the same
+      identity in gate, review and complete-check (a check run can only be
+      completed by the identity that created it).
+    required: true
+  repo:
+    description: owner/name of the repository under review
+    default: ${{ github.repository }}
+  name:
+    description: Reviewer name; the check run is ai-review/<name>
+    default: main
+  pr:
+    description: Pull request number (all commands but gate; gate takes it for manual dispatch)
+    default: ""
+  head-sha:
+    description: Head SHA the gate authorized (prepare, complete-check)
+    default: ""
+  base-sha:
+    description: Base SHA (prepare)
+    default: ""
+  auth-label:
+    description: Authorization label for PRs from authors without write access (C-4, Q-10)
+    default: ai-review/approved
+  auth-label-lifetime:
+    description: "per-push (removed on the author's next push) or per-pr (kept)"
+    default: per-push
+  models:
+    description: "Role→model map, one per line: reviewer=<provider>/<id>, verifier=<provider>/<id> (C-6). .review/review-bot.yaml on the base branch overrides it."
+    default: ""
+  thinking:
+    description: "One per line: <role>=off|minimal|low|medium|high"
+    default: ""
+  providers:
+    description: "OpenRouter only, one per line: <role>=<provider>,<provider>"
+    default: ""
+  max-cost:
+    description: Run spend cap in USD (per-step limits go in .review/review-bot.yaml)
+    default: ""
+  timeout-minutes:
+    description: >-
+      The review step's own time limit. Set the step's timeout-minutes to the
+      same value; the action stops the review a minute earlier so it can
+      complete its check and write its record.
+    default: "40"
+  provider-env:
+    description: Names of environment variables holding provider keys, passed to the review container only
+    default: OPENROUTER_API_KEY
+  outcome:
+    description: "complete-check: how the review step ended (steps.<id>.outcome)"
+    default: ""
+  go-version:
+    description: Go toolchain for the prepare job's go mod download (pin it to match the repository's go.mod)
+    default: stable
+  go-modules:
+    description: Directories in the head tree with a go.mod, space-separated
+    default: "."
+  goproxy:
+    description: The only module proxy prepare may use (one https URL; no direct mode)
+    default: https://proxy.golang.org
+  modcache-max-mb:
+    description: The module cache is dropped above this size
+    default: "3072"
+  work-dir:
+    description: Working directory shared by the steps of one job (default $RUNNER_TEMP/review-bot)
+    default: ""
+
+outputs:
+  review:
+    description: "gate: 'true' when the PR is to be reviewed"
+    value: ${{ steps.run.outputs.review }}
+  remove-label:
+    description: "gate: 'true' when the authorization label is to be removed"
+    value: ${{ steps.run.outputs.remove-label }}
+  decision:
+    description: "gate: review | skip | ignore"
+    value: ${{ steps.run.outputs.decision }}
+  reason:
+    description: "gate: one line"
+    value: ${{ steps.run.outputs.reason }}
+  pr:
+    description: "gate: PR number"
+    value: ${{ steps.run.outputs.pr }}
+  head-sha:
+    description: "gate: head SHA that was authorized"
+    value: ${{ steps.run.outputs.head-sha }}
+  base-sha:
+    description: "gate: base SHA"
+    value: ${{ steps.run.outputs.base-sha }}
+  label:
+    description: "gate: the authorization label in effect (after .review/review-bot.yaml)"
+    value: ${{ steps.run.outputs.label }}
+
+runs:
+  using: composite
+  steps:
+    # ---- prepare: no secrets, no container -----------------------------
+    - name: Set up Go
+      if: inputs.command == 'prepare'
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: ${{ inputs.go-version }}
+        # C-4: a pull_request_target job must not write the base branch's cache scope.
+        cache: false
+    - name: Prepare snapshots
+      if: inputs.command == 'prepare'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        RB_REPO: ${{ inputs.repo }}
+        RB_PR: ${{ inputs.pr }}
+        RB_BASE_SHA: ${{ inputs.base-sha }}
+        RB_HEAD_SHA: ${{ inputs.head-sha }}
+        RB_GO_MODULES: ${{ inputs.go-modules }}
+        RB_GOPROXY: ${{ inputs.goproxy }}
+        RB_MODCACHE_MAX_MB: ${{ inputs.modcache-max-mb }}
+        RB_WORK_DIR: ${{ inputs.work-dir }}
+      run: RB_WORK="${RB_WORK_DIR:-$RUNNER_TEMP/review-bot}" "$GITHUB_ACTION_PATH/prepare.sh"
+
+    # ---- everything else: in the action image --------------------------
+    - name: Build the review-bot image
+      if: inputs.command != 'prepare'
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/run.sh" build'
+    - name: Run review-bot ${{ inputs.command }}
+      id: run
+      if: inputs.command != 'prepare'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        RB_COMMAND: ${{ inputs.command }}
+        RB_REPO: ${{ inputs.repo }}
+        RB_NAME: ${{ inputs.name }}
+        RB_PR: ${{ inputs.pr }}
+        RB_HEAD_SHA: ${{ inputs.head-sha }}
+        RB_AUTH_LABEL: ${{ inputs.auth-label }}
+        RB_AUTH_LIFETIME: ${{ inputs.auth-label-lifetime }}
+        RB_MODELS: ${{ inputs.models }}
+        RB_THINKING: ${{ inputs.thinking }}
+        RB_PROVIDERS: ${{ inputs.providers }}
+        RB_MAX_COST: ${{ inputs.max-cost }}
+        RB_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+        RB_PROVIDER_ENV: ${{ inputs.provider-env }}
+        RB_OUTCOME: ${{ inputs.outcome }}
+        RB_WORK_DIR: ${{ inputs.work-dir }}
+      run: '"$GITHUB_ACTION_PATH/run.sh" run'

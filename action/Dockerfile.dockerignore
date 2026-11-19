@@ -1,0 +1,11 @@
+# Build context is the repository root; send only what the image copies.
+*
+!package.json
+!package-lock.json
+!src/**
+!pi-review/**
+!action/tools.json
+!action/install-tools.mjs
+**/*.test.ts
+**/fixtures/**
+**/node_modules/**
