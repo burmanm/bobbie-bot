@@ -14,6 +14,8 @@ backed by the pi SDK; the guard and tools it loads live in
 | `acp/connection.ts` | Minimal ACP client: JSON-RPC 2.0, one message per line, over the agent's stdio |
 | `acp/outputs.ts` | Output tools described in the prompt; the agent's JSON block checked like tool calls |
 | `acp/fake-agent.ts` | Scripted ACP agent, tests only |
+| `limits.ts` | `RUN_DEADLINE`: the abort reason that stops a step as a run-deadline timeout |
+| `timeouts.test.ts` | Step timeout, inactivity, run deadline, hung provider, hung tool call, query tools |
 | `routed-step.ts` | Sends `acp/<agent>` models to the ACP step, everything else to pi |
 | `isolation.test.ts` | The mandatory isolation regression test (C-3a). Run it on every pi upgrade |
 
@@ -28,7 +30,21 @@ backed by the pi SDK; the guard and tools it loads live in
   (`guard`, `not-allowed`, `schema`, `validator`), so A-6 can count guard
   blocks and schema violations separately.
 - **`stoppedBy`** says which limit ended a `timeout` or `truncated` step:
-  `turns`, `cost`, `timeout`, `idle`, `output-length`, `cancelled`.
+  `turns`, `cost`, `timeout`, `idle`, `deadline`, `output-length`,
+  `cancelled`. `deadline` is the run deadline: the pipeline aborts the
+  run signal with `RUN_DEADLINE` as the reason, and the step ends as
+  `timeout` rather than `cancelled`, so the run can still publish.
+- **`queryTools`** (R-2): read-only queries the orchestrator answers
+  (history, issue search; S-4). Definitions like output tools
+  (`QueryTool`, `pi-review/extension/query-tools.ts`): schema, `validate`,
+  and `run(value, signal) => text`. The extension caps the answer size,
+  bounds each call (`timeoutMs`, default 30 s), and settles the call as
+  soon as the step is stopped even if `run` ignores its signal. The ACP
+  step does not offer them (the agent cannot call our tools); its
+  `harness.tools` does not list them.
+- **`abandoned`** is set when a stopped step did not settle within
+  `abortGraceMs` (a provider or tool that ignores the abort). The step
+  returns anyway, with `usageComplete: false`.
 - **`usage.usageComplete`** is false when a model call was aborted in
   flight (A-6, Q-16). A turn or spend cap ends the run between calls, so it
   leaves usage complete; a timeout or cancellation during a call does not.
@@ -80,7 +96,10 @@ backed by the pi SDK; the guard and tools it loads live in
 - **Turn and spend caps** are enforced in pi-agent-core's `finishTurn` hook
   (`session.agent.finishTurn`, chained after pi's own), which ends the run
   before the next request. A model that has finished is never cut off by a
-  cap. Timeouts and cancellation call `session.abort()`.
+  cap. Timeouts and cancellation call `session.abort()`, which aborts the
+  provider request in flight (the request's signal; checked in
+  `timeouts.test.ts`) and any running tool. If pi does not settle within
+  `abortGraceMs` (default 10 s), the step returns `abandoned`.
 
 ## ACP agents
 

@@ -29,8 +29,10 @@ import {
   type OutputDetails,
   READ_TOOLS,
   RG_MISSING,
+  type QueryTool,
 } from "../../pi-review/extension/index.ts";
 import { StepAccounting } from "./accounting.ts";
+import { stopReasonOf } from "./limits.ts";
 import type {
   AgentStep,
   AgentStepRequest,
@@ -107,7 +109,7 @@ function validateRequest(request: AgentStepRequest<OutputTool>, options: PiSdkAg
     if (!(READ_TOOLS as readonly string[]).includes(t)) throw new ConfigError(`unknown read tool: ${t}`);
   }
   const names = new Set<string>(request.readTools);
-  for (const t of request.outputTools) {
+  for (const t of [...request.outputTools, ...(request.queryTools ?? [])]) {
     // Plain names only: `tools` on the session also accepts patterns and +/- edits.
     if (!TOOL_NAME.test(t.name)) throw new ConfigError(`invalid output tool name: ${t.name}`);
     if (names.has(t.name)) throw new ConfigError(`duplicate tool name: ${t.name}`);
@@ -170,8 +172,8 @@ async function runStep<T extends OutputTool>(
   };
 
   if (request.signal?.aborted) {
-    result.outcome = "cancelled";
-    result.stoppedBy = "cancelled";
+    result.stoppedBy = stopReasonOf(request.signal);
+    result.outcome = result.stoppedBy === "deadline" ? "timeout" : "cancelled";
     return finish();
   }
 
@@ -226,6 +228,7 @@ async function runStep<T extends OutputTool>(
       roots,
       readTools: request.readTools,
       outputTools: request.outputTools,
+      ...(request.queryTools === undefined ? {} : { queryTools: request.queryTools }),
       ...(options.rgPath === undefined ? {} : { rgPath: options.rgPath }),
       onReject: (r) => guardRejections.set(r.toolCallId, r),
     });
@@ -255,7 +258,13 @@ async function runStep<T extends OutputTool>(
     });
     await resourceLoader.reload();
 
-    const allowlist = [...new Set<string>([...request.readTools, ...request.outputTools.map((t) => t.name)])];
+    const allowlist = [
+      ...new Set<string>([
+        ...request.readTools,
+        ...request.outputTools.map((t) => t.name),
+        ...(request.queryTools ?? []).map((t) => t.name),
+      ]),
+    ];
     const created = await createAgentSession({
       cwd: head,
       agentDir,
@@ -310,6 +319,7 @@ async function drive<T extends OutputTool>(
   const { limits } = request;
   const accounting = new StepAccounting(limits);
   const outputTools = new Map<string, OutputTool>(request.outputTools.map((t) => [t.name, t]));
+  const queryTools = new Map<string, QueryTool>((request.queryTools ?? []).map((t) => [t.name, t]));
   const declared = new Set(result.harness.tools);
   let stoppedBy: StoppedBy | undefined;
   let requestInFlight = false;
@@ -380,6 +390,9 @@ async function drive<T extends OutputTool>(
           } else if (outputTools.has(event.toolName)) {
             const kind = reason.startsWith("Validation failed") ? "schema" : "validator";
             recordRejection({ toolCallId: event.toolCallId, tool: event.toolName, kind, reason });
+          } else if (queryTools.has(event.toolName) && reason.startsWith("Validation failed")) {
+            // Other query failures (not found, timed out) are answers, not rejections.
+            recordRejection({ toolCallId: event.toolCallId, tool: event.toolName, kind: "schema", reason });
           }
         } else {
           const tool = outputTools.get(event.toolName);
@@ -407,7 +420,7 @@ async function drive<T extends OutputTool>(
 
   const unsubscribe = session.subscribe(onEvent);
   const timeout = setTimeout(() => stop("timeout"), limits.timeoutMs);
-  const onCancel = () => stop("cancelled");
+  const onCancel = () => stop(stopReasonOf(request.signal));
   request.signal?.addEventListener("abort", onCancel, { once: true });
   resetIdle();
 
@@ -453,8 +466,13 @@ async function drive<T extends OutputTool>(
   if (stoppedBy !== undefined) {
     result.stoppedBy = stoppedBy;
     result.outcome =
-      stoppedBy === "cancelled" ? "cancelled" : stoppedBy === "timeout" || stoppedBy === "idle" ? "timeout" : "truncated";
+      stoppedBy === "cancelled"
+        ? "cancelled"
+        : stoppedBy === "timeout" || stoppedBy === "idle" || stoppedBy === "deadline"
+          ? "timeout"
+          : "truncated";
     if (!settledInGrace) {
+      result.abandoned = true;
       result.error = { kind: "internal", message: "pi did not settle after abort" };
     }
     return;
