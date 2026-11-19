@@ -36,6 +36,10 @@ with tools.
 - Authorization ([C-4](06-ci-and-security.md#c-4--fork-pull-requests-and-authorization)):
   automatic review only for maintainers' PRs; others need a maintainer's
   label. Not authorized → complete the check as *skipped* and stop.
+- CI ([C-9](06-ci-and-security.md#c-9--waiting-for-ci)), when the
+  repository requires it: the gate has already established that CI passed
+  on this head SHA, or the run was dispatched with `--ignore-ci`. Intake
+  records the CI wait for the run record.
 - Source snapshots: the head tree and base tree arrive as **data** prepared
   by an unprivileged job. Knowledge is read from the base
   ([C-3](06-ci-and-security.md#c-3--trust-model)).

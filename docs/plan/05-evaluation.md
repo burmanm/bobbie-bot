@@ -104,8 +104,11 @@ RP §2's "automated finding outcomes" and Phase 5 exit criteria:
 - Per `REVIEW.md` line: citations and outcome mix
   ([L-6](04-learning-loop.md#l-6--pruning)).
 
-Process-level metrics (review wait, approvals, follow-up fix rate) stay in
-`review-metrics`; the bot does not compute them.
+The full set of production metrics — cost, rounds, human comments, missed
+findings, and timings such as PR open → human-approval request — and how
+they are collected is in [10-metrics.md](10-metrics.md). Timings shared
+with the review process follow `review-metrics`'s definitions
+([O-3](10-metrics.md#o-3--relation-to-review-metrics)).
 
 ## E-4 — Replay harness
 

@@ -18,7 +18,8 @@ References below of the form *RP §n* point at `review-process/00-plan.md`;
 | "Reviews before your own PRs" gate, stale-PR nudge | `review-process` | Not about review content |
 | Deterministic checks (lint, generated files, changelog, docs note) | The repository's own CI and local check command (RP §3.1) | They must also run locally and before review |
 | Risk tiers, CODEOWNERS, approvals | `review-process` + GitHub settings | Human layer |
-| Process metrics (`review-metrics`) | `review-process` | Already exists, in Go |
+| Process metrics (`review-metrics`) | `review-process` | Already exists, in Go. The bot's harvest job also computes the shared timings next to its own numbers, using `review-metrics`'s definitions ([O-3](10-metrics.md#o-3--relation-to-review-metrics)) |
+| Waiting for CI before reviewing | **review bot** gate job ([C-9](06-ci-and-security.md#c-9--waiting-for-ci)) | Saves model cost on red builds; no state labels involved |
 | Reading the change, producing verified findings, posting one review | **review bot** | Judgement |
 | Recording finding outcomes; proposing changes to `REVIEW.md`, lint config or CI checks | **review bot** (harvest and learn jobs) | Needs the bot's run records and fingerprints |
 | Local pre-PR review (RP layer 1, step 3.3) | **review bot** pi package, `/review` | Same pipeline on a working tree |
@@ -90,3 +91,15 @@ contract in I-2.
 - Outside-contributor PRs that are not authorized for automatic review still
   need a completed `ai-review/<name>` check, or they never leave
   `review/bots`. The bot completes it as *skipped* (I-2 #1).
+- **CI failure and the state workflow.** With
+  [C-9](06-ci-and-security.md#c-9--waiting-for-ci) the bot's check can be
+  *skipped* because CI failed. The state workflow should not read that as
+  "bots done" and request people; it should hold the PR in `review/author`
+  until CI passes. That ordering (tests → bots → humans) belongs to the
+  state workflow.
+- **The human-approval request event.** Metrics need one well-defined
+  moment when a PR is handed to people
+  ([O-1](10-metrics.md#o-1--what-is-measured)). The bot assumes the first
+  `review/human` label; review-process should state it, and
+  `review-metrics` and the harvest job should share the definition of every
+  timing ([O-3](10-metrics.md#o-3--relation-to-review-metrics)).

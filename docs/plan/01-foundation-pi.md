@@ -31,6 +31,7 @@ checked before code depends on them.
 | Skills (`SKILL.md`) | Review method instructions, loaded on demand |
 | Package manifest (`pi.extensions`, `pi.skills`, `pi.prompts`) | Distribution: `pi install npm:…` or `git:…` |
 | `pi.registerMcpServer` / other pi packages | Later integrations (issue trackers, chat, docs) without changing our core |
+| `settings.json` `packages`, `models.json` in an operator agent directory | Providers, endpoints, model overrides and pi packages added by configuration ([F-7](#f-7--configuration-follows-pi)) |
 
 Extensions are TypeScript loaded through jiti, so no build step is required
 for the extension itself.
@@ -142,3 +143,104 @@ Pin pi to exactly **1.5.2** in `package.json`, lockfile committed, installed
 with `npm ci --ignore-scripts`. pi releases roughly weekly; upgrades go
 through the isolation regression test and the replay harness like any other
 change.
+
+## F-7 — Configuration follows pi
+
+**Decision ([D-18](README.md#key-decisions)):** everything pi already has
+a configuration concept for is configured in pi's own files, in pi's own
+format. The bot invents configuration only for what pi does not have.
+Adding a provider, an endpoint or a pi package is a configuration change,
+never a code change or a bot release.
+
+**The operator's pi agent directory.** The runner is given an agent
+directory with pi's standard layout (`docs/configuration.md` in the pi
+package, "Agent directory"), the same one a developer can point `pi` at locally:
+
+| File | Holds | Replaces |
+|---|---|---|
+| `settings.json` | `packages` (pi packages to load), `enabledModels` (which models the repository may pick) | — |
+| `models.json` | Custom providers and endpoints, extra model ids, `modelOverrides` (prices, context, thinking maps), `compat.openRouterRouting` for upstream-provider restrictions | Our `providers` and `routing` role fields, and the "custom id" fallback for models missing from pi's catalog where an operator wants real prices |
+| `auth.json` | Not used in CI. Keys come from environment variables, or `"apiKey": "$NAME"` in `models.json` | — |
+
+Running `pi --list-models` with `PI_CODING_AGENT_DIR` set to that directory
+shows exactly what the bot can use, and `/review` inside pi uses the same
+providers.
+
+Where it comes from: a path in the consumer's default branch, or an
+organization configuration repository, named by a workflow input. **Never
+from the PR**, and never from `.review/review-bot.yaml`: pi packages
+execute code, and `models.json` can run a command (`"apiKey": "!cmd"`).
+
+**Role → model** uses pi's model syntax: `provider/id`, with an optional
+`:<thinking>` suffix, as pi's `--model` takes it. The bot-specific
+`thinking`, `providers` and `routing` fields are removed in favour of the
+suffix and `models.json`.
+
+**Bot settings** — what pi has no concept for — stay in the bot's own
+file: roles, step and run limits, skip rules, authorization label, CI wait
+([C-9](06-ci-and-security.md#c-9--waiting-for-ci)), metrics export
+([O-2](10-metrics.md#o-2--how-the-numbers-are-collected)). Workflow inputs
+first, then the base branch's `.review/review-bot.yaml`, which can choose
+only among `enabledModels` and lower limits, not raise them past the
+operator's.
+
+### Adding a pi package without code changes
+
+Two equivalent ways, both pinned:
+
+1. **pi's own sources** in `settings.json` `packages`:
+   `npm:@scope/pi-provider-x@1.2.3` or `git:github.com/org/pkg@<commit>`.
+   Ranges and branch names are rejected; the version is the pin.
+2. **The runner's own `node_modules`**: add the package to the
+   `package.json` next to the agent directory (npm or pnpm, lockfile
+   committed) and list it as a local source,
+   `./node_modules/@scope/pi-provider-x`. An installed package is loaded
+   only when listed; installing is not configuring, so a transitive
+   dependency that happens to be a pi package never loads by itself.
+
+**Installation happens before any secret is present.** The review job
+runs with `PI_OFFLINE=1` and downloads nothing
+([C-3a](06-ci-and-security.md#c-3a--pi-session-isolation)). Packages are
+installed by `review-bot setup` (pi's package manager, or `npm ci` /
+`pnpm install --frozen-lockfile` with scripts disabled) in a step that has
+no provider key, or baked into the action image. The review step then
+finds them already installed and fails as a configuration error if one is
+missing.
+
+**What a package can do in a review.** Packages are operator-trusted code
+running in the job that holds the model key; review their source as for
+any dependency.
+
+| Contribution | Effect |
+|---|---|
+| Providers (`pi.registerProvider`), models | Available to roles, like built-in ones. The main use |
+| Tools | **Not** active in model steps unless the operator names them in a role's extra tool allowlist. Path confinement does not cover what they do |
+| Skills, prompt templates | Not loaded into model steps; the review method is the bot's ([A-5](02-architecture.md#a-5--knowledge-sources)) |
+| Event hooks (`before_provider_request` …) | Run, and see prompts and responses. Inherent to trusted code |
+
+Every loaded package and its resolved version goes in the run record, and
+adding or upgrading one is a change replayed under
+[E-5](05-evaluation.md#e-5--acceptance-procedure) like a model change.
+
+### What does not change
+
+Isolation from the **PR** is exactly as before: project trust stays off,
+the snapshot's `.pi/` and context files are never read, and the active
+tools must equal the allowlist. What changes is the source of trusted
+configuration: an operator directory instead of an empty one. The live
+isolation check becomes "the loaded extensions are ours plus exactly the
+listed packages".
+
+ACP agents ([A-2](02-architecture.md#a-2--modules)) keep their own
+`--acp-agent` configuration for now. If ACP is later offered as a pi
+provider package, it moves into `settings.json` like any other.
+
+### To verify before implementing (pi 1.5.2)
+
+| # | Question |
+|---|---|
+| 1 | Does the SDK's resource loader load `packages` from the agent directory's `settings.json` while project trust is off, and with `PI_OFFLINE=1` from an already-installed copy? |
+| 2 | Can package installation run with lifecycle scripts disabled (pi's package manager, or plain npm/pnpm into a local source)? |
+| 3 | Does pi tolerate unknown keys in `settings.json`, or must bot settings stay in a separate file? (Plan assumes separate.) |
+| 4 | With `PI_OFFLINE=1`, does OpenRouter's per-key model list (`/models/user`) still apply, and are `models.json` additions merged with the built-in catalog? |
+| 5 | Does a package's tool registration stay inactive when the session's tool list does not name it? |
