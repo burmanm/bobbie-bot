@@ -14,7 +14,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Value } from "typebox/value";
 import type { AgentStep, AgentStepResult, ModelRef, OutputTool, ReadRoots } from "../agent/index.ts";
-import { PI_VERSION } from "../agent/index.ts";
+import { PI_VERSION, RUN_DEADLINE } from "../agent/index.ts";
 import {
   applyVerdict,
   BOT_VERSION,
@@ -54,7 +54,16 @@ import {
   type PullRequestInfo,
   type SnapshotSource,
 } from "../platform/index.ts";
-import { type ConfigInputs, ConfigError, formatModel, type PipelineConfig, type PipelineRole, resolveConfig } from "./config.ts";
+import {
+  type ConfigInputs,
+  ConfigError,
+  DEFAULT_LIMITS,
+  formatDuration,
+  formatModel,
+  type PipelineConfig,
+  type PipelineRole,
+  resolveConfig,
+} from "./config.ts";
 import { buildContext } from "./context.ts";
 import { type Chunk, chunkByDirectory, deterministicPass, type DeterministicResult } from "./deterministic.ts";
 import { isKnowledgePath, type Knowledge, knowledgeFileList, type KnowledgeOverride, loadKnowledge } from "./knowledge.ts";
@@ -156,15 +165,47 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
   let checkCompleted = false;
   let spentUsd = 0;
   let publishedIds: string[] = [];
+  let partialNote: string | undefined;
+
+  // Run deadline (S-4 Limits, S-9). One signal for the whole run: aborted
+  // with the caller's reason on cancellation, or with RUN_DEADLINE when the
+  // run's time is up. Steps stop on it; non-model stages race it. The
+  // deadline comes from the inputs first and is re-armed once
+  // .review/review-bot.yaml is read, always measured from the run's start.
+  const runController = new AbortController();
+  const runSignal = runController.signal;
+  const onOuterAbort = () => runController.abort(o.signal?.reason ?? "cancelled");
+  if (o.signal?.aborted) onOuterAbort();
+  else o.signal?.addEventListener("abort", onOuterAbort, { once: true });
+  let deadlineMs = o.inputs.runTimeoutMs ?? DEFAULT_LIMITS.runTimeoutMs;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const armDeadline = (ms: number) => {
+    deadlineMs = ms;
+    clearTimeout(deadlineTimer);
+    if (runSignal.aborted) return;
+    const left = ms - (performance.now() - started);
+    const fire = () => {
+      if (runSignal.aborted) return;
+      log(`run deadline of ${formatDuration(deadlineMs)} reached: stopping the running step; what exists is published as partial`);
+      runController.abort(RUN_DEADLINE);
+    };
+    if (left <= 0) fire();
+    else deadlineTimer = setTimeout(fire, left);
+  };
+  armDeadline(deadlineMs);
+  const deadlineReached = () => runSignal.aborted && runSignal.reason === RUN_DEADLINE;
+  /** Why a step was not run: the deadline or the spend cap. */
+  let notRunWhy = "the run spend cap was reached";
 
   const stage = (file: string, data: unknown) => {
     if (runDir === undefined) return;
     writeFileSync(join(runDir, file), JSON.stringify(data, null, 2) + "\n");
   };
+  /** A non-model stage, bounded by the run signal: a hung read cannot hold the run past its deadline. */
   const timed = async <T>(label: string, fn: () => Promise<T>, detail?: (r: T) => string): Promise<T> => {
     const t = performance.now();
     try {
-      const r = await fn();
+      const r = await raceRun(label, fn());
       log(`${label} ok ${Math.round(performance.now() - t)}ms${detail ? ` ${detail(r)}` : ""}`);
       return r;
     } catch (e) {
@@ -173,7 +214,34 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     }
   };
   const checkCancelled = () => {
-    if (o.signal?.aborted) throw new RunFailure("cancelled");
+    if (deadlineReached()) throw new RunFailure(`the run deadline of ${formatDuration(deadlineMs)} was reached before the review started`);
+    if (runSignal.aborted) throw new RunFailure("cancelled");
+  };
+  const raceRun = <T>(label: string, p: Promise<T>): Promise<T> => {
+    if (runSignal.aborted) {
+      p.catch(() => {});
+      checkCancelled();
+    }
+    return new Promise<T>((resolvePromise, reject) => {
+      const onAbort = () => {
+        reject(
+          new RunFailure(
+            deadlineReached() ? `the run deadline of ${formatDuration(deadlineMs)} was reached during ${label}` : "cancelled",
+          ),
+        );
+      };
+      runSignal.addEventListener("abort", onAbort, { once: true });
+      p.then(
+        (v) => {
+          runSignal.removeEventListener("abort", onAbort);
+          resolvePromise(v);
+        },
+        (e: unknown) => {
+          runSignal.removeEventListener("abort", onAbort);
+          reject(e);
+        },
+      );
+    });
   };
 
   const complete = async (c: CheckConclusion, summary: string) => {
@@ -201,9 +269,15 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     model: ModelRef,
     req: { systemPrompt: string; prompt: string; roots: ReadRoots; outputTools: readonly T[] },
   ): Promise<AgentStepResult<T> | undefined> => {
+    if (deadlineReached()) {
+      notRunWhy = `the run deadline of ${formatDuration(deadlineMs)} was reached`;
+      log(`${stepName} not run: ${notRunWhy}`);
+      return undefined;
+    }
     checkCancelled();
     const remaining = config!.limits.runCostUsd - spentUsd;
     if (remaining <= 0) {
+      notRunWhy = "the run spend cap was reached";
       log(`${stepName} not run: run spend cap of $${config!.limits.runCostUsd} reached`);
       return undefined;
     }
@@ -220,7 +294,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       readTools: READ_TOOLS,
       outputTools: req.outputTools,
       limits: { ...roleLimits, maxCostUsd },
-      ...(o.signal === undefined ? {} : { signal: o.signal }),
+      signal: runSignal,
       onProgress: (p) => {
         // C-8 heartbeat, at most every 30 seconds.
         if (performance.now() - lastBeat < 30_000) return;
@@ -248,7 +322,11 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       usageComplete: result.usage.usageComplete,
       rejectedCalls: result.rejectedCalls.map((r) => ({ tool: r.tool, reason: `${r.kind}: ${r.reason}` })),
     };
-    const err = result.error ? `${result.error.kind}: ${result.error.message}` : result.stoppedBy ? `stopped by ${result.stoppedBy}` : undefined;
+    const err = result.error
+      ? `${result.error.kind}: ${result.error.message}${result.stoppedBy ? ` (stopped by ${result.stoppedBy})` : ""}`
+      : result.stoppedBy
+        ? `stopped by ${result.stoppedBy}`
+        : undefined;
     if (err !== undefined) record.error = err;
     steps.push(record);
     if (result.uncataloguedModel) {
@@ -281,6 +359,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     await timed("S-1 base snapshot", () => o.snapshots.extract("base", currentPr.baseSha, heads.base));
     knowledge = loadKnowledge(heads.base, o.knowledgeOverride ?? {});
     config = resolveConfig(o.inputs, knowledge.botConfig?.text);
+    if (config.limits.runTimeoutMs !== deadlineMs) armDeadline(config.limits.runTimeoutMs);
     const prior: PriorState = derivePriorState(comments, botId);
     round = prior.rounds + 1;
 
@@ -429,7 +508,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
         outputTools: REVIEWER_TOOLS,
       });
       if (result === undefined) {
-        partial.push(`the reviewer step for ${chunk.name === "all" ? "the change" : chunk.name} was not run: the run spend cap was reached`);
+        partial.push(`the reviewer step for ${chunk.name === "all" ? "the change" : chunk.name} was not run: ${notRunWhy}`);
         continue;
       }
       reviewerOutputs += result.outputs.length;
@@ -471,7 +550,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       }
     }
     if (chunks.length > 0 && reviewerOk === 0 && reviewerOutputs === 0) {
-      throw new RunFailure(`the reviewer produced nothing: ${reviewerErrors.join("; ") || "no step could run within the spend cap"}`);
+      throw new RunFailure(`the reviewer produced nothing: ${reviewerErrors.join("; ") || `no step could run (${notRunWhy})`}`);
     }
     stage("04-review.json", { findings, questions, needsHuman, checked, notRun, partial });
 
@@ -509,7 +588,12 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       });
       const verdict = result?.outputs.filter((x) => x.tool === "submit_verdict").map((x) => x.value as Verdict).pop();
       if (verdict === undefined) {
-        const why = result === undefined ? "the run spend cap was reached" : `${result.outcome}${result.error ? `: ${result.error.message}` : ""}`;
+        const why =
+          result === undefined
+            ? notRunWhy
+            : result.stoppedBy === "deadline"
+              ? `the run deadline of ${formatDuration(deadlineMs)} was reached`
+              : `${result.outcome}${result.error ? `: ${result.error.message}` : ""}`;
         findings[i] = { ...f, status: "unverified", statusReason: `verifier returned no verdict (${why})` };
         verifierGaps++;
         continue;
@@ -554,7 +638,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       });
       const r = result?.outputs.filter((x) => x.tool === "submit_recheck").map((x) => x.value).pop() as Recheck | undefined;
       if (r === undefined || !isValidRecheck(r)) {
-        const why = result === undefined ? "the run spend cap was reached" : result.outcome;
+        const why = result === undefined ? notRunWhy : result.stoppedBy === "deadline" ? "the run deadline was reached" : result.outcome;
         rechecks.push({ ...base, status: "inconclusive", by: "model", detail: `could not be re-checked (${why})` });
         continue;
       }
@@ -585,7 +669,11 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
         .map((r): EarlierFinding => ({ title: r.title, detail: r.status === "still-open" ? r.detail : `not confirmed fixed: ${r.detail}`, ...(r.tag ? { tag: r.tag } : {}) })),
       verifiedFixed: rechecks.filter((r) => r.status === "fixed").map((r): EarlierFinding => ({ title: r.title, detail: r.detail, ...(r.tag ? { tag: r.tag } : {}) })),
     };
+    if (deadlineReached()) {
+      partial.unshift(`the run deadline of ${formatDuration(deadlineMs)} was reached, so the review stopped early and later steps were not run`);
+    }
     const partialText = partial.length > 0 ? `${partial.join("; ")}.` : undefined;
+    partialNote = partialText;
     const summary = renderSummary({
       round: { number: round, headSha: pr.headSha, ...(sinceSha === undefined ? {} : { sinceSha }) },
       counts: summaryCounts(findings),
@@ -621,6 +709,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
   } catch (e) {
     // ---- S-9 failure behaviour ---------------------------------------------
     const reason = e instanceof RunFailure && e.message === "cancelled" ? "the run was cancelled" : errorMessage(e);
+    if (deadlineReached()) partialNote = `the run deadline of ${formatDuration(deadlineMs)} was reached`;
     log(`run failed: ${reason}`);
     if (!published && pr !== undefined) {
       publication = { threadReplies: [], resolveThreads: [], failureComment: failureCommentBody(pr.headSha, reason) };
@@ -638,6 +727,8 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
 
   // ---- S-8 record ----------------------------------------------------------
   async function finish(): Promise<ReviewRunResult> {
+    clearTimeout(deadlineTimer);
+    o.signal?.removeEventListener("abort", onOuterAbort);
     if (!checkCompleted) await complete(conclusion, checkSummary);
     const out: ReviewRunResult = { runId, conclusion, checkSummary };
     if (runDir !== undefined) out.runDir = runDir;
@@ -667,6 +758,8 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     for (const [k, v] of Object.entries(config?.roles ?? {})) roles[k] = formatModel(v);
     const result: RunRecord["run"]["result"] = { checkConclusion: conclusion, summary: checkSummary, publishedCommentIds: publishedIds };
     if (skipReason !== undefined) result.skipReason = skipReason;
+    if (partialNote !== undefined) result.partial = partialNote;
+    if (deadlineReached()) result.deadlineReached = true;
     return {
       tool: RUN_RECORD_TOOL,
       toolVersion: BOT_VERSION,

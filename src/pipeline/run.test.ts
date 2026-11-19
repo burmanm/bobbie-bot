@@ -241,6 +241,97 @@ describe("timed-out reviewer (S-4 Limits, S-9)", () => {
   });
 });
 
+describe("run deadline (S-4 Limits, S-9)", () => {
+  /** A model turn that holds the request open until it is aborted, and records that it was. */
+  const heldOpen = () => {
+    const seen: { aborted?: boolean } = {};
+    const factory: FauxResponseFactory = async (_c, options) => {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 30_000);
+        options?.signal?.addEventListener(
+          "abort",
+          () => {
+            seen.aborted = true;
+            clearTimeout(t);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+      return fauxAssistantMessage(fauxText("late"));
+    };
+    return { seen, factory };
+  };
+
+  test("the running step is aborted, what exists is published labelled partial, the check is neutral, nothing else runs", async () => {
+    const script = basicScript();
+    const first = (script.reviewer![0] as { toolCalls: Array<{ name: string }> }).toolCalls[0]!;
+    const held = heldOpen();
+    script.reviewer = [{ toolCalls: [first as never] }, held.factory];
+    const started = performance.now();
+    const { result, platform, calls } = await run({
+      script,
+      inputs: { models: { reviewer: "scripted/reviewer", verifier: "scripted/verifier" }, runTimeoutMs: 700 },
+    });
+    assert.ok(performance.now() - started < 5_000);
+    assert.equal(held.seen.aborted, true, "the in-flight model call was aborted");
+    assert.ok(!calls.includes("verifier"), "no step starts after the deadline");
+    assert.equal(result.conclusion, "neutral");
+    assert.match(result.checkSummary, /^Partial review of 89abcde/);
+    const body = platform.output.review!.body;
+    assert.match(body, /\*\*Partial review:\*\* the run deadline of 700 ms was reached, so the review stopped early/);
+    assert.equal(platform.output.review!.comments.length, 1, "the finding reported before the deadline is posted");
+    assert.match(platform.output.review!.comments[0]!.body, /unverified/i);
+    const record = readRecord(result);
+    assert.equal(record.run.result.deadlineReached, true);
+    assert.match(record.run.result.partial ?? "", /run deadline/);
+    const review = record.run.steps.find((s) => s.name === "review:all")!;
+    assert.equal(review.outcome, "timeout");
+    assert.equal(review.error, "stopped by deadline");
+    assert.equal(review.usageComplete, false);
+    const f = record.findings.find((x) => x.tag === "important")!;
+    assert.equal(f.status, "published");
+    assert.match(f.statusReason ?? "", /run deadline/);
+  });
+
+  test("a hung read before any model step: the run fails neutral with a reason, the check completes and a record is written", async () => {
+    const { result, platform, calls } = await run({
+      script: basicScript(),
+      reader: (fixture) => ({ ...withComments(fixture, []), listComments: () => new Promise<PrComment[]>(() => {}) }),
+      inputs: { models: { reviewer: "scripted/reviewer", verifier: "scripted/verifier" }, runTimeoutMs: 300 },
+    });
+    assert.deepEqual(calls, []);
+    assert.equal(result.conclusion, "neutral");
+    assert.match(result.checkSummary, /run deadline of 300 ms was reached during S-1 comments/);
+    assert.equal(platform.output.check_run?.status, "completed");
+    assert.match(platform.output.failure_comment ?? "", /run deadline/);
+    const record = readRecord(result);
+    assert.equal(record.run.result.deadlineReached, true);
+  });
+
+  test("cancellation is still a cancellation, not a deadline", async () => {
+    const script = basicScript();
+    const held = heldOpen();
+    script.reviewer = [held.factory];
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 300);
+    const fixture = new FixturePrReader(BASIC);
+    const platform = new DryRunPlatform(fixture);
+    const scripted = createScriptedProvider(script);
+    const result = await runReview({
+      platform,
+      snapshots: fixture.snapshots(),
+      agentStep: createPiSdkAgentStep({ providers: [scripted.provider], retry: { enabled: false }, abortGraceMs: 2_000 }),
+      inputs: { models: { reviewer: "scripted/reviewer" } },
+      runsDir: join(work, "runs"),
+      signal: controller.signal,
+    });
+    assert.equal(held.seen.aborted, true);
+    assert.equal(result.conclusion, "neutral");
+    assert.equal(readRecord(result).run.result.deadlineReached, undefined);
+  });
+});
+
 describe("refuted finding (S-5)", () => {
   test("refuted with evidence → dropped; refuted with evidence that is not there → kept as unverified (P-7)", async () => {
     const script = basicScript();

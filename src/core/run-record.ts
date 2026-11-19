@@ -79,6 +79,10 @@ export const RunInfo = Type.Object({
     summary: Type.String({ description: "One-line check-run summary" }),
     publishedCommentIds: Type.Array(Type.String()),
     skipReason: Type.Optional(Type.String()),
+    /** Why the review is partial (S-9), as stated in the summary. */
+    partial: Type.Optional(Type.String()),
+    /** The whole-run deadline stopped the run (S-4 Limits). */
+    deadlineReached: Type.Optional(Type.Boolean()),
   }),
 });
 export type RunInfo = Static<typeof RunInfo>;

@@ -38,7 +38,7 @@ import {
   type PrReader,
   type SnapshotSource,
 } from "../platform/index.ts";
-import { type ConfigInputs, PIPELINE_ROLES, type PipelineRole, runReview } from "../pipeline/index.ts";
+import { type ConfigInputs, parseDuration, PIPELINE_ROLES, type PipelineRole, runReview } from "../pipeline/index.ts";
 
 const USAGE = `Usage:
   review-bot review --dry-run --pr <owner/repo#N | PR URL> [options]
@@ -76,6 +76,14 @@ Run:
   --no-modcache            Do not offer a dependency source cache
   --runs-dir <dir>         Parent of the run directory (default: <tmp>/review-bot-runs)
   --max-cost <usd>         Run spend cap
+  --run-timeout <duration> Whole-run deadline (default 45m): the running step
+                           is stopped and what exists is published as partial
+  --step-timeout [<role>=]<duration>  Per-step wall-clock limit (default
+                           reviewer 20m, verifier 8m); no role = both roles
+  --idle-timeout [<role>=]<duration>  Stop a step after this long with no
+                           model output or tool activity (default 3m)
+                           Durations: 90s, 20m, 1.5h; a bare number is seconds.
+                           .review/review-bot.yaml on the base branch overrides
   --include-drafts         Review draft PRs too
   --out <file>             Also write the would-be review JSON here
   --quiet                  No progress log on stderr
@@ -132,6 +140,28 @@ function readAcpAgents(configFile: string | undefined, defs: string[] | undefine
   return agents;
 }
 
+/** --run-timeout, --step-timeout and --idle-timeout into the config inputs (S-4 Limits). */
+function applyTimeoutFlags(inputs: ConfigInputs, run: string | undefined, step: string[] | undefined, idle: string[] | undefined): void {
+  const duration = (flag: string, text: string): number => {
+    const ms = parseDuration(text);
+    if (ms === undefined) throw new UsageError(`invalid ${flag}: ${text} (use for example 90s, 20m or 1.5h)`);
+    return ms;
+  };
+  if (run !== undefined) inputs.runTimeoutMs = duration("--run-timeout", run);
+  const perRole = (flag: string, values: string[] | undefined, key: "timeoutMs" | "idleTimeoutMs") => {
+    for (const v of values ?? []) {
+      const eq = v.indexOf("=");
+      const roles = eq < 0 ? [...PIPELINE_ROLES] : [v.slice(0, eq) as PipelineRole];
+      if (eq >= 0 && !PIPELINE_ROLES.includes(roles[0]!)) throw new UsageError(`${flag} role must be ${PIPELINE_ROLES.join(" or ")}: ${v}`);
+      const ms = duration(flag, eq < 0 ? v : v.slice(eq + 1));
+      inputs.limits ??= {};
+      for (const role of roles) inputs.limits[role] = { ...inputs.limits[role], [key]: ms };
+    }
+  };
+  perRole("--step-timeout", step, "timeoutMs");
+  perRole("--idle-timeout", idle, "idleTimeoutMs");
+}
+
 export interface Io {
   stdout(text: string): void;
   stderr(text: string): void;
@@ -175,6 +205,9 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
         "no-modcache": { type: "boolean" },
         "runs-dir": { type: "string" },
         "max-cost": { type: "string" },
+        "run-timeout": { type: "string" },
+        "step-timeout": { type: "string", multiple: true },
+        "idle-timeout": { type: "string", multiple: true },
         "include-drafts": { type: "boolean" },
         out: { type: "string" },
         quiet: { type: "boolean" },
@@ -245,6 +278,7 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       inputs.runCostUsd = usd;
     }
     if (args["include-drafts"]) inputs.skipDraft = false;
+    applyTimeoutFlags(inputs, args["run-timeout"], args["step-timeout"], args["idle-timeout"]);
 
     const modcache = args["no-modcache"] ? undefined : args.modcache !== undefined ? resolve(args.modcache) : defaultModcache();
     const knowledgeOverride = {

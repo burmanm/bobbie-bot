@@ -61,6 +61,39 @@ test("without a model the run completes neutral instead of picking one (P-4)", a
   assert.match(payload.check_run.output.summary, /no model is configured for the reviewer role/);
 });
 
+test("timeout flags: bad durations and roles are usage errors; a short run deadline gives a partial, neutral review", async () => {
+  for (const bad of [["--run-timeout", "soon"], ["--step-timeout", "judge=5m"], ["--idle-timeout", "reviewer=0"]]) {
+    const cap = io();
+    assert.equal(await main(["review", "--dry-run", "--fixture", FIXTURE, ...bad], cap.io), 2, bad.join(" "));
+  }
+  const cap = io();
+  const code = await main(
+    [
+      "review",
+      "--dry-run",
+      "--fixture",
+      FIXTURE,
+      "--script",
+      join(FIXTURE, "script.json"),
+      "--no-modcache",
+      "--runs-dir",
+      join(work, "runs"),
+      "--step-timeout",
+      "20m",
+      "--idle-timeout",
+      "verifier=2m",
+      "--run-timeout",
+      "1ms",
+      "--quiet",
+    ],
+    cap.io,
+  );
+  assert.equal(code, 1);
+  const payload = JSON.parse(cap.out.stdout) as { check_run: { conclusion: string; output: { summary: string } } };
+  assert.equal(payload.check_run.conclusion, "neutral");
+  assert.match(payload.check_run.output.summary, /run deadline of 1 ms was reached/);
+});
+
 test("malformed --acp-agent and --acp-config are usage errors", async () => {
   const bad = io();
   assert.equal(await main(["review", "--dry-run", "--fixture", FIXTURE, "--acp-agent", "=node"], bad.io), 2);

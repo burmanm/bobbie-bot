@@ -20,6 +20,13 @@ export interface PipelineConfig {
   limits: Record<PipelineRole, StepLimits> & {
     /** Whole-run spend cap (S-4 Limits). */
     runCostUsd: number;
+    /**
+     * Whole-run deadline, from the start of the run (S-4 Limits, S-9). When
+     * it passes, the running step is stopped, no further step starts, and
+     * what exists is published labelled partial with a neutral check. Set
+     * the CI job's own timeout a few minutes above it, so publishing fits.
+     */
+    runTimeoutMs: number;
     /** Above this many patch lines the review is chunked by directory (S-4 Phase 1). */
     chunkPatchLines: number;
   };
@@ -34,6 +41,7 @@ export const DEFAULT_LIMITS: PipelineConfig["limits"] = {
   reviewer: { timeoutMs: 20 * 60_000, idleTimeoutMs: 3 * 60_000, maxTurns: 120 },
   verifier: { timeoutMs: 8 * 60_000, idleTimeoutMs: 3 * 60_000, maxTurns: 40 },
   runCostUsd: 5,
+  runTimeoutMs: 45 * 60_000,
   chunkPatchLines: 4000,
 };
 
@@ -91,6 +99,7 @@ export const BotConfigYaml = Type.Object(
           reviewer: Type.Optional(LimitsYaml),
           verifier: Type.Optional(LimitsYaml),
           runCostUsd: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
+          runTimeoutSeconds: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
           chunkPatchLines: Type.Optional(Type.Integer({ minimum: 1 })),
         },
         { additionalProperties: false },
@@ -122,6 +131,7 @@ export interface ConfigInputs {
   /** role → OpenRouter provider slugs the model may be served by (routing `only`). */
   providers?: Partial<Record<PipelineRole, string[]>>;
   runCostUsd?: number;
+  runTimeoutMs?: number;
   chunkPatchLines?: number;
   skipDraft?: boolean;
   /** Per-role step limits (workflow inputs). */
@@ -206,6 +216,7 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
     if (l !== undefined) config.limits[role] = { ...config.limits[role], ...(l as StepLimits) };
   }
   if (inputs.runCostUsd !== undefined) config.limits.runCostUsd = inputs.runCostUsd;
+  if (inputs.runTimeoutMs !== undefined) config.limits.runTimeoutMs = inputs.runTimeoutMs;
   if (inputs.chunkPatchLines !== undefined) config.limits.chunkPatchLines = inputs.chunkPatchLines;
   if (inputs.skipDraft !== undefined) config.skip.draft = inputs.skipDraft;
 
@@ -218,6 +229,7 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
     config.limits.reviewer = limitsFromYaml(config.limits.reviewer, y.limits?.reviewer);
     config.limits.verifier = limitsFromYaml(config.limits.verifier, y.limits?.verifier);
     if (y.limits?.runCostUsd !== undefined) config.limits.runCostUsd = y.limits.runCostUsd;
+    if (y.limits?.runTimeoutSeconds !== undefined) config.limits.runTimeoutMs = Math.round(y.limits.runTimeoutSeconds * 1000);
     if (y.limits?.chunkPatchLines !== undefined) config.limits.chunkPatchLines = y.limits.chunkPatchLines;
     if (y.skip?.draft !== undefined) config.skip.draft = y.skip.draft;
     if (y.skip?.labels !== undefined) config.skip.labels = y.skip.labels;
@@ -229,4 +241,24 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
     }
   }
   return config;
+}
+
+/**
+ * A duration as given on the command line: "90" or "90s" (seconds), "20m",
+ * "1.5h". Returns milliseconds, or undefined when it is not one.
+ */
+export function parseDuration(text: string): number | undefined {
+  const m = /^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h)?\s*$/i.exec(text);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  const unit = (m[2] ?? "s").toLowerCase();
+  const ms = unit === "ms" ? n : unit === "s" ? n * 1000 : unit === "m" ? n * 60_000 : n * 3_600_000;
+  return ms > 0 && Number.isFinite(ms) ? Math.round(ms) : undefined;
+}
+
+export function formatDuration(ms: number): string {
+  if (ms >= 3_600_000 && ms % 3_600_000 === 0) return `${ms / 3_600_000} h`;
+  if (ms >= 60_000 && ms % 60_000 === 0) return `${ms / 60_000} min`;
+  if (ms >= 1000) return `${Math.round(ms / 1000)} s`;
+  return `${ms} ms`;
 }
