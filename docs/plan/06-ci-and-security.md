@@ -101,13 +101,39 @@ PR that the model can read as untrusted data, like any other.
 Fork PRs are the normal path for the target repositories, maintainers
 included, so this is the main design, not a special case.
 
-**Three jobs:**
+**Three jobs, plus a small label job:**
 
 | Job | Secrets | Token | Does |
 |---|---|---|---|
-| `gate` | none | `pull-requests: read`, `checks: write` | Decides whether this PR is reviewed automatically. If not, completes `ai-review/<name>` as *skipped* |
+| `gate` | none (App identity: the App private key) | `contents: read`, `pull-requests: read`, `checks: write` | Decides whether this PR is reviewed automatically. If not, completes `ai-review/<name>` as *skipped*. `contents: read` is only for `.review/review-bot.yaml` at the base SHA ([A-5](02-architecture.md#a-5--knowledge-sources)) |
+| `remove-label` | none (App identity: the App private key) | `pull-requests: write` | Removes the authorization label on the contributor's next push when its lifetime is *per push* ([Q-10](07-roadmap.md#open-questions)). Separate because the gate's token is read-only. Reads nothing from the PR |
 | `prepare` | **none** | `contents: read` | Fetches base and head trees. Runs the language preparation step (Go: `go mod download` for the head's `go.mod`). Uploads snapshots and module cache as an artifact |
-| `review` | model provider key | `pull-requests: write`, `checks: write` | Downloads the artifact, extracts it as read-only data to a directory with no `.git` or context files above it, runs the pipeline with `PI_OFFLINE=1`. **Never** checks out the PR, never runs `go`, `make` or anything from the snapshot, never downloads a binary |
+| `review` | model provider key (App identity: also the App private key) | `pull-requests: write`, `checks: write`; on private repositories also `contents: read` and `issues: read` (below) | Downloads the artifact, extracts it as read-only data to a directory with no `.git` or context files above it, runs the pipeline with `PI_OFFLINE=1`. **Never** checks out the PR, never runs `go`, `make` or anything from the snapshot, never downloads a binary |
+
+**Identity in every job.** With the App identity, each job that talks to
+GitHub mints its own token from the App private key, scoped to that job's
+permissions in the table. The key is therefore present in `gate`,
+`remove-label` and `review`. None of them executes PR content, and in
+`review` the model has no shell or environment access
+([C-3](#c-3--trust-model)), so the key is out of its reach. The job that
+creates the check run and the jobs that complete it must use the same
+identity: GitHub lets only the creator update a check run.
+
+**Private repositories.** The reviewer's history tools (`git_log`,
+`git_blame`, `git_show`) and issue search ([S-4](03-review-pipeline.md#s-4--review))
+call the GitHub API with the review job's token. On a public repository
+that works with the permissions above. On a private one the token also
+needs `contents: read` and `issues: read`; with the App identity the App
+needs the same permissions and the minted token must request them. Neither
+permission lets the job write anything. A repository that does not grant
+them runs with `--no-history`, and the summary says the tools were not
+available.
+
+**The action image.** The review container is built in each job from a
+Dockerfile whose downloads (Node by digest, `rg`, `fd`, `gh`) are pinned
+and checksum-verified. That still means network downloads in the job that
+holds the model key. A prebuilt image pinned by digest removes them and is
+the intended next step ([R-2](07-roadmap.md#r-2--live-on-the-pilot)).
 
 `prepare` is the only place PR-controlled input reaches a tool that acts on
 it, so it is hardened even though it has nothing worth stealing:

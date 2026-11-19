@@ -87,8 +87,10 @@ the reviewer has the source snapshot and search tools.
 head snapshot, the base snapshot, and the Go module cache (read-only);
 read-only history queries served by the orchestrator through the GitHub API
 (log, blame, commit diff — there is no `.git` to run commands in); a
-read-only issue search scoped to the repository (for I-2 #4); and three
-typed output tools:
+read-only issue search scoped to the repository (for I-2 #4) — on private
+repositories these two need extra read permissions or are switched off
+([C-4](06-ci-and-security.md#c-4--fork-pull-requests-and-authorization));
+and three typed output tools:
 
 - `report_finding` — [A-3](02-architecture.md#a-3--finding).
 - `ask_question` — for stated trade-offs that may lead to a failure

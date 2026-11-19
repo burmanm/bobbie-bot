@@ -160,8 +160,11 @@ them for replay.
 ## A-7 — Store
 
 **The review job never writes to a repository or to storage.** It runs on
-`pull_request_target` for fork PRs and holds only `pull-requests` and
-`checks` permissions. Its run record leaves the job in exactly one way: as
+`pull_request_target` for fork PRs and holds `pull-requests` and `checks`
+write permissions, plus `contents: read` and `issues: read` on private
+repositories for the reviewer's history and issue tools
+([C-4](06-ci-and-security.md#c-4--fork-pull-requests-and-authorization)).
+None of these lets it write to a repository. Its run record leaves the job in exactly one way: as
 a **workflow artifact**, which needs no extra permission.
 
 Durable storage is written by the **harvest job**, which runs on a schedule

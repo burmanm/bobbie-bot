@@ -78,6 +78,8 @@ same agent directory works for `/review` in pi.
   isolation regression test and `rg`/`fd` shipped in the action image
   ([C-3a](06-ci-and-security.md#c-3a--pi-session-isolation)) — not
   deferrable.
+- Prebuilt action image pinned by digest, so the job holding the model key
+  downloads nothing ([C-4](06-ci-and-security.md#c-4--fork-pull-requests-and-authorization)).
 - Run record as artifact, with CI-wait and queue timestamps
   ([A-6](02-architecture.md#a-6--run-record)).
 - Waiting for CI, opt-in per repository
