@@ -3,10 +3,10 @@
  * code host. Reads: PR metadata, diff, existing comments. Writes: the check
  * run, one review, thread replies, thread resolution (S-1, S-7).
  *
- * R-1 has only a dry-run implementation, which reads (from a fixture or
- * GitHub, read-only) and records the writes instead of performing them.
- * Shapes follow GitHub's REST payloads so the R-2 implementation can pass
- * them through unchanged.
+ * Two implementations: the dry run (R-1), which reads (from a fixture or
+ * GitHub, read-only) and records the writes instead of performing them, and
+ * the live GitHub platform (R-2, `github.ts`). Shapes follow GitHub's REST
+ * payloads so the live platform passes them through unchanged.
  */
 
 export interface Author {
@@ -108,6 +108,11 @@ export interface Publication {
 export interface PublishResult {
   /** Ids of what was posted; empty for a dry run. */
   commentIds: string[];
+  /**
+   * Parts that were not published while the review itself was (a reply or
+   * a thread resolution that failed, inline comments moved into the body).
+   */
+  warnings?: string[];
 }
 
 export interface Platform {

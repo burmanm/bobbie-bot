@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 /**
- * `review-bot` CLI (A-2). R-1 has one command, a dry run:
+ * `review-bot` CLI (A-2):
  *
+ *   review-bot review --pr <owner/repo#N> [options]            live (R-2)
  *   review-bot review --dry-run --pr <owner/repo#N> [options]
  *   review-bot review --dry-run --fixture <dir> [--script <file>] [options]
  *
- * It reads the PR (GitHub read-only through `gh`, or a fixture), runs the
- * pipeline, and prints the would-be review instead of posting it. Logs go to
- * stderr; the payload JSON goes to stdout and, with --out, to a file.
+ * A dry run reads the PR (GitHub read-only through `gh`, or a fixture), runs
+ * the pipeline, and prints the would-be review instead of posting it. A live
+ * run posts it with the installation token in GH_TOKEN or GITHUB_TOKEN (C-5) and prints
+ * what it did. Logs go to stderr; the JSON goes to stdout and, with --out,
+ * to a file.
  *
  * Exit codes: 0 reviewed or skipped, 1 could not complete (neutral check),
  * 2 usage error.
@@ -30,8 +33,11 @@ import {
 import {
   defaultModcache,
   DryRunPlatform,
+  type FetchLike,
   FixturePrReader,
   GhPrReader,
+  gitHubClientFromEnv,
+  GitHubPlatform,
   GhTarballSnapshots,
   GitArchiveSnapshots,
   parsePrRef,
@@ -41,11 +47,17 @@ import {
 import { type ConfigInputs, PIPELINE_ROLES, type PipelineRole, runReview } from "../pipeline/index.ts";
 
 const USAGE = `Usage:
+  review-bot review --pr <owner/repo#N | PR URL> [options]
   review-bot review --dry-run --pr <owner/repo#N | PR URL> [options]
   review-bot review --dry-run --fixture <dir> [options]
 
+Without --dry-run the review, thread replies and check run are posted to
+GitHub with the token in GH_TOKEN (else GITHUB_TOKEN): the Actions
+GITHUB_TOKEN or a GitHub App installation token (personal access tokens are refused). GITHUB_API_URL
+and GITHUB_GRAPHQL_URL are honoured.
+
 Source:
-  --pr <ref>               Read the PR from GitHub, read-only, through gh
+  --pr <ref>               The PR on GitHub (dry run: read-only through gh)
   --repo-dir <dir>         Extract trees with git archive from this clone
                            (default with --pr: download tarballs through gh)
   --fixture <dir>          Read the PR from a fixture directory
@@ -142,7 +154,13 @@ const processIo: Io = {
   stderr: (t) => void process.stderr.write(t),
 };
 
-export async function main(argv: string[], io: Io = processIo): Promise<number> {
+/** Live-run dependencies, injectable for tests. */
+export interface LiveDeps {
+  env?: Record<string, string | undefined>;
+  fetch?: FetchLike;
+}
+
+export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = {}): Promise<number> {
   const [command, ...rest] = argv;
   if (command === undefined || command === "--help" || command === "-h") {
     io.stdout(USAGE);
@@ -193,7 +211,8 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
   }
 
   try {
-    if (!args["dry-run"]) throw new UsageError("only --dry-run is supported in R-1: nothing is ever posted to GitHub");
+    const live = args["dry-run"] !== true;
+    if (live && args.fixture !== undefined) throw new UsageError("--fixture needs --dry-run: a fixture is never posted to GitHub");
     if ((args.pr === undefined) === (args.fixture === undefined)) throw new UsageError("give exactly one of --pr and --fixture");
     if (args.name !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,40}$/.test(args.name)) throw new UsageError(`invalid --name: ${args.name}`);
 
@@ -252,12 +271,33 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       ...(args.guidelines === undefined ? {} : { guidelines: args.guidelines.map((g) => resolve(g)) }),
     };
 
-    const platform = new DryRunPlatform(reader);
+    const log = args.quiet ? () => {} : (line: string) => io.stderr(`[review-bot] ${line}\n`);
+    let platform: DryRunPlatform | GitHubPlatform;
+    if (live) {
+      const env = deps.env ?? process.env;
+      let client;
+      try {
+        client = gitHubClientFromEnv(env, { log, ...(deps.fetch === undefined ? {} : { fetch: deps.fetch }) });
+      } catch (e) {
+        throw new UsageError(e instanceof Error ? e.message : String(e));
+      }
+      const runUrl =
+        env.GITHUB_SERVER_URL && env.GITHUB_REPOSITORY && env.GITHUB_RUN_ID ? `${env.GITHUB_SERVER_URL}/${env.GITHUB_REPOSITORY}/actions/runs/${env.GITHUB_RUN_ID}` : undefined;
+      platform = new GitHubPlatform({
+        client,
+        repo: prRef!.repo,
+        number: prRef!.number,
+        botId: `ai-review/${args.name ?? "main"}`,
+        log,
+        ...(runUrl === undefined ? {} : { detailsUrl: runUrl }),
+      });
+    } else {
+      platform = new DryRunPlatform(reader);
+    }
     const controller = new AbortController();
     const onSignal = () => controller.abort();
     process.once("SIGINT", onSignal);
     process.once("SIGTERM", onSignal);
-    const log = args.quiet ? () => {} : (line: string) => io.stderr(`[review-bot] ${line}\n`);
 
     const result = await runReview({
       platform,
@@ -268,7 +308,7 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       knowledgeOverride,
       ...(modcache === undefined ? {} : { modcache }),
       runsDir: resolve(args["runs-dir"] ?? join(tmpdir(), "review-bot-runs")),
-      trigger: "cli-dry-run",
+      trigger: live ? "cli" : "cli-dry-run",
       ...(prRef === undefined ? {} : { prRef }),
       signal: controller.signal,
       log,
@@ -276,7 +316,7 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
 
-    const payload = JSON.stringify(platform.output, null, 2) + "\n";
+    const payload = JSON.stringify(platform instanceof GitHubPlatform ? platform.report : platform.output, null, 2) + "\n";
     io.stdout(payload);
     if (args.out !== undefined) writeFileSync(resolve(args.out), payload);
     log(`check ${result.conclusion}: ${result.checkSummary}`);

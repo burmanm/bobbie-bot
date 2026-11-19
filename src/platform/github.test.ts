@@ -1,0 +1,393 @@
+/**
+ * Live GitHub platform (R-2) against an in-memory GitHub behind a fake
+ * fetch: no network, no token (AGENTS.md).
+ */
+import assert from "node:assert/strict";
+import { describe, test } from "node:test";
+import { encodeMarker } from "../core/index.ts";
+import { completeCheckRun, findCheckRun } from "./github-checks.ts";
+import { assertInstallationToken, GitHubClient, gitHubClientFromEnv, GraphQLError, RateLimitError } from "./github-client.ts";
+import { ACTIONS_BOT, FakeGitHub, type FakeUser, HUMAN } from "./github-fake.ts";
+import { hasFailureMarker } from "./github-markers.ts";
+import { foldInlineComments, GitHubPlatform, SupersededError } from "./github.ts";
+import type { Publication, ReviewPayload } from "./types.ts";
+
+const TOKEN = "ghs_faketoken0000";
+const BOT = "ai-review/main";
+const OTHER_APP: FakeUser = { login: "other-ci[bot]", type: "Bot" };
+
+function fp(n: number): string {
+  return n.toString(16).padStart(64, "0");
+}
+function findingBody(title: string, n: number, bot = BOT): string {
+  return `**Important.** ${title}.\n\nDetails.\n\n${encodeMarker({ kind: "finding", bot, run: "r1", fingerprint: fp(n), fingerprintVersion: 1 })}\n`;
+}
+function summaryBody(gh: FakeGitHub, run = "r2"): string {
+  return `Round 2.\n\n${encodeMarker({ kind: "summary", bot: BOT, run, sha: gh.headSha, fingerprintVersion: 1 })}\n`;
+}
+
+interface Setup {
+  gh: FakeGitHub;
+  client: GitHubClient;
+  platform: GitHubPlatform;
+  sleeps: number[];
+  logs: string[];
+}
+
+function setup(gh = new FakeGitHub(), o: { maxAttempts?: number } = {}): Setup {
+  const sleeps: number[] = [];
+  const logs: string[] = [];
+  const client = new GitHubClient({
+    token: TOKEN,
+    apiUrl: gh.origin,
+    fetch: gh.fetch,
+    sleep: async (ms) => void sleeps.push(ms),
+    now: () => Date.UTC(2026, 10, 20),
+    retry: { maxAttempts: o.maxAttempts ?? 4, baseDelayMs: 100 },
+    log: (l) => logs.push(l),
+  });
+  const platform = new GitHubPlatform({ client, repo: gh.repo, number: gh.number, botId: BOT, log: (l) => logs.push(l), now: () => new Date(Date.UTC(2026, 10, 20)) });
+  return { gh, client, platform, sleeps, logs };
+}
+
+function review(gh: FakeGitHub, comments: ReviewPayload["comments"] = []): ReviewPayload {
+  return { commit_id: gh.headSha, event: "COMMENT", body: summaryBody(gh), comments };
+}
+
+describe("client: identity and token handling (C-5)", () => {
+  test("refuses personal access tokens and user tokens; accepts installation tokens", () => {
+    for (const t of ["ghp_x", "github_pat_x", "gho_x", "ghu_x", "ghr_x"]) assert.throws(() => assertInstallationToken(t), /accepts only the Actions GITHUB_TOKEN or a GitHub App installation token/);
+    assert.throws(() => assertInstallationToken(" "), /empty/);
+    assert.doesNotThrow(() => assertInstallationToken("ghs_abc"));
+    assert.throws(() => gitHubClientFromEnv({}), /neither GH_TOKEN nor GITHUB_TOKEN is set/);
+    // GH_TOKEN wins, as in gh; an empty one falls through.
+    assert.throws(() => gitHubClientFromEnv({ GH_TOKEN: "ghp_user", GITHUB_TOKEN: "ghs_x" }), /personal access token/);
+    assert.doesNotThrow(() => gitHubClientFromEnv({ GH_TOKEN: "ghs_app", GITHUB_TOKEN: "ghp_user" }));
+    assert.doesNotThrow(() => gitHubClientFromEnv({ GH_TOKEN: "", GITHUB_TOKEN: "ghs_x" }));
+    const c = gitHubClientFromEnv({ GITHUB_TOKEN: "ghs_x", GITHUB_API_URL: "https://ghe.example/api/v3" });
+    assert.equal(c.apiUrl, "https://ghe.example/api/v3");
+    assert.equal(c.graphqlUrl, "https://ghe.example/api/v3/graphql");
+  });
+
+  test("the token goes only to the API origin, and never into an error", async () => {
+    const { gh, client } = setup();
+    await client.get(`repos/${gh.repo}/pulls/${gh.number}`);
+    assert.equal(gh.requests[0]!.authorization, `Bearer ${TOKEN}`);
+    await assert.rejects(client.get("https://evil.example/x"), /refusing to send the token to another origin/);
+    assert.equal(gh.requests.length, 1);
+    gh.faults.push({ method: "GET", path: /pulls/, status: 401, body: { message: "Bad credentials" } });
+    await assert.rejects(client.get(`repos/${gh.repo}/pulls/${gh.number}`), (e: Error) => !e.message.includes(TOKEN) && /401 Bad credentials/.test(e.message));
+  });
+
+  test("pagination follows Link headers", async () => {
+    const gh = new FakeGitHub({ pageSize: 2 });
+    for (let i = 0; i < 5; i++) gh.addIssueComment(HUMAN, `c${i}`);
+    const { client } = setup(gh);
+    const all = await client.paginate<{ body: string }>(`repos/${gh.repo}/issues/${gh.number}/comments`);
+    assert.deepEqual(all.map((c) => c.body), ["c0", "c1", "c2", "c3", "c4"]);
+    assert.equal(gh.requests.length, 3);
+  });
+});
+
+describe("client: rate limits and transient errors (S-9)", () => {
+  test("primary limit waits until the reset, then succeeds", async () => {
+    const { gh, client, sleeps } = setup();
+    const reset = Date.UTC(2026, 10, 20) / 1000 + 30;
+    gh.faults.push({ method: "GET", path: /pulls/, status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) }, body: { message: "API rate limit exceeded" } });
+    await client.get(`repos/${gh.repo}/pulls/${gh.number}`);
+    assert.deepEqual(sleeps, [31_000]);
+  });
+
+  test("a reset beyond the bound fails fast with RateLimitError", async () => {
+    const { gh, client, sleeps } = setup();
+    const reset = Date.UTC(2026, 10, 20) / 1000 + 3600;
+    gh.faults.push({ method: "GET", path: /pulls/, status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) } });
+    await assert.rejects(client.get(`repos/${gh.repo}/pulls/${gh.number}`), RateLimitError);
+    assert.deepEqual(sleeps, []);
+  });
+
+  test("429 honours retry-after; a secondary limit waits a minute; even for POST (refused requests took no effect)", async () => {
+    const { gh, client, sleeps } = setup();
+    gh.faults.push({ method: "POST", path: /issues\/7\/comments/, status: 429, headers: { "retry-after": "5" } });
+    gh.faults.push({ method: "POST", path: /issues\/7\/comments/, status: 403, body: { message: "You have exceeded a secondary rate limit." } });
+    await client.request("POST", `repos/${gh.repo}/issues/${gh.number}/comments`, { body: { body: "x" } });
+    assert.deepEqual(sleeps, [5_000, 60_000]);
+    assert.equal(gh.issueComments.length, 1);
+  });
+
+  test("transient 5xx and network errors on reads back off and retry, bounded", async () => {
+    const { gh, client, sleeps } = setup(new FakeGitHub(), { maxAttempts: 3 });
+    gh.faults.push({ method: "GET", path: /pulls/, status: 502 }, { method: "GET", path: /pulls/, status: 0, network: true });
+    await client.get(`repos/${gh.repo}/pulls/${gh.number}`);
+    assert.deepEqual(sleeps, [100, 200]);
+    gh.faults.push({ method: "GET", path: /pulls/, status: 503, times: 3 });
+    await assert.rejects(client.get(`repos/${gh.repo}/pulls/${gh.number}`), /503/);
+  });
+
+  test("a POST without a probe is not repeated after an ambiguous failure", async () => {
+    const { gh, client } = setup();
+    gh.faults.push({ method: "POST", path: /issues\/7\/comments/, status: 502, afterEffect: true });
+    await assert.rejects(client.request("POST", `repos/${gh.repo}/issues/${gh.number}/comments`, { body: { body: "x" } }), /502/);
+    assert.equal(gh.issueComments.length, 1);
+  });
+
+  test("GraphQL errors surface with their types; RATE_LIMITED waits and retries", async () => {
+    const gh = new FakeGitHub({ canResolveThreads: false });
+    const { client } = setup(gh);
+    await assert.rejects(client.graphql("mutation($threadId:ID!){x}", { threadId: "T" }), (e: unknown) => e instanceof GraphQLError && e.types.includes("FORBIDDEN"));
+    const sleeps: number[] = [];
+    let calls = 0;
+    const limited = new GitHubClient({
+      token: TOKEN,
+      apiUrl: gh.origin,
+      sleep: async (ms) => void sleeps.push(ms),
+      fetch: async () =>
+        new Response(JSON.stringify(++calls === 1 ? { errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] } : { data: { ok: true } }), { status: 200 }),
+    });
+    assert.deepEqual(await limited.graphql("query{ok}", {}), { ok: true });
+    assert.deepEqual(sleeps, [60_000]);
+  });
+});
+
+describe("publish (S-7)", () => {
+  test("one COMMENT review with inline comments, replies on own threads, resolution only after Verified fixed", async () => {
+    const { gh, platform } = setup();
+    const own = gh.addThreadRoot(ACTIONS_BOT, findingBody("Nil map", 1), "a.go", 3);
+    const ownStillOpen = gh.addThreadRoot(ACTIONS_BOT, findingBody("Leak", 2), "a.go", 9);
+    const ownNoReply = gh.addThreadRoot(ACTIONS_BOT, findingBody("Race", 3), "a.go", 12);
+    // A human pasting the bot's marker, and another workflow under the same Actions login without a marker.
+    const forged = gh.addThreadRoot(HUMAN, findingBody("Forged", 4), "a.go", 20);
+    const otherWorkflow = gh.addThreadRoot(ACTIONS_BOT, "**Lint.** unused import", "a.go", 30);
+    const otherBotId = gh.addThreadRoot(OTHER_APP, findingBody("Another reviewer", 5, "ai-review/security"), "a.go", 40);
+
+    const pr = await platform.getPullRequest();
+    await platform.startCheck(BOT, pr.headSha);
+    const comments = await platform.listComments();
+    assert.equal(comments.filter((c) => c.threadResolved === false).length, 6);
+
+    const fixed = (id: number) => ({ in_reply_to: id, body: `**Verified fixed at \`${gh.headSha.slice(0, 7)}\`.** Guarded.\n` });
+    const publication: Publication = {
+      review: review(gh, [{ path: "a.go", line: 5, side: "RIGHT", body: findingBody("New", 9) }]),
+      threadReplies: [
+        fixed(own.id),
+        { in_reply_to: ownStillOpen.id, body: "**Still open at `bbbbbbb`.** Not yet.\n" },
+        fixed(forged.id),
+        fixed(otherWorkflow.id),
+        fixed(otherBotId.id),
+      ],
+      resolveThreads: [own, ownStillOpen, ownNoReply, forged, otherWorkflow, otherBotId].map((c) => ({ comment_id: c.id, reason: "verified fixed" })),
+    };
+    const result = await platform.publish(publication);
+
+    assert.equal(gh.reviews.length, 1);
+    assert.equal(gh.reviews[0]!.event, "COMMENT");
+    const inline = gh.reviewComments.filter((c) => c.review_id === gh.reviews[0]!.id);
+    assert.equal(inline.length, 1);
+    const replies = gh.reviewComments.filter((c) => c.in_reply_to_id !== undefined);
+    assert.deepEqual(replies.map((c) => c.in_reply_to_id).sort(), [own.id, ownStillOpen.id].sort());
+    assert.deepEqual(
+      gh.threads.filter((t) => t.isResolved).map((t) => t.rootId),
+      [own.id],
+      "only the bot's own thread with a Verified fixed reply is resolved",
+    );
+    assert.deepEqual(result.commentIds, [String(gh.reviews[0]!.id), String(inline[0]!.id), ...replies.map((r) => String(r.id))]);
+    const w = (result.warnings ?? []).join("\n");
+    assert.match(w, new RegExp(`reply to comment ${forged.id} not posted: not a thread of ai-review/main`));
+    assert.match(w, new RegExp(`reply to comment ${otherWorkflow.id} not posted`));
+    assert.match(w, new RegExp(`reply to comment ${otherBotId.id} not posted`));
+    assert.match(w, new RegExp(`thread of comment ${ownStillOpen.id} not resolved: no "Verified fixed" reply`));
+    assert.match(w, new RegExp(`thread of comment ${ownNoReply.id} not resolved`));
+    const mutations = gh.writes().filter((r) => r.path === "/graphql");
+    assert.equal(mutations.length, 1);
+  });
+
+  test("a refused thread resolution is a warning; the review stays published", async () => {
+    const gh = new FakeGitHub({ canResolveThreads: false });
+    const { platform } = setup(gh);
+    const own = gh.addThreadRoot(ACTIONS_BOT, findingBody("Nil map", 1));
+    await platform.getPullRequest();
+    await platform.listComments();
+    const result = await platform.publish({
+      review: review(gh),
+      threadReplies: [{ in_reply_to: own.id, body: "**Verified fixed at `bbbbbbb`.** ok\n" }],
+      resolveThreads: [{ comment_id: own.id, reason: "verified fixed" }],
+    });
+    assert.equal(gh.reviews.length, 1);
+    assert.match((result.warnings ?? []).join("\n"), /not resolved: GitHub GraphQL: Resource not accessible by integration \(FORBIDDEN\)/);
+  });
+
+  test("a 5xx after GitHub created the review does not post a second one", async () => {
+    const { gh, platform } = setup();
+    gh.faults.push({ method: "POST", path: /\/reviews$/, status: 502, afterEffect: true });
+    await platform.getPullRequest();
+    const result = await platform.publish({ review: review(gh), threadReplies: [], resolveThreads: [] });
+    assert.equal(gh.reviews.length, 1);
+    assert.equal(result.commentIds[0], String(gh.reviews[0]!.id));
+  });
+
+  test("a rejected inline anchor moves the findings into the review body", async () => {
+    const gh = new FakeGitHub({ invalidAnchors: ["a.go:99"] });
+    const { platform } = setup(gh);
+    await platform.getPullRequest();
+    const r = review(gh, [
+      { path: "a.go", line: 5, side: "RIGHT", body: findingBody("Good", 1) },
+      { path: "a.go", line: 99, start_line: 97, start_side: "RIGHT", side: "RIGHT", body: findingBody("Bad anchor", 2) },
+    ]);
+    const result = await platform.publish({ review: r, threadReplies: [], resolveThreads: [] });
+    assert.equal(gh.reviews.length, 1);
+    const body = gh.reviews[0]!.body;
+    assert.match(body, /### Findings not placed inline/);
+    assert.match(body, /`a\.go:97-99`/);
+    assert.doesNotMatch(body, /review-bot:finding/);
+    assert.match(body.trimEnd().split("\n").at(-1)!, /^<!-- review-bot:summary /, "the summary marker stays, last");
+    assert.match((result.warnings ?? []).join(), /moved into the review body/);
+    assert.deepEqual(foldInlineComments(r).comments, []);
+  });
+
+  test("refuses any event other than COMMENT", async () => {
+    const { gh, platform } = setup();
+    await platform.getPullRequest();
+    const bad = { ...review(gh), event: "APPROVE" } as unknown as ReviewPayload;
+    await assert.rejects(platform.publish({ review: bad, threadReplies: [], resolveThreads: [] }), /only comments/);
+    assert.equal(gh.reviews.length, 0);
+  });
+});
+
+describe("superseded run (S-9)", () => {
+  test("head moved before publishing: nothing posted to the old head, no failure comment, check neutral 'superseded'", async () => {
+    const { gh, platform } = setup();
+    const own = gh.addThreadRoot(ACTIONS_BOT, findingBody("Nil map", 1));
+    const pr = await platform.getPullRequest();
+    await platform.startCheck(BOT, pr.headSha);
+    await platform.listComments();
+    gh.push("c".repeat(40));
+    const p: Publication = {
+      review: review(gh, []),
+      threadReplies: [{ in_reply_to: own.id, body: "**Verified fixed at `x`.**\n" }],
+      resolveThreads: [{ comment_id: own.id, reason: "fixed" }],
+    };
+    p.review!.commit_id = pr.headSha;
+    await assert.rejects(platform.publish(p), (e: unknown) => e instanceof SupersededError && /head moved from bbbbbbb to ccccccc/.test(e.message));
+    // The pipeline then tries its failure comment: not posted, the newer run speaks for the PR.
+    assert.deepEqual(await platform.publish({ threadReplies: [], resolveThreads: [], failureComment: "could not complete" }), { commentIds: [] });
+    await platform.completeCheck({ name: BOT, headSha: pr.headSha, conclusion: "neutral", title: "Could not complete", summary: "Review could not complete: superseded" });
+    assert.deepEqual(gh.writes().map((r) => `${r.method} ${r.path}`), [`POST /repos/o/r/check-runs`, `PATCH /repos/o/r/check-runs/${gh.checkRuns[0]!.id}`]);
+    assert.equal(gh.checkRuns[0]!.head_sha, pr.headSha);
+    assert.equal(gh.checkRuns[0]!.conclusion, "neutral");
+    assert.equal(gh.checkRuns[0]!.output?.title, "Superseded by a newer push");
+    assert.deepEqual(platform.report.superseded, { from: pr.headSha, to: "c".repeat(40) });
+  });
+});
+
+describe("failure comment (S-9)", () => {
+  test("created once, then updated in place by marker; never someone else's; retired after a completed review", async () => {
+    const { gh, platform } = setup();
+    // A human quoting the marker, and another workflow's comment under the same login.
+    gh.addIssueComment(HUMAN, `quote\n<!-- review-bot:failure bot=${BOT} -->`);
+    gh.addIssueComment(ACTIONS_BOT, "Deploy preview ready");
+    await platform.getPullRequest();
+    const first = await platform.publish({ threadReplies: [], resolveThreads: [], failureComment: "Automated review could not complete for `bbbbbbb`: boom.\n" });
+    assert.equal(gh.issueComments.length, 3);
+    const mine = gh.issueComments[2]!;
+    assert.deepEqual(first.commentIds, [String(mine.id)]);
+    assert.ok(hasFailureMarker(mine.body, BOT));
+
+    // Next push, same failure: updated in place, not repeated.
+    gh.push("c".repeat(40));
+    const second = new GitHubPlatform({ client: setup(gh).client, repo: gh.repo, number: gh.number, botId: BOT });
+    await second.getPullRequest();
+    const again = await second.publish({ threadReplies: [], resolveThreads: [], failureComment: "Automated review could not complete for `ccccccc`: boom again.\n" });
+    assert.deepEqual(again.commentIds, [String(mine.id)]);
+    assert.equal(gh.issueComments.length, 3);
+    assert.match(mine.body, /`ccccccc`: boom again/);
+
+    // A later completed review updates it so it no longer says the review failed.
+    const third = new GitHubPlatform({ client: setup(gh).client, repo: gh.repo, number: gh.number, botId: BOT });
+    await third.getPullRequest();
+    await third.publish({ review: review(gh), threadReplies: [], resolveThreads: [] });
+    assert.equal(gh.issueComments.length, 3);
+    assert.match(mine.body, /The review of `ccccccc` completed/);
+    assert.ok(hasFailureMarker(mine.body, BOT));
+    assert.match(gh.issueComments[0]!.body, /^quote/, "the human's comment is untouched");
+  });
+
+  test("a failure marker inside a code block or for another bot does not count", () => {
+    assert.equal(hasFailureMarker("```\n<!-- review-bot:failure bot=ai-review/main -->\n```", BOT), false);
+    assert.equal(hasFailureMarker("<!-- review-bot:failure bot=ai-review/other -->", BOT), false);
+    assert.equal(hasFailureMarker("x\n  <!-- review-bot:failure bot=ai-review/main -->  \n", BOT), true);
+  });
+});
+
+describe("check run ai-review/<name> (S-1, S-9)", () => {
+  test("opened in progress at intake and completed in place", async () => {
+    const { gh, platform } = setup();
+    const pr = await platform.getPullRequest();
+    await platform.startCheck(BOT, pr.headSha);
+    assert.equal(gh.checkRuns.length, 1);
+    assert.equal(gh.checkRuns[0]!.status, "in_progress");
+    await platform.completeCheck({ name: BOT, headSha: pr.headSha, conclusion: "success", title: "Reviewed", summary: "1 important" });
+    assert.equal(gh.checkRuns.length, 1);
+    assert.deepEqual([gh.checkRuns[0]!.status, gh.checkRuns[0]!.conclusion, gh.checkRuns[0]!.output?.title], ["completed", "success", "Reviewed"]);
+  });
+
+  test("a queued run of the same name is reused instead of duplicated", async () => {
+    const { gh, platform } = setup();
+    gh.checkRuns.push({ id: 5, name: BOT, head_sha: gh.headSha, status: "queued", conclusion: null });
+    await platform.startCheck(BOT, gh.headSha);
+    assert.equal(gh.checkRuns.length, 1);
+    assert.equal(gh.checkRuns[0]!.status, "in_progress");
+  });
+
+  test("standalone completion: closes an open run, creates a completed one when none, leaves a completed one alone", async () => {
+    const { gh, client } = setup();
+    const c = { name: BOT, headSha: gh.headSha, conclusion: "neutral" as const, title: "Could not complete", summary: "The review job crashed." };
+    // Gate job, no run yet → created completed (e.g. skipped).
+    assert.equal((await completeCheckRun(client, gh.repo, { ...c, conclusion: "skipped", title: "Skipped", summary: "Not authorized (C-4)." })).action, "created");
+    assert.equal(gh.checkRuns[0]!.conclusion, "skipped");
+    // Always-run step after the pipeline completed it: untouched.
+    assert.equal((await completeCheckRun(client, gh.repo, c)).action, "already-completed");
+    assert.equal(gh.checkRuns[0]!.conclusion, "skipped");
+    // Always-run step after a crash left it in progress: completed neutral.
+    const sha2 = "d".repeat(40);
+    gh.checkRuns.push({ id: 77, name: BOT, head_sha: sha2, status: "in_progress", conclusion: null });
+    assert.deepEqual(await completeCheckRun(client, gh.repo, { ...c, headSha: sha2 }), { action: "updated", id: 77 });
+    assert.equal(gh.checkRuns[1]!.conclusion, "neutral");
+    assert.equal((await findCheckRun(client, gh.repo, BOT, sha2))?.status, "completed");
+    await assert.rejects(completeCheckRun(client, gh.repo, { ...c, name: "review" }), /invalid check name/);
+    await assert.rejects(completeCheckRun(client, gh.repo, { ...c, headSha: "" }), /invalid head SHA/);
+  });
+
+  test("completing without a known head SHA fails clearly (the always-run step covers it)", async () => {
+    const { platform } = setup();
+    await assert.rejects(platform.completeCheck({ name: BOT, headSha: "", conclusion: "neutral", title: "x", summary: "y" }), /head SHA is unknown/);
+  });
+});
+
+describe("reads", () => {
+  test("comments normalized with thread state across pages; diff and incremental diff", async () => {
+    const gh = new FakeGitHub({ pageSize: 1, diff: "diff --git a/a.go b/a.go\n" });
+    const root = gh.addThreadRoot(ACTIONS_BOT, findingBody("x", 1), "a.go", 3, true);
+    gh.addThreadRoot(HUMAN, "human", "a.go", 4);
+    gh.reviewComments.push({ id: 5000, user: HUMAN, body: "[wrong] no", path: "a.go", line: null, in_reply_to_id: root.id, created_at: "t" });
+    gh.addIssueComment(HUMAN, "hi");
+    gh.reviews.push({ id: 6000, user: ACTIONS_BOT, body: "", commit_id: gh.headSha, event: "COMMENT", submitted_at: "t" });
+    const { platform } = setup(gh);
+    const comments = await platform.listComments();
+    assert.deepEqual(
+      comments.map((c) => [c.kind, c.threadResolved ?? null, c.inReplyTo ?? null]),
+      [
+        ["review-comment", true, null],
+        ["review-comment", false, null],
+        ["review-comment", null, String(root.id)],
+        ["issue-comment", null, null],
+      ],
+    );
+    assert.equal(await platform.getDiff(), "diff --git a/a.go b/a.go\n");
+    const since = "e".repeat(40);
+    gh.compare.set(`${since}...${gh.headSha}`, { status: "ahead", diff: "incremental" });
+    assert.equal(await platform.getDiff(since), "incremental");
+    gh.compare.set(`${since}...${gh.headSha}`, { status: "diverged", diff: "wrong base" });
+    assert.equal(await platform.getDiff(since), undefined, "after a force push: full review");
+    assert.equal(await platform.getDiff("f".repeat(40)), undefined, "unknown commit: full review");
+  });
+});
