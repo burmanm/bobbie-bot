@@ -147,6 +147,28 @@ merged into any other `routing`. The same from the command line:
 Without a `verifier` model, Important findings are posted labelled
 *unverified* and the summary says verification was not run.
 
+## Per-area `REVIEW.md`
+
+A `REVIEW.md` in a subdirectory applies to changes under that directory, in
+addition to the root one (A-5). Only files above a changed path are read,
+from the base branch (or from `--knowledge-dir` when given), at most 50.
+The root `REVIEW.md` is still what onboards a repository.
+
+- **Skip these paths:** every applicable file's entries apply. An area
+  file's globs are relative to its directory, like a `.gitignore` in a
+  subdirectory: `*.pb.go` matches at any depth below it, `/gen/` and
+  `gen/x.go` are anchored at it. An area cannot un-skip what the root
+  skips. The run record gives the file an exclusion came from.
+- **Limits (nit cap):** the root cap counts every nit in the review; an
+  area cap counts the nits anchored under that area. A nit is posted only
+  when every cap that applies still has room, so the strictest wins and an
+  area cannot raise the root's cap. Important findings are never capped.
+- **Everything else** goes to the reviewer verbatim. `context.md` has a
+  table of which `REVIEW.md` files apply to each changed file, and each
+  file is labelled `applies-to` (`all files`, or `<dir>/**`).
+- A PR's edit to any `REVIEW.md` is reviewed like other changes; the base
+  versions apply (C-3).
+
 ## Time limits
 
 | Limit | Default | Flag | YAML |

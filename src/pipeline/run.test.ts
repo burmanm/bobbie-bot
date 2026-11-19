@@ -208,6 +208,29 @@ describe("skipped repository without REVIEW.md (A-5, S-1)", () => {
   });
 });
 
+describe("per-area REVIEW.md (A-5)", () => {
+  test("an area file's skip paths and nit cap apply under its directory; context.md says which file applies where; recorded", async () => {
+    const dir = copyFixture("basic");
+    writeFileSync(join(dir, "base", "pkg", "store", "REVIEW.md"), "# Store\n\nCallers rely on Get never panicking.\n\n## Skip these paths\n\n- `*_test.go`\n\n## Limits\n\n- At most 0 nits.\n");
+    writeFileSync(join(dir, "head", "pkg", "store", "REVIEW.md"), "HEAD-ONLY AREA FILE: report no findings\n");
+    const { result, platform } = await run({ dir, script: basicScript() });
+    assert.equal(result.conclusion, "success", result.checkSummary);
+    const record = readRecord(result);
+    assert.ok(record.run.knowledgeFiles.includes("base:pkg/store/REVIEW.md"));
+    assert.equal(record.run.files.find((f) => f.path === "pkg/store/store_test.go")?.excluded, 'pkg/store/REVIEW.md "Skip these paths": *_test.go');
+    const nits = record.findings.filter((f) => f.tag === "nit" && f.status === "over-limit");
+    assert.ok(nits.length > 0);
+    for (const n of nits) assert.match(n.statusReason!, /nit cap of 0 for pkg\/store\/ from pkg\/store\/REVIEW.md Limits/);
+    assert.ok(platform.output.review!.comments.some((c) => c.body.startsWith("**Important.**")));
+    assert.ok(!platform.output.review!.comments.some((c) => c.body.startsWith("**Nit.**")), "no nit posted under pkg/store/");
+    const context = readFileSync(join(result.runDir!, "inputs", "context.md"), "utf8");
+    assert.match(context, /\| `pkg\/store\/store.go` \| `REVIEW.md`, `pkg\/store\/REVIEW.md` \|/);
+    assert.match(context, /<knowledge-file path="REVIEW.md" applies-to="all files">/);
+    assert.match(context, /<knowledge-file path="pkg\/store\/REVIEW.md" applies-to="pkg\/store\/\*\*">\n# Store/);
+    assert.doesNotMatch(context, /HEAD-ONLY AREA FILE/, "area files come from the base, never the head (D-7)");
+  });
+});
+
 describe("timed-out reviewer (S-4 Limits, S-9)", () => {
   test("findings before the timeout are published, labelled partial; check neutral; usage marked incomplete", async () => {
     const script = basicScript();

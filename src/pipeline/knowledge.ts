@@ -2,7 +2,10 @@
  * Knowledge (A-5, D-6, D-7): the repository's `AGENTS.md`, `REVIEW.md` and
  * vendored `.review/*-guidelines.md`, plus bot settings in
  * `.review/review-bot.yaml` — all read from the **base** tree, never the
- * head. Per-area `REVIEW.md` files are not supported yet (R-4).
+ * head. Per-area `REVIEW.md` files (A-5) are loaded once the changed paths
+ * are known: a `REVIEW.md` in any directory above a changed file applies to
+ * it, in addition to the root one (core/review-areas.ts says how they
+ * combine).
  *
  * For the pilot, the knowledge files can come from another directory
  * (`--knowledge-dir`, `--guidelines`) while the repository has none of its
@@ -11,6 +14,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { candidateAreaDirs } from "../core/index.ts";
 
 export interface KnowledgeFile {
   /** Display path: repository-relative for the base tree, otherwise the file name. */
@@ -28,6 +32,10 @@ export interface Knowledge {
   guidelines: KnowledgeFile[];
   /** `.review/review-bot.yaml` text, when present. */
   botConfig?: KnowledgeFile;
+  /** Per-area `REVIEW.md` files, path order (A-5). Filled by `loadAreaReviews`. */
+  areas: KnowledgeFile[];
+  /** The tree the root `REVIEW.md` came from; area files come from the same one. */
+  tree?: { root: string; source: KnowledgeFile["source"] };
 }
 
 export interface KnowledgeOverride {
@@ -68,7 +76,7 @@ function guidelineNames(root: string): string[] {
 }
 
 function fromTree(root: string, source: KnowledgeFile["source"]): Knowledge {
-  const k: Knowledge = { guidelines: [] };
+  const k: Knowledge = { guidelines: [], areas: [], tree: { root, source } };
   const read = (rel: string) => readInside(root, rel);
   const origin = (rel: string) => (source === "override" ? resolve(root, rel) : undefined);
   const agents = read("AGENTS.md");
@@ -100,13 +108,34 @@ export function loadKnowledge(baseTree: string, override: KnowledgeOverride = {}
   return k;
 }
 
+/** At most this many area files are loaded; more is a sign of a misconfigured repository. */
+export const MAX_AREA_FILES = 50;
+
+/**
+ * Load the area `REVIEW.md` files that apply to `paths` (A-5): one in any
+ * directory above a changed file, from the same tree as the root file.
+ * Sets and returns `k.areas`.
+ */
+export function loadAreaReviews(k: Knowledge, paths: readonly string[]): KnowledgeFile[] {
+  k.areas = [];
+  if (k.tree === undefined || k.review === undefined) return k.areas;
+  const { root, source } = k.tree;
+  for (const dir of candidateAreaDirs(paths)) {
+    if (k.areas.length >= MAX_AREA_FILES) break;
+    const rel = `${dir}/REVIEW.md`;
+    const text = readInside(root, rel);
+    if (text !== undefined) k.areas.push(file(rel, source, text, source === "override" ? resolve(root, rel) : undefined));
+  }
+  return k.areas;
+}
+
 /** The files the run loaded, for the run record (A-6). */
 export function knowledgeFileList(k: Knowledge): string[] {
-  const all = [k.agents, k.review, ...k.guidelines, k.botConfig].filter((f): f is KnowledgeFile => f !== undefined);
+  const all = [k.agents, k.review, ...k.areas, ...k.guidelines, k.botConfig].filter((f): f is KnowledgeFile => f !== undefined);
   return all.map((f) => (f.source === "base" ? `base:${f.path}` : `override:${f.origin}#sha256=${f.sha256.slice(0, 12)}`));
 }
 
 /** Knowledge paths a PR edit would have changed; a PR cannot reconfigure the bot (C-3). */
 export function isKnowledgePath(path: string): boolean {
-  return path === "AGENTS.md" || path === "REVIEW.md" || /^\.review\/[^/]+$/.test(path);
+  return path === "AGENTS.md" || path === "REVIEW.md" || path.endsWith("/REVIEW.md") || /^\.review\/[^/]+$/.test(path);
 }

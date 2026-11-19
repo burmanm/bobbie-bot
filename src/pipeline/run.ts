@@ -32,6 +32,8 @@ import {
   parseDiff,
   parseReviewMd,
   preExistingItems,
+  areaNitCaps,
+  type ReviewArea,
   producerPart,
   type Question,
   quoteFound,
@@ -68,7 +70,7 @@ import {
 import { buildContext } from "./context.ts";
 import { historyTools } from "./history-tools.ts";
 import { type Chunk, chunkByDirectory, deterministicPass, type DeterministicResult } from "./deterministic.ts";
-import { isKnowledgePath, type Knowledge, knowledgeFileList, type KnowledgeOverride, loadKnowledge } from "./knowledge.ts";
+import { isKnowledgePath, type Knowledge, knowledgeFileList, type KnowledgeOverride, loadAreaReviews, loadKnowledge } from "./knowledge.ts";
 import { snapshotLookup } from "./lookup.ts";
 import { loadMethod, type Method } from "./method.ts";
 import { buildReview, failureCommentBody, recheckReplyBody } from "./publish.ts";
@@ -441,8 +443,15 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
 
     // ---- S-2 deterministic pass ------------------------------------------
     const reviewMd = parseReviewMd(knowledge.review!.text);
-    const det: DeterministicResult = deterministicPass(reviewDiffText!, reviewMd, inputsDir);
-    const fullFiles = scope === "incremental" ? parseDiff(fullDiffText!) : det.all;
+    const reviewFiles = parseDiff(reviewDiffText!);
+    const fullFiles = scope === "incremental" ? parseDiff(fullDiffText!) : reviewFiles;
+    // Per-area REVIEW.md files above any file the PR changes (A-5).
+    loadAreaReviews(knowledge, [...new Set(fullFiles.flatMap((f) => [f.newPath, f.oldPath]).filter((p): p is string => p !== undefined))]);
+    const areas: ReviewArea[] = [
+      { dir: "", path: "REVIEW.md", parsed: reviewMd },
+      ...knowledge.areas.map((f) => ({ dir: f.path.slice(0, -"/REVIEW.md".length), path: f.path, parsed: parseReviewMd(f.text) })),
+    ];
+    const det: DeterministicResult = deterministicPass(reviewFiles, areas, inputsDir);
     const fullIndex = indexDiff(fullFiles.filter((f) => !f.binary));
     const excludedReason = new Map(det.excluded.map((e) => [e.path, e.reason]));
     files = det.all.map((f) => {
@@ -460,6 +469,13 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       scope,
       sinceSha,
       reviewMd: { skipEntries: reviewMd.skipEntries, nitCap: reviewMd.nitCap, found: reviewMd.found, unparsedSkipItems: reviewMd.unparsedSkipItems },
+      areaReviewMd: areas.slice(1).map((a) => ({
+        path: a.path,
+        appliesTo: `${a.dir}/`,
+        skipEntries: a.parsed.skipEntries,
+        nitCap: a.parsed.nitCap,
+        unparsedSkipItems: a.parsed.unparsedSkipItems,
+      })),
       patches: det.patches,
       excluded: det.excluded,
       softSkips: det.softSkips,
@@ -484,6 +500,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       excluded: det.excluded,
       softSkips: det.softSkips,
       knowledge,
+      areas,
       knowledgeSha: pr.baseSha,
       knowledgeEditedByPr,
       comments,
@@ -676,7 +693,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
 
     // ---- S-6 reconcile ----------------------------------------------------
     findings = dedupeAgainstComments(findings, prior.othersInline);
-    findings = reconcile(findings, { priorFingerprints: prior.fingerprints, nitCap: reviewMd.nitCap });
+    findings = reconcile(findings, { priorFingerprints: prior.fingerprints, nitCaps: areaNitCaps(areas) });
     stage("06-reconcile.json", { findings, rechecks });
     log(`S-6 reconcile ok publish=${findings.filter(isLive).length} duplicate=${findings.filter((f) => f.status === "duplicate").length} over-limit=${findings.filter((f) => f.status === "over-limit").length}`);
 

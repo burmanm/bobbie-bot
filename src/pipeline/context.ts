@@ -4,7 +4,7 @@
  * look-alikes neutralized (C-3: hygiene, not the defence). Knowledge files
  * from the base branch go in verbatim.
  */
-import type { Exclusion, SoftSkip } from "../core/index.ts";
+import { areasFor, type Exclusion, type ReviewArea, type SoftSkip } from "../core/index.ts";
 import type { PrComment, PullRequestInfo } from "../platform/index.ts";
 import type { PatchFile } from "./deterministic.ts";
 import type { Knowledge, KnowledgeFile } from "./knowledge.ts";
@@ -24,8 +24,9 @@ function untrusted(label: string, text: string): string {
   return `<${UNTRUSTED} source="${label}">\n${neutralizeDelimiters(text).trimEnd()}\n</${UNTRUSTED}>`;
 }
 
-function knowledgeBlock(f: KnowledgeFile): string {
-  return `<${KNOWLEDGE} path="${f.path}">\n${f.text.replace(/<\s*(\/?)\s*knowledge-file/gi, "&lt;$1knowledge-file").trimEnd()}\n</${KNOWLEDGE}>`;
+function knowledgeBlock(f: KnowledgeFile, appliesTo?: string): string {
+  const scope = appliesTo === undefined ? "" : ` applies-to="${appliesTo}"`;
+  return `<${KNOWLEDGE} path="${f.path}"${scope}>\n${f.text.replace(/<\s*(\/?)\s*knowledge-file/gi, "&lt;$1knowledge-file").trimEnd()}\n</${KNOWLEDGE}>`;
 }
 
 export interface ContextInput {
@@ -36,6 +37,8 @@ export interface ContextInput {
   excluded: Exclusion[];
   softSkips: SoftSkip[];
   knowledge: Knowledge;
+  /** Root and per-area REVIEW.md files (A-5); the root has dir "". */
+  areas?: readonly ReviewArea[];
   knowledgeSha: string;
   /** Knowledge files the PR edits; the base versions apply (C-3). */
   knowledgeEditedByPr: string[];
@@ -91,7 +94,7 @@ export function buildContext(c: ContextInput): string {
   }
   if (c.softSkips.length > 0) {
     out.push("Matched by a qualified \"Skip these paths\" entry; apply the qualifier yourself:", "");
-    for (const s of c.softSkips) out.push(`- \`${cell(s.path)}\` — \`${s.glob}\` ${s.qualifier}`);
+    for (const s of c.softSkips) out.push(`- \`${cell(s.path)}\` — \`${s.glob}\` ${s.qualifier}${s.source ? ` (from \`${cell(s.source)}\`)` : ""}`);
     out.push("");
   }
   if (c.hasModcache) out.push("The dependency source cache is available as the `modcache` root.", "");
@@ -104,8 +107,24 @@ export function buildContext(c: ContextInput): string {
       "",
     );
   }
-  const files = [c.knowledge.agents, c.knowledge.review, ...c.knowledge.guidelines].filter((f): f is KnowledgeFile => f !== undefined);
-  for (const f of files) out.push(knowledgeBlock(f), "");
+  const areaFiles = c.knowledge.areas ?? [];
+  if (areaFiles.length > 0) {
+    out.push(
+      "This repository has more than one `REVIEW.md`. The root one applies to every file; one in a subdirectory applies, in addition, to the files under that directory and is more specific there. Their skip paths and nit caps are already applied.",
+      "",
+      "| Changed file | REVIEW.md files that apply |",
+      "|---|---|",
+    );
+    for (const p of c.patches) {
+      const applying = areasFor(c.areas ?? [], p.path).map((a) => `\`${cell(a.path)}\``);
+      out.push(`| \`${cell(p.path)}\` | ${applying.join(", ") || "`REVIEW.md`"} |`);
+    }
+    out.push("");
+  }
+  if (c.knowledge.agents) out.push(knowledgeBlock(c.knowledge.agents), "");
+  if (c.knowledge.review) out.push(knowledgeBlock(c.knowledge.review, areaFiles.length > 0 ? "all files" : undefined), "");
+  for (const f of areaFiles) out.push(knowledgeBlock(f, `${f.path.slice(0, -"REVIEW.md".length)}**`), "");
+  for (const f of c.knowledge.guidelines) out.push(knowledgeBlock(f), "");
 
   out.push("## Existing comments on this PR (untrusted)", "");
   const relevant = c.comments.filter((x) => x.body.trim() !== "");

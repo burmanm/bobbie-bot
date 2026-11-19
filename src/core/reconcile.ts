@@ -7,6 +7,7 @@
  * Findings are never mutated; new objects are returned in the input order.
  */
 import { isLive } from "./grounding.ts";
+import { type AreaNitCap, applyAreaNitCaps } from "./review-areas.ts";
 import type { Finding, Location, Tag } from "./schemas.ts";
 
 const TAG_RANK: Record<Tag, number> = { important: 0, nit: 1, "pre-existing": 2 };
@@ -71,9 +72,16 @@ export function applyNitCap(findings: readonly Finding[], cap: number | undefine
   });
 }
 
-/** S-6 in one call: dedupe, then the nit cap. */
-export function reconcile(findings: readonly Finding[], opts: { priorFingerprints?: ReadonlySet<string>; nitCap?: number | undefined }): Finding[] {
-  return applyNitCap(dedupe(findings, opts.priorFingerprints), opts.nitCap);
+/**
+ * S-6 in one call: dedupe, then the nit cap. With `nitCaps` (root and
+ * per-area REVIEW.md caps, A-5) those apply instead of `nitCap`.
+ */
+export function reconcile(
+  findings: readonly Finding[],
+  opts: { priorFingerprints?: ReadonlySet<string>; nitCap?: number | undefined; nitCaps?: readonly AreaNitCap[] },
+): Finding[] {
+  const deduped = dedupe(findings, opts.priorFingerprints);
+  return opts.nitCaps !== undefined ? applyAreaNitCaps(deduped, opts.nitCaps) : applyNitCap(deduped, opts.nitCap);
 }
 
 /** Ids of findings that are not published and have no statusReason (A-3 invariant). */
