@@ -17,7 +17,16 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { type AgentStep, createPiSdkAgentStep, createScriptedProvider, type Script, type ThinkingLevel } from "../agent/index.ts";
+import {
+  type AcpAgentConfig,
+  type AgentStep,
+  createAcpAgentStep,
+  createPiSdkAgentStep,
+  createRoutedAgentStep,
+  createScriptedProvider,
+  type Script,
+  type ThinkingLevel,
+} from "../agent/index.ts";
 import {
   defaultModcache,
   DryRunPlatform,
@@ -46,9 +55,20 @@ Knowledge (default: AGENTS.md, REVIEW.md, .review/*-guidelines.md from the base 
   --guidelines <file>      Add a guidelines file (repeatable)
 
 Models (no defaults; .review/review-bot.yaml on the base branch overrides):
-  --model <role>=<provider>/<id>   role is reviewer or verifier (repeatable)
+  --model <role>=<provider>/<id>   role is reviewer or verifier (repeatable).
+                                   provider "openrouter" runs in pi;
+                                   "acp/<agent>" runs an ACP agent (below)
   --thinking <role>=<level>        off, minimal, low, medium, high
+  --providers <role>=<a,b,...>     OpenRouter only: serve the role's model only
+                                   from these providers (routing "only", no
+                                   fallbacks), e.g. reviewer=anthropic,amazon-bedrock
   --script <file>          Use a scripted model (JSON) instead of a provider
+
+ACP agents (Agent Client Protocol, started as a subprocess over stdio):
+  --acp-agent <name>=<command> [args]   Define agent <name>; use it with
+                                   --model <role>=acp/<name> (repeatable)
+  --acp-config <file>      JSON: {"agents": {"<name>": {"command": "...",
+                           "args": [...], "env": {...}, "model": "..."}}}
 
 Run:
   --name <name>            Reviewer name; check run ai-review/<name> (default main)
@@ -72,6 +92,44 @@ function pairs(values: string[] | undefined, what: string): Map<PipelineRole, st
     out.set(role, v.slice(eq + 1));
   }
   return out;
+}
+
+const AGENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+/** ACP agents from --acp-config, then --acp-agent (which wins for the same name). Operator input only. */
+function readAcpAgents(configFile: string | undefined, defs: string[] | undefined): Record<string, AcpAgentConfig> {
+  const agents: Record<string, AcpAgentConfig> = {};
+  if (configFile !== undefined) {
+    let data: { agents?: Record<string, Partial<AcpAgentConfig>> };
+    try {
+      data = JSON.parse(readFileSync(resolve(configFile), "utf8"));
+    } catch (e) {
+      throw new UsageError(`cannot read --acp-config ${configFile}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    for (const [name, a] of Object.entries(data.agents ?? {})) {
+      const strings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string");
+      const env = a.env as unknown;
+      if (
+        !AGENT_NAME.test(name) ||
+        typeof a.command !== "string" ||
+        a.command === "" ||
+        (a.args !== undefined && !strings(a.args)) ||
+        (env !== undefined && (typeof env !== "object" || env === null || !Object.values(env).every((v) => typeof v === "string"))) ||
+        (a.model !== undefined && typeof a.model !== "string")
+      ) {
+        throw new UsageError(`--acp-config: agent "${name}" needs a name of letters, digits, ".", "_", "-", a "command" string, and optional "args" (strings), "env" (string values), "model" (string)`);
+      }
+      agents[name] = { command: a.command, ...(a.args ? { args: a.args } : {}), ...(a.env ? { env: a.env } : {}), ...(a.model ? { model: a.model } : {}) };
+    }
+  }
+  for (const def of defs ?? []) {
+    const eq = def.indexOf("=");
+    const name = def.slice(0, eq);
+    const words = def.slice(eq + 1).trim().split(/\s+/).filter((w) => w !== "");
+    if (eq <= 0 || !AGENT_NAME.test(name) || words.length === 0) throw new UsageError(`--acp-agent must be <name>=<command> [args]: ${def}`);
+    agents[name] = { command: words[0]!, args: words.slice(1) };
+  }
+  return agents;
 }
 
 export interface Io {
@@ -108,6 +166,9 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
         guidelines: { type: "string", multiple: true },
         model: { type: "string", multiple: true },
         thinking: { type: "string", multiple: true },
+        providers: { type: "string", multiple: true },
+        "acp-agent": { type: "string", multiple: true },
+        "acp-config": { type: "string" },
         script: { type: "string" },
         name: { type: "string" },
         modcache: { type: "string" },
@@ -155,7 +216,10 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
     // Models: plain configuration, never a default (P-4).
     const models = pairs(args.model, "--model");
     const thinking = pairs(args.thinking, "--thinking");
-    const inputs: ConfigInputs = { models: {}, thinking: {} };
+    const providers = pairs(args.providers, "--providers");
+    const inputs: ConfigInputs = { models: {}, thinking: {}, providers: {} };
+    for (const [role, list] of providers) inputs.providers![role] = list.split(",").map((p) => p.trim()).filter((p) => p !== "");
+    const acpAgents = readAcpAgents(args["acp-config"], args["acp-agent"]);
     let agentStep: AgentStep;
     if (args.script !== undefined) {
       const script = JSON.parse(readFileSync(resolve(args.script), "utf8")) as Script;
@@ -164,6 +228,11 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       agentStep = createPiSdkAgentStep({ providers: [scripted.provider], retry: { enabled: false } });
     } else {
       agentStep = createPiSdkAgentStep();
+    }
+    if (Object.keys(acpAgents).length > 0) {
+      agentStep = createRoutedAgentStep({ pi: agentStep, acp: createAcpAgentStep({ agents: acpAgents }) });
+    } else {
+      agentStep = createRoutedAgentStep({ pi: agentStep });
     }
     for (const [role, spec] of models) inputs.models![role] = spec;
     for (const [role, level] of thinking) {

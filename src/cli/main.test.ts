@@ -60,3 +60,12 @@ test("without a model the run completes neutral instead of picking one (P-4)", a
   assert.equal(payload.check_run.conclusion, "neutral");
   assert.match(payload.check_run.output.summary, /no model is configured for the reviewer role/);
 });
+
+test("malformed --acp-agent and --acp-config are usage errors", async () => {
+  const bad = io();
+  assert.equal(await main(["review", "--dry-run", "--fixture", FIXTURE, "--acp-agent", "=node"], bad.io), 2);
+  assert.match(bad.out.stderr, /--acp-agent must be <name>=<command>/);
+  const missing = io();
+  assert.equal(await main(["review", "--dry-run", "--fixture", FIXTURE, "--acp-config", join(work, "none.json")], missing.io), 2);
+  assert.match(missing.out.stderr, /cannot read --acp-config/);
+});

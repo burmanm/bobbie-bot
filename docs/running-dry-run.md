@@ -78,6 +78,7 @@ roles:
   verifier:
     model: openrouter/<vendor>/<model>
     thinking: low
+    providers: [anthropic, amazon-bedrock]
     routing: { sort: price }
 limits:
   reviewer: { timeoutSeconds: 1200, idleTimeoutSeconds: 180, maxTurns: 120, maxCostUsd: 3 }
@@ -89,8 +90,41 @@ skip:
   labels: [round-cap]
 ```
 
+`providers` (OpenRouter models only) restricts which upstream providers may
+serve the model: it becomes OpenRouter's routing `only` with fallbacks off,
+merged into any other `routing`. The same from the command line:
+`--providers reviewer=anthropic,amazon-bedrock`.
+
 Without a `verifier` model, Important findings are posted labelled
 *unverified* and the summary says verification was not run.
+
+## Using an ACP agent instead of OpenRouter
+
+A role's model can be an external agent that speaks the Agent Client
+Protocol: the model spec `acp/<name>` selects it, where `<name>` is defined
+on the command line (never in the repository's YAML, which can only refer
+to it):
+
+```bash
+node src/cli/main.ts review --dry-run --pr k8ssandra/cass-operator#1021 --acp-agent claude=claude-code-acp --model reviewer=acp/claude --model verifier=openrouter/<vendor>/<model>
+```
+
+`--acp-agent <name>=<command> [args]` splits on spaces. For arguments with
+spaces, environment variables or a model choice, use `--acp-config`:
+
+```json
+{
+  "agents": {
+    "claude": { "command": "claude-code-acp", "args": [], "env": {}, "model": "<model id>" }
+  }
+}
+```
+
+The agent starts in the head snapshot, so use absolute paths for local
+scripts. It needs its own credentials (environment or a prior login);
+review-bot withholds GitHub tokens from it. Its isolation is weaker than the
+pi step's (see `src/agent/README.md`, "ACP agents"), and spend is only
+counted if the agent reports a cost.
 
 ## Offline, with the scripted model
 
