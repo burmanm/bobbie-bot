@@ -134,6 +134,8 @@ test("review: extraction offline and keyless; the review gets the snapshot read-
   assert.deepEqual(cli, [
     "review", "--pr", "k8ssandra/cass-operator#1021", "--snapshot-dir", "/snapshot", "--runs-dir", "/runs", "--name", "main",
     "--model", "reviewer=openrouter/vendor/model-a", "--model", "verifier=openrouter/vendor/model-b", "--thinking", "verifier=low", "--max-cost", "3",
+    // 30 min step: container stopped at 29 min, run deadline 2 min inside that (S-9).
+    "--run-timeout", "1620s",
   ]);
   assert.ok(!cli.includes("--dry-run"));
 });

@@ -58,8 +58,10 @@ inputs:
   timeout-minutes:
     description: >-
       The review step's own time limit. Set the step's timeout-minutes to the
-      same value; the action stops the review a minute earlier so it can
-      complete its check and write its record.
+      same value. The pipeline's run deadline (--run-timeout) is set three
+      minutes inside it, so a slow review publishes a partial result and
+      completes its check; the action stops the container a minute before the
+      limit as a last resort.
     default: "40"
   provider-env:
     description: Names of environment variables holding provider keys, passed to the review container only

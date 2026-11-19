@@ -126,6 +126,12 @@ case "$cmd" in
     minutes="${RB_TIMEOUT_MINUTES:-40}"
     [[ "$minutes" =~ ^[1-9][0-9]*$ ]] || fail "invalid timeout-minutes: $minutes"
     seconds=$(( minutes * 60 > 120 ? minutes * 60 - 60 : minutes * 60 ))
+    # The pipeline's own run deadline sits a further two minutes inside that
+    # (S-4 Limits, S-9): it aborts the running step, publishes what it has
+    # labelled partial and completes the check as neutral before SIGTERM.
+    # A runTimeout in the base branch's .review/review-bot.yaml still wins.
+    run_deadline=$(( seconds > 300 ? seconds - 120 : seconds * 3 / 4 ))
+    args+=(--run-timeout "${run_deadline}s")
     container="review-bot-$$-${GITHUB_RUN_ID:-local}"
     docker_args+=(--name "$container")
     set +e
