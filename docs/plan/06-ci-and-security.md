@@ -15,7 +15,7 @@
 
 | Workflow | Trigger | Job |
 |---|---|---|
-| Review | `pull_request_target`: opened, reopened, ready for review, synchronize, labeled; manual dispatch with PR number | gate → prepare → `review-bot review` |
+| Review | `pull_request_target`: opened, reopened, ready for review, synchronize, labeled; manual dispatch with PR number; when waiting for CI also `workflow_run` completed, `status`, and a schedule ([C-9](#c-9--waiting-for-ci)) | gate → prepare → `review-bot review` |
 | Harvest | Schedule; PR closed | `review-bot harvest` |
 | Learn | Schedule; manual | `review-bot learn` → report issue, PRs |
 | Eval | Manual; on PRs to the bot's own repository | `review-bot eval` |
@@ -27,9 +27,11 @@
   commit SHA. The consuming workflow file is a shared file vendored by the
   review-process sync tool; nothing references another organization at run
   time other than the pinned action itself.
-- Configuration: workflow inputs first (reviewer name, role→model map,
-  limits, authorization label), optionally overridden by
-  `.review/review-bot.yaml` on the base branch.
+- Configuration: a pi agent directory supplied by the operator (providers,
+  models, packages) plus bot settings — workflow inputs first (reviewer
+  name, role→model map, limits, authorization label, CI wait), optionally
+  overridden within operator limits by `.review/review-bot.yaml` on the
+  base branch. See [F-7](01-foundation-pi.md#f-7--configuration-follows-pi).
 - The same CLI runs locally (`review-bot review --pr N --dry-run`, or
   `/review` inside pi on a working tree) and prints the would-be review.
   That is both the development loop and the "local review step" of the
@@ -69,8 +71,8 @@ created with **all** of:
 | Setting | Keeps out |
 |---|---|
 | In-memory settings with `projectTrusted: false` | The snapshot's `.pi/` settings, extensions, skills, prompts, themes, system-prompt files; the user-level settings file |
-| A private, empty agent directory | User-level extensions, `auth.json`, `models.json`, global `AGENTS.md` |
-| Resource loader with no discovered extensions, skills, prompt templates or themes; our extension passed explicitly | Everything discovered |
+| A private agent directory: empty, or the operator's configuration ([F-7](01-foundation-pi.md#f-7--configuration-follows-pi)) and nothing else | The runner user's `~/.pi/agent`: extensions, `auth.json`, `models.json`, global `AGENTS.md`. The operator directory must contain no `AGENTS.md`, `SYSTEM.md` or `APPEND_SYSTEM.md`; the step checks |
+| Resource loader with no discovered extensions, skills, prompt templates or themes; our extension passed explicitly, plus only the packages listed in the operator's `settings.json` | Everything discovered |
 | `noContextFiles` | `AGENTS.md` / `CLAUDE.md`. This is a **separate switch from project trust**, and pi walks from the working directory up to the filesystem root. The base branch's `AGENTS.md` reaches the model through `context.md` instead |
 | Our own system prompt | pi's coding-assistant preamble |
 | In-memory session manager | Session files |
@@ -168,6 +170,11 @@ OpenRouter-specific.
   The role→model map is therefore plain configuration (workflow input,
   which can read an organization or repository variable), never code, and
   changing it needs no bot release.
+- **Providers are pi configuration.** Another provider, a gateway, an
+  endpoint or a pi provider package is added in the operator's pi agent
+  directory (`models.json`, `settings.json` `packages`), in pi's format,
+  with no change to the bot ([F-7](01-foundation-pi.md#f-7--configuration-follows-pi)).
+  OpenRouter upstream restrictions use pi's `compat.openRouterRouting`.
 - **Owners decide what is allowed**, per organization, and enforce it at the
   provider: an OpenRouter API key can be restricted to specific models, and
   upstream-provider and data-retention preferences are set there. The bot
@@ -195,3 +202,61 @@ OpenRouter-specific.
 - Job summary: findings by status, cost, per-step timings.
 - Run record artifact on every run, including failures.
 - A heartbeat line while a model step is working.
+- Production metrics — cost, findings, rounds, human comments, missed
+  findings, timings — are computed by the harvest job, not by the review
+  job ([10-metrics.md](10-metrics.md)).
+
+## C-9 — Waiting for CI
+
+Optional, per repository: the bot does not review a head SHA until the
+repository's own CI has passed on it. A red build usually means another
+push is coming, and a review of a broken change costs the same as a review
+of a good one ([D-16](README.md#key-decisions)).
+
+**Configuration** (bot settings, [F-7](01-foundation-pi.md#f-7--configuration-follows-pi)):
+
+| Key | Values | Default |
+|---|---|---|
+| `ci.require` | `off`; `required` (the base branch's required status checks, minus every `ai-review/*` check); or a list of check-run, status-context or workflow names | `off` |
+| `ci.onFailure` | `skip` (complete the check as *skipped*, "CI failed: <names>") or `review` (review anyway, and say so in the summary) | `skip` |
+| `ci.timeout` | How long to wait for CI before giving up | `6h` |
+
+**In the gate job** (no secrets, no model), after authorization:
+
+| State of the required checks on the head SHA | Gate does |
+|---|---|
+| All completed, conclusion `success`, `skipped` or `neutral` | Continue to prepare and review |
+| Any completed with another conclusion | `ci.onFailure` |
+| Any pending or not yet reported | Create `ai-review/<name>` as **queued** with "Waiting for CI: <names>", and stop. No prepare, no model call |
+
+**Triggers that re-run the gate** for a waiting PR (added to the review
+workflow, [C-2](#c-2--workflows)):
+
+- `workflow_run` with `types: [completed]`, naming the repository's CI
+  workflows. GitHub does not start workflows on `check_suite` events from
+  suites that Actions created, so `check_suite` cannot be used for this.
+  `workflow_run` runs the default branch's workflow file with secrets, like
+  `pull_request_target`; it gets the same three-job split. Its
+  `pull_requests` field is empty for fork PRs, so the PR is found by
+  listing open PRs and matching `head.sha`. An event for a SHA that is no
+  longer the PR's head is ignored.
+- `status` for CI that reports commit statuses from outside Actions.
+- A schedule (every 30 minutes) that completes a check queued longer than
+  `ci.timeout` as *skipped*, "CI did not report within <timeout>", so no
+  PR stays in `review/bots` forever when CI never starts (for example a
+  first-time contributor's run awaiting approval).
+- Manual dispatch with the PR number, by someone with write access, which
+  can also pass `--ignore-ci`.
+
+A new push while waiting is handled like any push: the concurrency group
+cancels the old gate, and the new head SHA gets its own check.
+
+The run record stores when the head SHA was first seen and when CI
+completed, so the CI wait is visible in the metrics
+([O-1](10-metrics.md#o-1--what-is-measured)).
+
+**Contract.** I-2 #1 still holds: a queued check always ends as
+*success*, *skipped* or *neutral* — by review, by CI failure, or by
+timeout. Whether a PR whose CI failed should move on to people at all is
+the review-process state workflow's call, not the bot's
+([I-5](09-process-integration.md#i-5--gaps-this-exposes-in-review-process-to-raise-there)).

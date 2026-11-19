@@ -38,7 +38,7 @@ GitHub, which keeps most logic unit-testable without a model or network.
 | `agent` | `AgentStep` interface: run one model step with a role, prompt, read roots, tool allowlist and limits; return typed tool outputs, rejected calls, usage and outcome. Signature proposed in [spike-r0-findings.md](spike-r0-findings.md#proposed-agentstep-interface). Implementation: pi SDK (subprocess possible later). Tests use the same implementation with pi's scripted model provider | `core` |
 | `pi-review` (pi package) | Extension: typed tools, tool-call guard, `/review` command. Method skill and prompt templates | `core` |
 | `platform` | `Platform` interface: fetch PR and comments, check runs, publish review and replies, read outcomes. Implementation: GitHub | `core` |
-| `store` | `Store` interface: append/read run records and outcomes | `core` |
+| `store` | `Store` interface: append/read run records, outcomes and per-PR metrics records; `MetricsSink` for optional export ([O-2](10-metrics.md#o-2--how-the-numbers-are-collected)) | `core` |
 | `pipeline` | The stages in [03](03-review-pipeline.md) | all above |
 | `learn` | Harvest and learning jobs ([04](04-learning-loop.md)) | all above |
 | `eval` | Replay harness and mechanical diff ([05](05-evaluation.md)). No judging | all above |
@@ -102,7 +102,7 @@ branch ([D-7](README.md#key-decisions)).
 | `AGENTS.md` (root) | repo owners | What the project is, conventions, how to verify, what counts as user-facing. Also checked for lines the PR makes stale |
 | `REVIEW.md` (root, optionally per area) | code owners | What failure looks like, focus, don't-flag, needs-human, skip paths, evidence rules, limits, summary format |
 | `.review/<family>-guidelines.md` | vendored from the source-of-truth repo | Rules shared by a family of repositories |
-| `.review/review-bot.yaml` (optional) | repo owners | Bot settings only: role→model map, limits, authorization label. Overrides workflow inputs |
+| `.review/review-bot.yaml` (optional) | repo owners | Bot settings only: role→model map, limits, authorization label, CI wait. Overrides workflow inputs, but can only choose among models the operator's pi configuration provides, and can never add providers, endpoints or packages ([F-7](01-foundation-pi.md#f-7--configuration-follows-pi)) |
 
 - **Per-area `REVIEW.md`:** a `REVIEW.md` in a subdirectory applies to
   changes under it, in addition to the root file.
@@ -129,9 +129,15 @@ review process's shared report envelope (`tool`, `toolVersion`, `repo`,
 
 - Identity: repo, PR number, base SHA, head SHA, run ID, timestamps,
   trigger, scope (full / incremental), round.
+- Waiting: when the head SHA was first seen, when required CI completed
+  ([C-9](06-ci-and-security.md#c-9--waiting-for-ci)), when the review job
+  started. Input to the queue-time metrics ([O-1](10-metrics.md#o-1--what-is-measured)).
+- Wall time per stage, not only per model step.
 - Versions: bot version, pi version, method-skill hash, knowledge base SHA,
   `fingerprintVersion`, role→model mapping as configured **and** the model
-  ID the provider actually served for each step.
+  ID the provider actually served for each step; every pi package loaded
+  from the operator configuration, with its resolved version, and a hash of
+  `models.json` ([F-7](01-foundation-pi.md#f-7--configuration-follows-pi)).
 - Inputs: file list with exclusions and reasons; which knowledge files were
   loaded.
 - Findings, questions and needs-human notes: **all** of them, with final

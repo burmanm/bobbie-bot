@@ -44,6 +44,29 @@ Exit: dry-run output on the PRs already reviewed by hand in
 `review-process/Claude outputs/` is comparable in form, and an owner judges
 it worth piloting.
 
+## R-1a — pi-native configuration
+
+Before R-2 fixes the workflow inputs, so nothing has to be migrated later
+([F-7](01-foundation-pi.md#f-7--configuration-follows-pi)).
+
+- Answer F-7's five verification questions against pi 1.5.2.
+- The runner takes an operator pi agent directory (`settings.json`,
+  `models.json`); role models in pi's `provider/id[:thinking]` syntax;
+  remove the bot's own `thinking`, `providers` and `routing` fields in
+  favour of pi's.
+- Pi packages from `settings.json` `packages` or listed local
+  `node_modules` paths; `review-bot setup` installs them before secrets
+  exist. Loaded packages and versions in the run record.
+- Isolation regression test extended: an operator directory with a
+  package loads that package and nothing from the snapshot; an
+  `AGENTS.md` or `SYSTEM.md` in the operator directory is refused.
+- `.review/review-bot.yaml` limited to choosing among `enabledModels` and
+  lowering limits.
+
+Exit: a provider that pi does not ship (a pi provider package, or a
+`models.json` endpoint) is used for a dry run with no code change, and the
+same agent directory works for `/review` in pi.
+
 ## R-2 — Live on the pilot
 
 - GitHub `Platform`: review, thread replies, check run `ai-review/<name>`.
@@ -55,7 +78,11 @@ it worth piloting.
   isolation regression test and `rg`/`fd` shipped in the action image
   ([C-3a](06-ci-and-security.md#c-3a--pi-session-isolation)) — not
   deferrable.
-- Run record as artifact.
+- Run record as artifact, with CI-wait and queue timestamps
+  ([A-6](02-architecture.md#a-6--run-record)).
+- Waiting for CI, opt-in per repository
+  ([C-9](06-ci-and-security.md#c-9--waiting-for-ci)): gate check of the
+  required checks, `workflow_run` / `status` re-triggers, timeout sweep.
 
 Exit: runs on real cass-operator PRs, non-blocking (RP 5.9); every run
 completes its check and leaves a record.
@@ -69,6 +96,12 @@ completes its check and leaves a record.
   diff. Judging stays outside the bot.
 - Loop A report: `fixed` / `wrong` / `intentional` / `not-worth-it` shares,
   rounds-to-pass.
+- Production metrics ([10-metrics.md](10-metrics.md)): per-PR metrics
+  record written by the harvest job — cost, runs, rounds, findings by tag,
+  rejected inside the bot and by people, human comments, missed findings,
+  and timings (time to first bot review, bot phase, time to human-approval
+  request, human review until merge). Weekly aggregate table in the report
+  issue.
 
 Exit: baseline numbers on the eval set; the acceptance procedure
 ([E-5](05-evaluation.md#e-5--acceptance-procedure)) is usable.
@@ -116,6 +149,11 @@ Exit: at least one class of finding moved from model to CI.
 - Integrations through pi packages / MCP: issue tracker context, chat.
 - Import and diff of independently produced reviews
   ([L-7](04-learning-loop.md#l-7--teaching-and-interviewing-outside-the-bot)).
+- Metrics export to an external backend through `MetricsSink` (OTLP
+  first), from the harvest job only
+  ([O-2](10-metrics.md#o-2--how-the-numbers-are-collected)).
+- ACP agents as a pi provider package, so they too are configured in
+  `settings.json` ([F-7](01-foundation-pi.md#f-7--configuration-follows-pi)).
 
 ## Deferred on purpose
 
@@ -162,4 +200,9 @@ started before R-3 data shows the need ([P-9](README.md#principles)).
 
 ### Open
 
-None.
+| ID | Question | Leaning |
+|---|---|---|
+| Q-17 | When CI fails and the bot's check completes *skipped*, how does the review-process state workflow keep the PR away from people? | Raise in review-process ([I-5](09-process-integration.md#i-5--gaps-this-exposes-in-review-process-to-raise-there)); `ci.onFailure: skip` by default until it is settled |
+| Q-18 | Which event is the "human-approval request" for timings? | First `review/human` label, falling back to the first review request to a person; configurable until review-process defines it ([O-1](10-metrics.md#o-1--what-is-measured)) |
+| Q-19 | Should pure process timings be computed by the harvest job or read from `review-metrics`? | Harvest computes them with `review-metrics`'s definitions; switch to reading them if `review-metrics` publishes per-PR records ([O-3](10-metrics.md#o-3--relation-to-review-metrics)) |
+| Q-20 | Do pi's settings tolerate bot keys, so the bot's settings could live in `settings.json` too? | Keep a separate bot file unless F-7 verification shows a supported place for extension settings |

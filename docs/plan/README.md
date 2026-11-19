@@ -29,6 +29,7 @@ PRs.
 | [07-roadmap.md](07-roadmap.md) | Phases with exit criteria, deferred work, open questions | `R-*`, `Q-*` |
 | [08-research-notes.md](08-research-notes.md) | Digest of the sources this plan draws on, with what is unverified | — |
 | [09-process-integration.md](09-process-integration.md) | What lives in the bot versus the review process; the contract the bot must honour | `I-*` |
+| [10-metrics.md](10-metrics.md) | Production metrics (cost, findings, rounds, human comments, missed findings, timings) and how they are collected | `O-*` |
 | [spike-r0-findings.md](spike-r0-findings.md) | Verified answers to the pi questions, with evidence; proposed `AgentStep` interface | — |
 
 ## Principles
@@ -105,6 +106,9 @@ start.
 | D-13 | The review job writes only a workflow artifact; durable records are written by the scheduled harvest job | [A-7](02-architecture.md#a-7--store) |
 | D-14 | Every run completes its `ai-review/<name>` check run, whatever happens | [S-9](03-review-pipeline.md#s-9--failure-behaviour) |
 | D-15 | Every pi session is created with explicit isolation, and the tool guard confines paths; a regression test guards both | [C-3a](06-ci-and-security.md#c-3a--pi-session-isolation) |
+| D-16 | Optionally, no review until the repository's CI has passed on the head SHA; the check waits as *queued* | [C-9](06-ci-and-security.md#c-9--waiting-for-ci) |
+| D-17 | Metrics are pulled by the harvest job from run records and the GitHub API, stored with the run records, and optionally exported from there; the review job pushes nothing | [O-2](10-metrics.md#o-2--how-the-numbers-are-collected) |
+| D-18 | Configuration follows pi: providers, models and pi packages live in an operator pi agent directory in pi's format; the bot's own file holds only what pi has no concept for | [F-7](01-foundation-pi.md#f-7--configuration-follows-pi) |
 
 ## Glossary
 
