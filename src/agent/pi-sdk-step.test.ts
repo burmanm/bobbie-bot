@@ -239,7 +239,7 @@ describe("configuration errors fail before any model call", () => {
     assert.equal(faux.state.callCount, 0);
   };
 
-  test("unknown model", () => configError({ model: { provider: "openrouter", id: "no/such-model" } }, /unknown model/));
+  test("unknown provider", () => configError({ model: { provider: "no-such-provider", id: "x/y" } }, /unknown provider "no-such-provider"/));
   test("missing read root", () => configError({ roots: { head, base: join(head, "nope") } }, /does not exist/));
   test("routing for a provider other than OpenRouter", async () => {
     const { model } = setup([]);
@@ -295,5 +295,22 @@ describe("inputs root (S-0, S-3)", () => {
     } finally {
       rmSync(inputs, { recursive: true, force: true });
     }
+  });
+});
+
+describe("model ids missing from pi's offline catalog (C-6)", () => {
+  test("are used as custom ids on a known provider, with no borrowed prices", async () => {
+    const { model, step, request } = setup([fauxAssistantMessage(fauxText("DONE"))]);
+    const result = await step.run(request({ model: { provider: model.provider, id: "vendor/new-model:free" } }));
+    assert.equal(result.outcome, "ok", JSON.stringify(result.error));
+    assert.equal(result.uncataloguedModel, true);
+    assert.deepEqual(result.servedModels, ["vendor/new-model:free"]);
+    assert.equal(result.usage.costUsd, 0);
+  });
+
+  test("a catalogued id is not flagged", async () => {
+    const { step, request } = setup([fauxAssistantMessage(fauxText("DONE"))]);
+    const result = await step.run(request());
+    assert.equal(result.uncataloguedModel, undefined);
   });
 });

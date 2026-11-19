@@ -192,7 +192,21 @@ async function runStep<T extends OutputTool>(
     }
     let model = modelRuntime.getModel(request.model.provider, request.model.id);
     if (model === undefined) {
-      throw new ConfigError(`unknown model "${request.model.id}" for provider "${request.model.provider}"`);
+      // C-6: models change faster than pi's offline catalog. Like pi's own CLI
+      // ("Using custom model id"), take the provider's transport settings from
+      // one of its catalogued models and use the requested id. The borrowed
+      // price table is zeroed so no estimate is made from another model's
+      // prices; a provider that bills (OpenRouter) still reports real cost.
+      // A wrong id then fails at the provider, as a provider error.
+      const template = modelRuntime.getModels(request.model.provider)[0];
+      if (template === undefined) throw new ConfigError(`unknown provider "${request.model.provider}"`);
+      model = {
+        ...template,
+        id: request.model.id,
+        name: request.model.id,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      } as typeof template;
+      result.uncataloguedModel = true;
     }
     if (request.model.routing !== undefined) {
       if (request.model.provider !== "openrouter") {

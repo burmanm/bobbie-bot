@@ -33,6 +33,12 @@ export VERIFIER_MODEL=openrouter/<vendor>/<model>
 node src/cli/main.ts review --dry-run --pr k8ssandra/cass-operator#1021 --knowledge-dir ~/projects/git/review-guidelines/pilot/cass-operator --guidelines ~/projects/git/review-guidelines/shared/go-operator-guidelines.md --model reviewer="$REVIEWER_MODEL" --model verifier="$VERIFIER_MODEL" --max-cost 3 --out "$TMPDIR/cass-operator-1021.json"
 ```
 
+Any model id the provider serves works, including ones newer than pi's
+offline catalog (the log then says it was used as a custom id; its context
+window and output limit are borrowed from another model of the provider).
+A mistyped id fails at the provider, and the run completes as *could not
+complete*.
+
 Compare the output with
 `~/projects/git/review-guidelines/Claude outputs/cass-operator-1021-review.json`
 (R-1 exit: comparable in form).

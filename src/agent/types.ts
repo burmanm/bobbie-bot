@@ -138,6 +138,13 @@ export interface AgentStepResult<T extends OutputTool = OutputTool> {
   usage: StepUsage;
   /** `responseModel ?? model` per call, distinct, in first-seen order (A-6, C-6). */
   servedModels: string[];
+  /**
+   * True when the requested model id is not in pi's offline catalog and was
+   * used as a custom id on the provider (C-6). Its context window and output
+   * limit are borrowed from another model of the provider, and cost comes
+   * only from what the provider bills.
+   */
+  uncataloguedModel?: boolean;
   harness: {
     /** `pi-sdk`: our pi session. `acp`: an external agent over ACP; `version` is the agent's. */
     name: "pi-sdk" | "acp";
