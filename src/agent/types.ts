@@ -18,7 +18,10 @@ export type Role = "reviewer" | "verifier" | "learner";
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high";
 
 export interface ModelRef {
-  /** pi provider id, e.g. "openrouter". */
+  /**
+   * pi provider id, e.g. "openrouter"; or "acp" for an external agent over
+   * the Agent Client Protocol, in which case `id` is the agent's name.
+   */
   provider: string;
   /** Model id as the provider names it, e.g. "openai/gpt-5-nano". */
   id: string;
@@ -136,7 +139,8 @@ export interface AgentStepResult<T extends OutputTool = OutputTool> {
   /** `responseModel ?? model` per call, distinct, in first-seen order (A-6, C-6). */
   servedModels: string[];
   harness: {
-    name: "pi-sdk";
+    /** `pi-sdk`: our pi session. `acp`: an external agent over ACP; `version` is the agent's. */
+    name: "pi-sdk" | "acp";
     version: string;
     /** Extensions loaded into the session; only ours (C-3a). */
     extensions: string[];

@@ -44,6 +44,30 @@ describe("configuration (P-4, C-2, A-5)", () => {
     assert.equal(c.skip.draft, false);
   });
 
+  test("a provider list restricts an OpenRouter model to those providers (C-6)", () => {
+    const c = resolveConfig({ models: { reviewer: "openrouter/a/b" }, providers: { reviewer: ["anthropic", " amazon-bedrock ", "anthropic"] } });
+    assert.deepEqual(c.roles.reviewer?.routing, { only: ["anthropic", "amazon-bedrock"], allow_fallbacks: false });
+
+    const y = resolveConfig({}, "roles:\n  verifier:\n    model: openrouter/c/d\n    providers: [google-vertex]\n    routing: { sort: price }\n");
+    assert.deepEqual(y.roles.verifier?.routing, { sort: "price", only: ["google-vertex"], allow_fallbacks: false });
+  });
+
+  test("a provider list or routing needs an OpenRouter model", () => {
+    assert.throws(() => resolveConfig({ models: { reviewer: "acp/claude" }, providers: { reviewer: ["anthropic"] } }), /needs an openrouter model/);
+    assert.throws(() => resolveConfig({ providers: { reviewer: ["anthropic"] } }), /no model is given/);
+    assert.throws(() => resolveConfig({ models: { reviewer: "openrouter/a/b" }, providers: { reviewer: [] } }), /empty/);
+    assert.throws(() => resolveConfig({}, "roles:\n  reviewer:\n    model: acp/claude\n    routing: { sort: price }\n"), /routing preferences need an openrouter model/);
+    assert.throws(
+      () => resolveConfig({}, "roles:\n  reviewer:\n    model: openrouter/a/b\n    providers: [x]\n    routing: { only: [y] }\n"),
+      /either providers or routing.only/,
+    );
+  });
+
+  test("an ACP agent is selected as model acp/<agent>", () => {
+    const c = resolveConfig({ models: { reviewer: "acp/claude-code" } });
+    assert.deepEqual(c.roles.reviewer, { provider: "acp", id: "claude-code" });
+  });
+
   test("invalid YAML or unknown keys are configuration errors", () => {
     assert.throws(() => resolveConfig({}, "roles: [unclosed"), /not valid YAML/);
     assert.throws(() => resolveConfig({}, "focus: everything\n"), /is invalid/);

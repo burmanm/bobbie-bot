@@ -10,6 +10,11 @@ backed by the pi SDK; the guard and tools it loads live in
 | `pi-sdk-step.ts` | The pi SDK implementation: isolation (C-3a), limits (F-3), usage (A-6) |
 | `accounting.ts` | Usage sums and the turn and spend caps, pure |
 | `testing.ts` | Hostile snapshot fixture and scripted-model helpers, tests only |
+| `acp/acp-step.ts` | `AgentStep` over the Agent Client Protocol: the step runs in an external agent |
+| `acp/connection.ts` | Minimal ACP client: JSON-RPC 2.0, one message per line, over the agent's stdio |
+| `acp/outputs.ts` | Output tools described in the prompt; the agent's JSON block checked like tool calls |
+| `acp/fake-agent.ts` | Scripted ACP agent, tests only |
+| `routed-step.ts` | Sends `acp/<agent>` models to the ACP step, everything else to pi |
 | `isolation.test.ts` | The mandatory isolation regression test (C-3a). Run it on every pi upgrade |
 
 ## Changes from the interface proposed in spike-r0-findings.md
@@ -33,7 +38,9 @@ backed by the pi SDK; the guard and tools it loads live in
   implementation with pi's scripted provider, so there is no separate
   scripted step.
 - **`ModelRef.routing`** is accepted only for `openrouter`; for any other
-  provider it is a configuration error rather than silently dropped.
+  provider it is a configuration error rather than silently dropped. The
+  pipeline's `providers` list becomes routing `only` with
+  `allow_fallbacks: false`.
 - **`roots.inputs`** (added for the pipeline): a run-directory folder with
   `context.md` and `patches/` (S-0, S-3). Readable like the other roots, but
   not an evidence root.
@@ -67,3 +74,45 @@ backed by the pi SDK; the guard and tools it loads live in
   (`session.agent.finishTurn`, chained after pi's own), which ends the run
   before the next request. A model that has finished is never cut off by a
   cap. Timeouts and cancellation call `session.abort()`.
+
+## ACP agents
+
+A model `acp/<name>` runs the step in an external agent that speaks the
+[Agent Client Protocol](https://agentclientprotocol.com) (for example an
+ACP adapter for Claude Code, Codex or Gemini CLI). The operator defines the
+agent (`--acp-agent`, `--acp-config`); `.review/review-bot.yaml` can only
+pick one by name, never give a command. One agent process and one ACP
+session per step, started in the head snapshot.
+
+How it differs from the pi step:
+
+- **Isolation is weaker than C-3a.** The agent brings its own system
+  prompt, tools and configuration, which we cannot inspect. The client
+  offers only `fs/read_text_file` (confined to the read roots, same
+  `AllowedRoots` as the pi tools), no terminal and no writes, answers
+  permission requests with allow only for `read`, `search` and `think`
+  tools (paths inside the roots), and starts the agent without
+  `GITHUB_TOKEN`, `GH_TOKEN` and the Actions tokens. Anything the agent does
+  without asking is outside our control: run it only where that is
+  acceptable.
+- **Outputs** are described in the prompt (name, description, JSON
+  Schema); the agent ends with a json block of calls, which are checked
+  against the schema and `validate` like pi tool calls. Rejected calls are
+  sent back for one correction round (`maxCorrections`). A step stopped by a
+  limit has no outputs.
+- **System prompt** goes at the top of the first prompt in
+  `<instructions>`; ACP has no system prompt.
+- **Turns:** each prompt round and each tool call the agent reports counts
+  as one; `maxTurns` cancels the session when exceeded.
+- **Usage:** tokens from the prompt response's `usage` and cost from
+  `usage_update` (USD), only if the agent sends them. Otherwise cost is 0
+  and `usageComplete` is false, so the run spend cap cannot see the step.
+  `costIsBilled` is always false.
+- **servedModels** is the agent's current model id if it reports one
+  (`session/new` → `models`), else `acp/<name>`. `model` in the agent
+  config is selected with `session/set_model`.
+- **Errors:** an agent that cannot start, needs authentication or speaks
+  another protocol version is a `config` error; one that exits or answers
+  with an error is a `provider` error. Timeouts, idle, turns and
+  cancellation send `session/cancel`; an agent that does not answer within
+  the grace period is killed.

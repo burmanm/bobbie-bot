@@ -73,6 +73,8 @@ const RoleYaml = Type.Union([
     {
       model: Type.String({ minLength: 3 }),
       thinking: Type.Optional(Type.Enum(THINKING)),
+      /** OpenRouter only: the upstream providers allowed to serve the model (routing `only`). */
+      providers: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
       routing: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
     },
     { additionalProperties: false },
@@ -117,6 +119,8 @@ export interface ConfigInputs {
   /** role → "provider/id". */
   models?: Partial<Record<PipelineRole, string>>;
   thinking?: Partial<Record<PipelineRole, ThinkingLevel>>;
+  /** role → OpenRouter provider slugs the model may be served by (routing `only`). */
+  providers?: Partial<Record<PipelineRole, string[]>>;
   runCostUsd?: number;
   chunkPatchLines?: number;
   skipDraft?: boolean;
@@ -124,11 +128,29 @@ export interface ConfigInputs {
   limits?: Partial<Record<PipelineRole, Partial<StepLimits>>>;
 }
 
-function roleFromYaml(v: Static<typeof RoleYaml>): ModelRef {
+/** The OpenRouter provider router (C-6) only exists for the openrouter provider. */
+export const OPENROUTER = "openrouter";
+
+/**
+ * Restrict `ref` to the given OpenRouter providers: routing `only`, with
+ * fallbacks to other providers off. Merged into any other routing settings.
+ */
+export function withProviders(ref: ModelRef, providers: readonly string[], where: string): ModelRef {
+  const list = [...new Set(providers.map((p) => p.trim()).filter((p) => p.length > 0))];
+  if (list.length === 0) throw new ConfigError(`${where}: the provider list is empty`);
+  if (ref.provider !== OPENROUTER) {
+    throw new ConfigError(`${where}: a provider list needs an ${OPENROUTER} model, not "${formatModel(ref)}"`);
+  }
+  if (ref.routing?.only !== undefined) throw new ConfigError(`${where}: give either providers or routing.only, not both`);
+  return { ...ref, routing: { ...ref.routing, only: list, allow_fallbacks: false } };
+}
+
+function roleFromYaml(v: Static<typeof RoleYaml>, where: string): ModelRef {
   if (typeof v === "string") return parseModelSpec(v);
-  const ref = parseModelSpec(v.model);
+  let ref = parseModelSpec(v.model);
   if (v.thinking !== undefined) ref.thinkingLevel = v.thinking;
   if (v.routing !== undefined) ref.routing = v.routing;
+  if (v.providers !== undefined) ref = withProviders(ref, v.providers, where);
   return ref;
 }
 
@@ -166,10 +188,17 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
   for (const role of PIPELINE_ROLES) {
     const spec = inputs.models?.[role];
     if (spec !== undefined) {
-      const ref = parseModelSpec(spec);
+      let ref = parseModelSpec(spec);
       const thinking = inputs.thinking?.[role];
       if (thinking !== undefined) ref.thinkingLevel = thinking;
+      const providers = inputs.providers?.[role];
+      if (providers !== undefined) ref = withProviders(ref, providers, `--providers ${role}`);
       config.roles[role] = ref;
+    }
+  }
+  for (const role of PIPELINE_ROLES) {
+    if (inputs.providers?.[role] !== undefined && inputs.models?.[role] === undefined) {
+      throw new ConfigError(`--providers ${role}: no model is given for the ${role} role`);
     }
   }
   for (const role of PIPELINE_ROLES) {
@@ -184,7 +213,7 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
     const y = parseBotConfigYaml(yamlText);
     for (const role of PIPELINE_ROLES) {
       const r = y.roles?.[role];
-      if (r !== undefined) config.roles[role] = roleFromYaml(r);
+      if (r !== undefined) config.roles[role] = roleFromYaml(r, `.review/review-bot.yaml roles.${role}`);
     }
     config.limits.reviewer = limitsFromYaml(config.limits.reviewer, y.limits?.reviewer);
     config.limits.verifier = limitsFromYaml(config.limits.verifier, y.limits?.verifier);
@@ -192,6 +221,12 @@ export function resolveConfig(inputs: ConfigInputs, yamlText?: string): Pipeline
     if (y.limits?.chunkPatchLines !== undefined) config.limits.chunkPatchLines = y.limits.chunkPatchLines;
     if (y.skip?.draft !== undefined) config.skip.draft = y.skip.draft;
     if (y.skip?.labels !== undefined) config.skip.labels = y.skip.labels;
+  }
+  for (const role of PIPELINE_ROLES) {
+    const ref = config.roles[role];
+    if (ref?.routing !== undefined && ref.provider !== OPENROUTER) {
+      throw new ConfigError(`roles.${role}: routing preferences need an ${OPENROUTER} model, not "${formatModel(ref)}"`);
+    }
   }
   return config;
 }
