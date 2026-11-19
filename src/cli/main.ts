@@ -208,7 +208,6 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
     let reader: PrReader;
     let snapshots: SnapshotSource;
     let prRef: { repo: string; number: number } | undefined;
-    let preparedCache: string | undefined;
     if (args.fixture !== undefined) {
       const fixture = new FixturePrReader(resolve(args.fixture));
       reader = fixture;
@@ -220,6 +219,7 @@ export async function main(argv: string[], io: Io = processIo): Promise<number> 
       reader = new GhPrReader(ref.repo, ref.number);
       snapshots = args["repo-dir"] !== undefined ? new GitArchiveSnapshots(resolve(args["repo-dir"])) : new GhTarballSnapshots(ref.repo);
     }
+    let preparedCache: string | undefined;
     if (args["snapshot-dir"] !== undefined) {
       // Trees prepared by the CI prepare job (C-4); only the SHAs in its manifest are handed out.
       if (args["repo-dir"] !== undefined) throw new UsageError("give at most one of --repo-dir and --snapshot-dir");
