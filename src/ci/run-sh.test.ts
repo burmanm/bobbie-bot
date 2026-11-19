@@ -17,7 +17,7 @@ after(() => rmSync(work, { recursive: true, force: true }));
 const FAKE_DOCKER = `#!/usr/bin/env bash
 # Records each call as one line of NUL-free, tab-joined argv.
 (IFS=$'\\t'; echo "$*") >> "$FAKE_LOG"
-[[ "$1" == image ]] && exit 0
+[[ "$1" == image ]] && exit "\${FAKE_IMAGE_MISSING:-0}"
 [[ "$1" == rm ]] && exit 0
 prev=""
 for a in "$@"; do
@@ -52,16 +52,16 @@ function setup() {
   return { dir, bin, log: join(dir, "docker.log") };
 }
 
-function run(s: ReturnType<typeof setup>, env: Record<string, string>): Promise<{ code: number; stderr: string; calls: string[][] }> {
+function run(s: ReturnType<typeof setup>, env: Record<string, string>, mode = "run", actionDir = ACTION): Promise<{ code: number; stderr: string; calls: string[][] }> {
   return new Promise((done) => {
     execFile(
       "bash",
-      [join(ACTION, "run.sh"), "run"],
+      [join(actionDir, "run.sh"), mode],
       {
         env: {
           PATH: `${s.bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
           RUNNER_TEMP: s.dir,
-          GITHUB_ACTION_PATH: ACTION,
+          GITHUB_ACTION_PATH: actionDir,
           GITHUB_EVENT_PATH: join(s.dir, "event.json"),
           GITHUB_OUTPUT: join(s.dir, "output"),
           GITHUB_STEP_SUMMARY: join(s.dir, "summary"),
@@ -172,4 +172,64 @@ test("complete-check and remove-label validate their inputs", async () => {
   assert.deepEqual(ok.calls.at(-1)!.slice(-8), ["complete-check", "--repo", "k8ssandra/cass-operator", "--name", "main", "--head-sha", "a".repeat(40), "--outcome", "cancelled"].slice(-8));
   assert.equal((await run(s, { RB_COMMAND: "remove-label" })).code, 2);
   assert.equal((await run(s, { RB_COMMAND: "nope" })).code, 2);
+});
+
+test("gate: CI-wait inputs become flags; --ignore-ci only on a manual dispatch; bad values refused", async () => {
+  const s = setup();
+  const r = await run(s, { RB_COMMAND: "gate", RB_CI_REQUIRE: "build, lint", RB_CI_ON_FAILURE: "review", RB_CI_TIMEOUT: "3h", RB_IGNORE_CI: "true", GITHUB_EVENT_NAME: "workflow_dispatch" });
+  assert.equal(r.code, 0, r.stderr);
+  const cli = r.calls[0]!.slice(r.calls[0]!.indexOf("review-bot-action:local") + 1);
+  assert.deepEqual(cli.slice(-7), ["--ci-require", "build, lint", "--ci-on-failure", "review", "--ci-timeout", "3h", "--ignore-ci"]);
+  const push = await run(setup(), { RB_COMMAND: "gate", RB_IGNORE_CI: "true", GITHUB_EVENT_NAME: "pull_request_target" });
+  assert.ok(!push.calls[0]!.includes("--ignore-ci"));
+  for (const bad of [{ RB_CI_ON_FAILURE: "maybe" }, { RB_CI_TIMEOUT: "6h; id" }, { RB_CI_REQUIRE: "a\tb" }]) {
+    assert.equal((await run(setup(), { RB_COMMAND: "gate", ...bad })).code, 2, JSON.stringify(bad));
+  }
+});
+
+test("review: the gate's waiting line and no-history are passed on; a multi-line waiting value is refused", async () => {
+  const mk = () => {
+    const s = setup();
+    mkdirSync(join(s.dir, "review-bot", "in"), { recursive: true });
+    writeFileSync(join(s.dir, "review-bot", "in", "snapshot.tar.gz"), "");
+    return s;
+  };
+  const waiting = '{"headSeenAt":"2026-11-20T09:00:00Z","ci":"passed"}';
+  const r = await run(mk(), { RB_COMMAND: "review", RB_PR: "5", RB_WAITING: waiting, RB_NO_HISTORY: "true" });
+  assert.equal(r.code, 0, r.stderr);
+  const review = r.calls.filter((c) => c[0] === "run")[1]!;
+  assert.deepEqual(flagValues(review, "--waiting"), [waiting]);
+  assert.ok(review.includes("--no-history"));
+  assert.equal((await run(mk(), { RB_COMMAND: "review", RB_PR: "5", RB_WAITING: '{"a":\n1}' })).code, 2);
+});
+
+test("image (C-4): a digest in image.lock is pulled, never built; no digest builds; a tag is refused", async () => {
+  const actionDir = (lock: string) => {
+    const d = join(work, `action${n++}`);
+    mkdirSync(d);
+    writeFileSync(join(d, "run.sh"), readFileSync(join(ACTION, "run.sh")));
+    writeFileSync(join(d, "image.lock"), lock);
+    return d;
+  };
+  const ref = `ghcr.io/example/review-bot-action@sha256:${"e".repeat(64)}`;
+  const pulled = await run(setup(), { FAKE_IMAGE_MISSING: "1" }, "build", actionDir(`# comment\n\n${ref}\n`));
+  assert.equal(pulled.code, 0, pulled.stderr);
+  assert.deepEqual(pulled.calls.map((c) => c[0]), ["image", "pull", "tag"]);
+  assert.deepEqual(pulled.calls[1], ["pull", "--quiet", ref]);
+  assert.deepEqual(pulled.calls[2], ["tag", ref, "review-bot-action:local"]);
+
+  const built = await run(setup(), { FAKE_IMAGE_MISSING: "1" }, "build", actionDir("# no image published yet\n"));
+  assert.equal(built.code, 0, built.stderr);
+  assert.deepEqual(built.calls.map((c) => c[0]), ["image", "build"]);
+  // The input wins over the lock: "build", or another digest.
+  const forced = await run(setup(), { FAKE_IMAGE_MISSING: "1", RB_IMAGE: "build" }, "build", actionDir(`${ref}\n`));
+  assert.deepEqual(forced.calls.map((c) => c[0]), ["image", "build"]);
+  for (const bad of ["ghcr.io/example/review-bot-action:latest", `ghcr.io/example/x@sha256:${"e".repeat(63)}`, `${ref};id`]) {
+    const r = await run(setup(), { FAKE_IMAGE_MISSING: "1", RB_IMAGE: bad }, "build", actionDir(""));
+    assert.equal(r.code, 2, bad);
+    assert.ok(!r.calls.some((c) => c[0] === "pull" || c[0] === "build"), bad);
+  }
+  // The repository's own lock names no image or exactly one digest.
+  const lock = readFileSync(join(ACTION, "image.lock"), "utf8").split("\n").filter((l) => l.trim() !== "" && !l.trim().startsWith("#"));
+  assert.ok(lock.length === 0 || (lock.length === 1 && /@sha256:[0-9a-f]{64}$/.test(lock[0]!.trim())), lock.join("|"));
 });

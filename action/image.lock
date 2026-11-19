@@ -1,0 +1,9 @@
+# The prebuilt action image this commit of the action uses (C-4 "The action
+# image"), pinned by digest:
+#
+#   ghcr.io/<owner>/review-bot-action@sha256:<64 hex>
+#
+# Written after .github/workflows/action-image.yml has published an image
+# from this commit's action/Dockerfile; the workflow's summary prints the
+# line. With no reference below, the action builds action/Dockerfile in
+# each job instead (pinned and checksum-verified downloads, but downloads).

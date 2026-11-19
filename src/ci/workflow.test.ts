@@ -32,9 +32,14 @@ interface Job {
   steps: Step[];
 }
 interface Workflow {
-  on: Record<string, { types?: string[]; inputs?: Record<string, { required?: boolean }> }>;
+  on: Record<string, { types?: string[]; workflows?: string[]; inputs?: Record<string, { required?: boolean; type?: string }> } | null | Array<{ cron: string }>> & {
+    pull_request_target: { types: string[] };
+    workflow_dispatch: { inputs: Record<string, { required?: boolean; type?: string }> };
+    workflow_run: { types: string[]; workflows: string[] };
+    schedule: Array<{ cron: string }>;
+  };
   permissions: Record<string, string>;
-  concurrency: { group: string; "cancel-in-progress": boolean };
+  concurrency: { group: string; "cancel-in-progress": boolean | string };
   jobs: Record<string, Job>;
 }
 
@@ -46,25 +51,58 @@ const PINNED = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+(\/[A-Za-z0-9._/-]+)?@[0-9a-f]{40
 
 const allSteps = (): Array<[string, Step]> => Object.entries(wf.jobs).flatMap(([j, job]) => job.steps.map((s) => [j, s] as [string, Step]));
 
-test("triggers: pull_request_target with the C-2 actions, and manual dispatch with a PR number", () => {
-  assert.deepEqual(Object.keys(wf.on).sort(), ["pull_request_target", "workflow_dispatch"]);
-  assert.deepEqual(wf.on.pull_request_target!.types, ["opened", "reopened", "ready_for_review", "synchronize", "labeled"]);
-  assert.equal(wf.on.workflow_dispatch!.inputs?.pr?.required, true);
+test("triggers: pull_request_target with the C-2 actions, manual dispatch with a PR number, C-9 re-triggers", () => {
+  assert.deepEqual(Object.keys(wf.on).sort(), ["pull_request_target", "schedule", "status", "workflow_dispatch", "workflow_run"]);
+  assert.deepEqual(wf.on.pull_request_target.types, ["opened", "reopened", "ready_for_review", "synchronize", "labeled"]);
+  assert.equal(wf.on.workflow_dispatch.inputs.pr?.required, true);
+  assert.equal(wf.on.workflow_dispatch.inputs["ignore-ci"]?.type, "boolean");
+  // C-9: workflow_run on completion, never on this workflow itself (no self-triggering chain).
+  assert.deepEqual(wf.on.workflow_run.types, ["completed"]);
+  assert.ok(wf.on.workflow_run.workflows.includes("!review-bot"));
+  assert.match(wfText, /^name: review-bot$/m);
+  assert.equal(wf.on.status, null);
+  // Every 30 minutes (C-9 sweep).
+  assert.deepEqual(wf.on.schedule.map((s) => s.cron), ["17,47 * * * *"]);
+});
+
+test("C-9: the gate skips pending statuses and CI runs that cannot be a PR head's; resume events need no PR in the payload", () => {
+  const cond = wf.jobs.gate!.if!;
+  assert.match(cond, /github\.event_name == 'status' && github\.event\.state != 'pending'/);
+  assert.match(cond, /"pull_request", "pull_request_target", "push"\]'\), github\.event\.workflow_run\.event/);
+  assert.match(cond, /github\.event_name == 'schedule'/);
+  // Nothing from workflow_run / status payloads but the SHA is used anywhere in the file.
+  for (const m of wfText.matchAll(/github\.event\.(workflow_run|sha|state|context|branches|commit)[\w.]*/g)) {
+    assert.ok(["github.event.workflow_run.head_sha", "github.event.workflow_run.event", "github.event.sha", "github.event.state"].includes(m[0]), m[0]);
+  }
+  const gate = wf.jobs.gate!.steps.find((s) => s.id === "gate")!;
+  for (const k of ["ci-require", "ci-on-failure", "ci-timeout", "ignore-ci"]) assert.ok(gate.with?.[k] !== undefined, k);
+  const review = wf.jobs.review!.steps.find((s) => s.id === "review")!;
+  assert.equal(review.with?.waiting, "${{ needs.gate.outputs.waiting }}");
 });
 
 test("no default token permissions; each job gets exactly its C-4 set", () => {
   assert.deepEqual(wf.permissions, {});
-  assert.deepEqual(wf.jobs.gate!.permissions, { contents: "read", "pull-requests": "read", checks: "write" });
+  assert.deepEqual(wf.jobs.gate!.permissions, { contents: "read", "pull-requests": "read", checks: "write", statuses: "read", actions: "read" });
   assert.deepEqual(wf.jobs["remove-label"]!.permissions, { "pull-requests": "write" });
   assert.deepEqual(wf.jobs.prepare!.permissions, { contents: "read" });
   assert.deepEqual(wf.jobs.review!.permissions, { "pull-requests": "write", checks: "write" });
   assert.deepEqual(Object.keys(wf.jobs).sort(), ["gate", "prepare", "remove-label", "review"]);
 });
 
-test("concurrency per PR with cancel-in-progress (S-9); unrelated label events cancel nothing", () => {
-  assert.equal(wf.concurrency["cancel-in-progress"], true);
+test("concurrency per PR with cancel-in-progress (S-9); unrelated label events cancel nothing; C-9 events queue per SHA", () => {
+  assert.equal(wf.concurrency["cancel-in-progress"], "${{ github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch' }}");
   assert.match(wf.concurrency.group, /github\.event\.pull_request\.number \|\| inputs\.pr/);
   assert.match(wf.concurrency.group, /review-bot-ignored-\{0\}', github\.run_id/);
+  assert.match(wf.concurrency.group, /review-bot-\{0\}-sha-\{1\}'.*github\.event\.workflow_run\.head_sha \|\| github\.event\.sha/s);
+  assert.match(wf.concurrency.group, /review-bot-\{0\}-sweep/);
+});
+
+test("private repositories (C-4): history permissions are opt-in, never granted by default", () => {
+  assert.match(wfText, /^      # contents: read\n      # issues: read$/m);
+  const app = wf.jobs.review!.steps.find((s) => s.uses?.startsWith("actions/create-github-app-token@"))!;
+  assert.equal(app.with?.["permission-contents"], "${{ vars.REVIEW_BOT_HISTORY_READ == 'true' && 'read' || '' }}");
+  assert.equal(app.with?.["permission-issues"], "${{ vars.REVIEW_BOT_HISTORY_READ == 'true' && 'read' || '' }}");
+  assert.equal(wf.jobs.review!.steps.find((s) => s.id === "review")!.with?.["no-history"], "${{ vars.REVIEW_BOT_NO_HISTORY }}");
 });
 
 test("every job and the review step have a time limit; the review step's comes from a variable", () => {

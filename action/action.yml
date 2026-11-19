@@ -3,10 +3,13 @@
 # part. Pin it by full commit SHA. Setup and the security model:
 # docs/installing.md.
 #
-# gate, review, complete-check, remove-label run in a locked-down container
-# built from action/Dockerfile (Node, pinned dependencies, pinned and
-# checksum-verified rg and fd; PI_OFFLINE=1). prepare runs on the runner
-# with Go and never sees a secret.
+# gate, review, complete-check, remove-label run in a locked-down container:
+# the prebuilt image named by digest in action/image.lock (published by
+# .github/workflows/action-image.yml with provenance), so the jobs download
+# nothing but that image (C-4 "The action image"). Without a digest there,
+# or with `image: build`, the image is built from action/Dockerfile (Node,
+# pinned dependencies, pinned and checksum-verified rg, fd and gh;
+# PI_OFFLINE=1). prepare runs on the runner with Go and never sees a secret.
 name: review-bot
 description: Automated pull-request review (gate, prepare, review, complete-check, remove-label)
 author: review-bot
@@ -43,6 +46,34 @@ inputs:
   auth-label-lifetime:
     description: "per-push (removed on the author's next push) or per-pr (kept)"
     default: per-push
+  ci-require:
+    description: >-
+      gate: wait for CI before reviewing (C-9). off; required (the base
+      branch's required status checks minus ai-review/*); or check-run,
+      status-context or workflow names, comma- or newline-separated.
+      ci.require in .review/review-bot.yaml on the base branch overrides it.
+    default: ""
+  ci-on-failure:
+    description: "gate: skip (complete the check as skipped) or review (review anyway and say so) when required CI failed"
+    default: ""
+  ci-timeout:
+    description: "gate: how long a PR waits for CI before its check is completed as skipped, e.g. 6h"
+    default: ""
+  ignore-ci:
+    description: "gate, manual dispatch only: 'true' reviews without waiting for CI"
+    default: ""
+  waiting:
+    description: "review: the gate's waiting output (A-6), recorded in the run record"
+    default: ""
+  no-history:
+    description: "review: 'true' turns off git_log/git_blame/git_show/search_issues (private repositories without contents: read and issues: read, C-4)"
+    default: ""
+  image:
+    description: >-
+      The action image. Empty: the digest in action/image.lock, else built
+      from action/Dockerfile. "build": always build. Otherwise a reference
+      pinned by digest, <registry>/<name>@sha256:<64 hex>.
+    default: ""
   models:
     description: "Role→model map, one per line: reviewer=<provider>/<id>, verifier=<provider>/<id> (C-6). .review/review-bot.yaml on the base branch overrides it."
     default: ""
@@ -110,6 +141,9 @@ outputs:
   label:
     description: "gate: the authorization label in effect (after .review/review-bot.yaml)"
     value: ${{ steps.run.outputs.label }}
+  waiting:
+    description: "gate: one JSON line for the review job's run record (A-6 Waiting), when the decision is review"
+    value: ${{ steps.run.outputs.waiting }}
 
 runs:
   using: composite
@@ -138,9 +172,11 @@ runs:
       run: RB_WORK="${RB_WORK_DIR:-$RUNNER_TEMP/review-bot}" "$GITHUB_ACTION_PATH/prepare.sh"
 
     # ---- everything else: in the action image --------------------------
-    - name: Build the review-bot image
+    - name: Get the review-bot image
       if: inputs.command != 'prepare'
       shell: bash
+      env:
+        RB_IMAGE: ${{ inputs.image }}
       run: '"$GITHUB_ACTION_PATH/run.sh" build'
     - name: Run review-bot ${{ inputs.command }}
       id: run
@@ -162,5 +198,11 @@ runs:
         RB_TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
         RB_PROVIDER_ENV: ${{ inputs.provider-env }}
         RB_OUTCOME: ${{ inputs.outcome }}
+        RB_CI_REQUIRE: ${{ inputs.ci-require }}
+        RB_CI_ON_FAILURE: ${{ inputs.ci-on-failure }}
+        RB_CI_TIMEOUT: ${{ inputs.ci-timeout }}
+        RB_IGNORE_CI: ${{ inputs.ignore-ci }}
+        RB_WAITING: ${{ inputs.waiting }}
+        RB_NO_HISTORY: ${{ inputs.no-history }}
         RB_WORK_DIR: ${{ inputs.work-dir }}
       run: '"$GITHUB_ACTION_PATH/run.sh" run'

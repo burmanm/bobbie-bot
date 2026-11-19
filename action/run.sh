@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Runs one review-bot command in the action image (C-2, C-3, C-3a).
 #
-#   run.sh build    build the image once per job (no secrets involved)
+#   run.sh build    get the image once per job (no secrets involved): pull
+#                   the prebuilt image pinned by digest (C-4 "The action
+#                   image"), or build action/Dockerfile (development)
 #   run.sh run      run $RB_COMMAND in a locked-down container
 #
 # Inputs arrive as environment variables (never interpolated into this
@@ -15,12 +17,31 @@ set -f
 image="review-bot-action:local"
 fail() { echo "::error title=review-bot::$*" >&2; exit 2; }
 
+# A prebuilt image is only ever named by digest: the digest is the content.
+digest_ref='^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)+@sha256:[0-9a-f]{64}$'
+
 if [[ "${1:-}" == build ]]; then
   if docker image inspect "$image" >/dev/null 2>&1; then
-    echo "image $image already built in this job"
+    echo "image $image already present in this job"
     exit 0
   fi
-  docker build --load -t "$image" -f "$GITHUB_ACTION_PATH/Dockerfile" "$GITHUB_ACTION_PATH/.."
+  # RB_IMAGE (the action's `image` input): empty → action/image.lock when it
+  # names a digest, else build; "build" → build from action/Dockerfile; else
+  # a digest-pinned reference.
+  want="${RB_IMAGE:-}"
+  if [[ -z "$want" && -f "$GITHUB_ACTION_PATH/image.lock" ]]; then
+    want="$(grep -Ev '^[[:space:]]*(#|$)' "$GITHUB_ACTION_PATH/image.lock" | head -n 1 | tr -d '[:space:]' || true)"
+  fi
+  if [[ -z "$want" || "$want" == build ]]; then
+    echo "building the action image from action/Dockerfile"
+    docker build --load -t "$image" -f "$GITHUB_ACTION_PATH/Dockerfile" "$GITHUB_ACTION_PATH/.."
+    exit 0
+  fi
+  [[ "$want" =~ $digest_ref ]] || fail "image must be pinned by digest (<registry>/<name>@sha256:<64 hex>) or be \"build\": $want"
+  # Docker checks the content against the digest; nothing else is fetched.
+  docker pull --quiet "$want"
+  docker tag "$want" "$image"
+  echo "using $want"
   exit 0
 fi
 [[ "${1:-}" == run ]] || fail "usage: run.sh build|run"
@@ -70,6 +91,21 @@ case "$cmd" in
       -v "${GITHUB_EVENT_PATH:?}:/github/event.json:ro" -v "$out:/github/out")
     args=(gate --repo "$repo" --name "$name" --label "${RB_AUTH_LABEL:-ai-review/approved}" --lifetime "${RB_AUTH_LIFETIME:-per-push}")
     if [[ -n "${RB_PR:-}" ]]; then need_pr "$RB_PR"; args+=(--pr "$RB_PR"); fi
+    # Waiting for CI (C-9); .review/review-bot.yaml on the base branch overrides these.
+    if [[ -n "${RB_CI_REQUIRE:-}" ]]; then
+      (( ${#RB_CI_REQUIRE} <= 4000 )) || fail "ci-require is too long"
+      [[ "$RB_CI_REQUIRE" != *[$'\x01'-$'\x09'$'\x0b'-$'\x1f'$'\x7f']* ]] || fail "ci-require has control characters"
+      args+=(--ci-require "$RB_CI_REQUIRE")
+    fi
+    if [[ -n "${RB_CI_ON_FAILURE:-}" ]]; then
+      [[ "$RB_CI_ON_FAILURE" =~ ^(skip|review)$ ]] || fail "invalid ci-on-failure: $RB_CI_ON_FAILURE"
+      args+=(--ci-on-failure "$RB_CI_ON_FAILURE")
+    fi
+    if [[ -n "${RB_CI_TIMEOUT:-}" ]]; then
+      [[ "$RB_CI_TIMEOUT" =~ ^[0-9]+(\.[0-9]+)?(s|m|h)?$ ]] || fail "invalid ci-timeout: $RB_CI_TIMEOUT"
+      args+=(--ci-timeout "$RB_CI_TIMEOUT")
+    fi
+    if [[ "${RB_IGNORE_CI:-}" == true && "${GITHUB_EVENT_NAME:-}" == workflow_dispatch ]]; then args+=(--ignore-ci); fi
     docker "${docker_args[@]}" "$image" "${args[@]}"
     # Pass on only well-formed outputs.
     while IFS= read -r line; do
@@ -108,6 +144,14 @@ case "$cmd" in
     role_lines --model '^(reviewer|verifier)=[^[:space:]]+$' "${RB_MODELS:-}"
     role_lines --thinking '^(reviewer|verifier)=(off|minimal|low|medium|high)$' "${RB_THINKING:-}"
     role_lines --providers '^(reviewer|verifier)=[A-Za-z0-9._,-]+$' "${RB_PROVIDERS:-}"
+    # What the gate knew about the wait for CI (A-6, C-9): one JSON line, checked again by the CLI.
+    if [[ -n "${RB_WAITING:-}" ]]; then
+      (( ${#RB_WAITING} <= 16384 )) || fail "waiting is too long"
+      [[ "$RB_WAITING" == "{"*"}" && "$RB_WAITING" != *[$'\x01'-$'\x1f'$'\x7f']* ]] || fail "waiting must be one JSON object on one line"
+      args+=(--waiting "$RB_WAITING")
+    fi
+    # Private repositories without contents: read / issues: read (C-4).
+    if [[ "${RB_NO_HISTORY:-}" == true ]]; then args+=(--no-history); fi
     if [[ -n "${RB_MAX_COST:-}" ]]; then
       [[ "$RB_MAX_COST" =~ ^[0-9]+(\.[0-9]+)?$ ]] || fail "invalid max-cost: $RB_MAX_COST"
       args+=(--max-cost "$RB_MAX_COST")
