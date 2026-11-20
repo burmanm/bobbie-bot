@@ -274,6 +274,11 @@ time, idle and turn limits and the run has a spend cap.
   with the run record (`08-record.json`) and the stage files. It is the only
   thing the review job writes besides the PR (A-7); the harvest job collects
   it later.
+- When the gate completes the check itself (not authorized, CI failed or
+  timed out, superseded by a push, or a review that died long ago), a
+  workflow artifact `review-bot-record-<name>-gate-<run id>-<attempt>` with
+  one run record per check it completed. Its `run.result.skipKind` says
+  which, and it has no model steps.
 
 ## Security
 

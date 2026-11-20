@@ -81,8 +81,12 @@ export const WaitingInput = Type.Object(
   {
     /** When the bot first saw the head SHA (the queued check's start, else the gate's time). */
     headSeenAt: Type.String({ pattern: ISO_TIME }),
-    /** passed / failed: required CI completed; not-required; ignored (dispatch with ignore-ci); unavailable (could not be read). */
-    ci: Type.Enum(["passed", "failed", "not-required", "ignored", "unavailable"] as const),
+    /**
+     * passed / failed: required CI completed; not-required; ignored (dispatch
+     * with ignore-ci); unavailable (could not be read); timed-out: CI did not
+     * report within ci.timeout (only in a gate record, C-9).
+     */
+    ci: Type.Enum(["passed", "failed", "not-required", "ignored", "unavailable", "timed-out"] as const),
     required: Type.Optional(Type.Array(CheckName, { maxItems: 100 })),
     failed: Type.Optional(Type.Array(CheckName, { maxItems: 100 })),
     /** When the last required check completed. */
@@ -95,7 +99,10 @@ export const WaitingInput = Type.Object(
 export type WaitingInput = Static<typeof WaitingInput>;
 
 export const Waiting = Type.Object(
-  { ...WaitingInput.properties, reviewStartedAt: Type.String({ description: "When this review run started (= run.startedAt)" }) },
+  {
+    ...WaitingInput.properties,
+    reviewStartedAt: Type.Optional(Type.String({ description: "When this review run started (= run.startedAt); absent in a gate record, where no review ran" })),
+  },
   { additionalProperties: false },
 );
 export type Waiting = Static<typeof Waiting>;
@@ -166,6 +173,68 @@ export const RunRecord = Type.Object({
   run: RunInfo,
 });
 export type RunRecord = Static<typeof RunRecord>;
+
+/** Which gate decision ended a run without a review (`result.skipKind` of a gate record). */
+export const GATE_END_KINDS = ["not-authorized", "ci-failed", "ci-timeout", "superseded", "stale-in-progress"] as const;
+export type GateEndKind = (typeof GATE_END_KINDS)[number];
+
+export interface GateRecordInput {
+  repo: string;
+  prNumber: number;
+  baseSha: string;
+  headSha: string;
+  runId: string;
+  /** The event that ran the gate: pull_request_target, workflow_run, status, schedule, workflow_dispatch. */
+  trigger: string;
+  startedAt: Date;
+  finishedAt: Date;
+  conclusion: "skipped" | "neutral";
+  /** The check run's title and summary as written. */
+  summary: string;
+  kind: GateEndKind;
+  piVersion: string;
+  botVersion: string;
+  fingerprintVersion: number;
+  waiting?: WaitingInput;
+}
+
+/**
+ * The run record for a check the gate completed itself (R-2 exit: every run
+ * leaves a record). No model step ran and no file was read, so steps, files,
+ * findings and the method hash are empty; the knowledge SHA is the base, which
+ * the gate read `.review/review-bot.yaml` from (A-5).
+ */
+export function gateRunRecord(o: GateRecordInput): RunRecord {
+  const run: RunInfo = {
+    schemaVersion: RUN_RECORD_SCHEMA_VERSION,
+    prNumber: o.prNumber,
+    baseSha: o.baseSha,
+    headSha: o.headSha,
+    runId: o.runId,
+    startedAt: o.startedAt.toISOString(),
+    finishedAt: o.finishedAt.toISOString(),
+    trigger: o.trigger,
+    scope: "full",
+    round: 1,
+    versions: { bot: o.botVersion, pi: o.piVersion, methodSkillHash: "", knowledgeBaseSha: o.baseSha, fingerprintVersion: o.fingerprintVersion, roles: {} },
+    files: [],
+    knowledgeFiles: [],
+    steps: [],
+    result: { checkConclusion: o.conclusion, summary: o.summary, publishedCommentIds: [], skipReason: o.summary, skipKind: o.kind },
+  };
+  if (o.waiting !== undefined) run.waiting = { ...o.waiting };
+  return {
+    tool: RUN_RECORD_TOOL,
+    toolVersion: o.botVersion,
+    repo: o.repo,
+    generatedAt: o.finishedAt.toISOString(),
+    metrics: runMetrics([], [], Math.max(0, o.finishedAt.getTime() - o.startedAt.getTime())),
+    findings: [],
+    questions: [],
+    needsHuman: [],
+    run,
+  };
+}
 
 /** Compute envelope metrics from findings and steps. */
 export function runMetrics(findings: readonly Finding[], steps: readonly StepRecord[], wallMs: number): RunRecord["metrics"] {

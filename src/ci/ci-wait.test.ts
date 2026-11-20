@@ -132,6 +132,7 @@ test("gate: CI failed → skipped 'CI failed: …' (ci.onFailure skip), or revie
   assert.equal(res.checkCompleted, true);
   const [check] = ours(r);
   assert.deepEqual([check?.status, check?.conclusion, check?.output?.title, check?.output?.summary], ["completed", "skipped", "Skipped: CI failed", "CI failed: build."]);
+  assert.deepEqual(res.ended.map((e) => [e.kind, e.pr.headSha, e.waiting?.ci, e.waiting?.failed]), [["ci-failed", SHA_A, "failed", ["build"]]]);
 
   const r2 = repo("ci:\n  require: [build]\n  onFailure: review\n", structuredClone(failing));
   const res2 = await runGate(client(r2).gh, ev("synchronize"), inputs, () => {}, { now });
@@ -140,6 +141,7 @@ test("gate: CI failed → skipped 'CI failed: …' (ci.onFailure skip), or revie
   assert.deepEqual(res2.waiting?.failed, ["build"]);
   assert.match(res2.decision.reason, /reviewed anyway/);
   assert.equal(ours(r2).length, 0);
+  assert.deepEqual(res2.ended, []);
 });
 
 test("gate: `required` = classic protection + rulesets of the base branch, minus ai-review/*", async () => {
@@ -197,7 +199,8 @@ test("gate: a push supersedes the previous head's queued check", async () => {
       { id: 8, name: "ai-review/main", head_sha: SHA_D, status: "in_progress", conclusion: null },
     ],
   });
-  await runGate(client(r).gh, ev("synchronize", { before: SHA_C }), inputs, () => {}, { now });
+  const res = await runGate(client(r).gh, ev("synchronize", { before: SHA_C }), inputs, () => {}, { now });
+  assert.deepEqual(res.ended.map((e) => [e.kind, e.pr.headSha]).slice(0, 1), [["superseded", SHA_C]]);
   const old = ours(r, SHA_C)[0]!;
   assert.deepEqual([old.status, old.conclusion, old.output?.title], ["completed", "skipped", "Superseded by a newer push"]);
   // Only queued checks: a running review is cancelled by the concurrency group and completes its own.
@@ -208,9 +211,10 @@ test("gate: a push supersedes the previous head's queued check", async () => {
 test("gate: an outsider waiting for CI whose authorization is revoked gets the queued check completed", async () => {
   const r = repo("ci:\n  require: [build]\n", { checks: [{ id: 5, name: "ai-review/main", head_sha: SHA_A, status: "queued", conclusion: null, started_at: ago(HOUR) }] });
   r.pulls[7]!.user.login = "outsider";
-  await runGate(client(r).gh, ev("reopened"), inputs, () => {}, { now });
+  const res = await runGate(client(r).gh, ev("reopened"), inputs, () => {}, { now });
   const [check] = ours(r);
   assert.deepEqual([check?.id, check?.status, check?.conclusion], [5, "completed", "skipped"]);
+  assert.deepEqual(res.ended.map((e) => e.kind), ["not-authorized"]);
 });
 
 // ---- re-triggers and the sweep -----------------------------------------------
@@ -315,6 +319,11 @@ test("sweep: times out checks queued longer than ci.timeout, ends dead in-progre
   assert.equal(byId(61).status, "queued");
   assert.deepEqual([byId(62).status, byId(62).conclusion], ["completed", "neutral"]);
   assert.equal(byId(63).status, "queued");
+  // One record per check the sweep completed: #8 timed out, #11 stale.
+  assert.deepEqual(
+    res.ended.map((e) => [e.pr.number, e.kind, e.conclusion, e.waiting?.ci, e.waiting?.resumedBy]),
+    [[8, "ci-timeout", "skipped", "timed-out", "schedule"], [11, "stale-in-progress", "neutral", undefined, undefined]],
+  );
   // The next sweep picks up #12.
   const next = await runGate(client(r).gh, { name: "schedule", sender: "" }, inputs, () => {}, { now });
   assert.equal(next.pr?.number, 12);
@@ -354,6 +363,27 @@ test("CLI gate: --ci-* inputs, the waiting JSON output for the review job, --ign
     assert.equal(lines["head-sha"], SHA_A);
     const waiting = JSON.parse(lines.waiting!) as { ci: string; resumedBy: string; required: string[] };
     assert.deepEqual([waiting.ci, waiting.resumedBy, waiting.required], ["passed", "workflow_run", ["build"]]);
+
+    // A gate that completes checks itself leaves a record for each (R-2 exit, A-6).
+    const { Value } = await import("typebox/value");
+    const { RunRecord } = await import("../core/index.ts");
+    const { readdirSync } = await import("node:fs");
+    const rf = forkRepo();
+    rf.files![`.review/review-bot.yaml@${SHA_B}`] = "ci:\n  require: [build]\n  timeout: 2h\n";
+    rf.checks!.push({ id: 70, name: "ai-review/main", head_sha: SHA_C, status: "queued", conclusion: null, started_at: new Date(Date.now() - 3 * HOUR).toISOString() });
+    const records = join(dir, "records");
+    writeFileSync(eventPath, JSON.stringify({}));
+    const envSweep = { ...env, GITHUB_EVENT_NAME: "schedule", GITHUB_RUN_ID: "42", GITHUB_RUN_ATTEMPT: "1" };
+    assert.equal(await runCi("gate", ["--records-dir", records], io, { env: envSweep, fetch: fakeGithub(rf).fetch }), 0, err.join(""));
+    const files = readdirSync(records);
+    assert.deepEqual(files, [`run-42-1-gate-pr8-${SHA_C.slice(0, 7)}.json`]);
+    const rec = JSON.parse(readFileSync(join(records, files[0]!), "utf8")) as import("../core/index.ts").RunRecord;
+    assert.ok(Value.Check(RunRecord, rec), JSON.stringify([...Value.Errors(RunRecord, rec)].slice(0, 3)));
+    assert.deepEqual(
+      [rec.run.prNumber, rec.run.headSha, rec.run.trigger, rec.run.result.checkConclusion, rec.run.result.skipKind, rec.run.waiting?.ci, rec.run.steps.length],
+      [8, SHA_C, "schedule", "skipped", "ci-timeout", "timed-out", 0],
+    );
+    assert.match(rec.run.result.summary, /^Skipped: CI did not report: CI did not report within 2 h/);
 
     assert.equal(await runCi("gate", ["--ignore-ci"], io, { env, fetch: f.fetch }), 2);
     assert.equal(await runCi("gate", ["--ci-on-failure", "maybe"], io, { env, fetch: f.fetch }), 2);

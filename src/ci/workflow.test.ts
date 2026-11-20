@@ -162,6 +162,13 @@ test("S-8, S-9: the check is completed and the record uploaded on every exit pat
   assert.match(String(record.with?.path), /runs\/\*\/\*\.json$/);
   assert.equal(wf.jobs.review!.if, "${{ !cancelled() && needs.gate.outputs.review == 'true' }}");
   assert.ok(steps.indexOf(complete) > steps.findIndex((s) => s.id === "review"));
+  // A check the gate completes itself leaves a record too (R-2 exit).
+  const gateSteps = wf.jobs.gate!.steps;
+  const gateRecord = gateSteps.find((s) => String(s.with?.name ?? "").startsWith("review-bot-record-"))!;
+  assert.equal(gateRecord.if, "always()");
+  assert.match(String(gateRecord.with?.path), /gate-out\/records\/\*\.json$/);
+  assert.equal(gateRecord.with?.["if-no-files-found"], "ignore");
+  assert.ok(gateSteps.indexOf(gateRecord) > gateSteps.findIndex((s) => s.id === "gate"));
 });
 
 test("the action: composite, setup-go without cache, every with-input declared", () => {

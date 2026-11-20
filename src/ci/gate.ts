@@ -41,6 +41,7 @@ import {
 } from "./ci-wait.ts";
 import { formatDuration } from "../pipeline/index.ts";
 import type { CheckRunOutput, CheckRunSummary, Github, PullSummary } from "./github.ts";
+import type { GateEndKind } from "../core/index.ts";
 
 export const DEFAULT_AUTH_LABEL = "ai-review/approved";
 export const LIFETIMES = ["per-push", "per-pr"] as const;
@@ -222,7 +223,7 @@ export interface WaitingInfo {
   /** When the bot first saw the head SHA: the queued check's start, else this gate. */
   headSeenAt: string;
   /** passed / failed: required CI completed; not-required: no wait configured; ignored: dispatch with ignore-ci; unavailable: could not be read. */
-  ci: "passed" | "failed" | "not-required" | "ignored" | "unavailable";
+  ci: "passed" | "failed" | "not-required" | "ignored" | "unavailable" | "timed-out";
   required?: string[];
   failed?: string[];
   /** When the last required check completed. */
@@ -231,8 +232,22 @@ export interface WaitingInfo {
   resumedBy?: string;
 }
 
+/**
+ * A check the gate completed itself, ending that head's run without a
+ * review. Each becomes a gate run record (R-2 exit: every run leaves a record).
+ */
+export interface GateEnd {
+  pr: Pick<PullSummary, "number" | "headSha" | "baseSha">;
+  kind: GateEndKind;
+  conclusion: "skipped" | "neutral";
+  output: CheckRunOutput;
+  waiting?: WaitingInfo;
+}
+
 export interface GateResult {
   decision: GateDecision;
+  /** Checks this gate run completed, one per head (C-9 resume and sweep can end several). */
+  ended: GateEnd[];
   config: GateConfig;
   /** Absent when a resume event matched no waiting PR. */
   pr?: PullSummary;
@@ -348,7 +363,7 @@ function ciOutcome(review: Extract<GateDecision, { kind: "review" }>, config: Ga
   if (ci.state === "passed") return { decision: { ...review, reason: `${review.reason}; CI passed (${nameList(ci.required)})` }, waiting: info("passed") };
   if (ci.state === "failed") {
     if (config.ci.onFailure === "review") return { decision: { ...review, reason: `${review.reason}; ${ciFailedReason(ci)}, reviewed anyway (ci.onFailure: review)` }, waiting: info("failed") };
-    return { decision: { kind: "skip", title: CI_FAILED_TITLE, reason: ciFailedReason(ci), removeLabel: false } };
+    return { decision: { kind: "skip", title: CI_FAILED_TITLE, reason: ciFailedReason(ci), removeLabel: false }, waiting: info("failed") };
   }
   return { decision: { kind: "wait", reason: `waiting for CI: ${nameList(ci.pending)}` } };
 }
@@ -361,50 +376,59 @@ export async function runGate(gh: Github, event: GateEvent, inputs: GateConfig, 
   const pr = await gh.getPull(event.prNumber);
   const config = await configLoader(gh, inputs, log)(pr);
   const name = checkNameOf(config);
-  await supersede(gh, event, pr, name, log);
+  const ended: GateEnd[] = [];
+  const superseded = await supersede(gh, event, pr, name, log);
+  if (superseded !== undefined) ended.push(superseded);
   const decision = decide(event, config, await authorizationFacts(gh, event, pr, config));
   if (decision.kind === "skip") {
-    await finishCheck(gh, name, pr.headSha, "skipped", { title: decision.title ?? NOT_AUTHORIZED, summary: sentence(decision.reason) }, log);
-    return { decision, config, pr, checkCompleted: true };
+    const output = { title: decision.title ?? NOT_AUTHORIZED, summary: sentence(decision.reason) };
+    await finishCheck(gh, name, pr.headSha, "skipped", output, log);
+    ended.push({ pr, kind: "not-authorized", conclusion: "skipped", output });
+    return { decision, ended, config, pr, checkCompleted: true };
   }
-  if (decision.kind !== "review") return { decision, config, pr, checkCompleted: false };
+  if (decision.kind !== "review") return { decision, ended, config, pr, checkCompleted: false };
 
   const existing = await latestCheck(gh, name, pr.headSha);
   const queued = existing?.status === "queued" ? existing : undefined;
   const headSeenAt = queued?.startedAt ?? now().toISOString();
   if (event.ignoreCi === true && event.name === "workflow_dispatch") {
-    return { decision: { ...decision, reason: `${decision.reason}; CI not waited for (ignore-ci)` }, config, pr, checkCompleted: false, waiting: { headSeenAt, ci: "ignored" } };
+    return { decision: { ...decision, reason: `${decision.reason}; CI not waited for (ignore-ci)` }, ended, config, pr, checkCompleted: false, waiting: { headSeenAt, ci: "ignored" } };
   }
   const ci = config.ci.require === "off" ? undefined : await readCi(gh, pr, config.ci, log);
   const out = ciOutcome(decision, config, ci, headSeenAt);
   if (out.decision.kind === "skip") {
-    await finishCheck(gh, name, pr.headSha, "skipped", { title: out.decision.title ?? CI_FAILED_TITLE, summary: sentence(out.decision.reason) }, log, queued);
-    return { decision: out.decision, config, pr, checkCompleted: true };
+    const output = { title: out.decision.title ?? CI_FAILED_TITLE, summary: sentence(out.decision.reason) };
+    await finishCheck(gh, name, pr.headSha, "skipped", output, log, queued);
+    ended.push({ pr, kind: "ci-failed", conclusion: "skipped", output, ...(out.waiting ? { waiting: out.waiting } : {}) });
+    return { decision: out.decision, ended, config, pr, checkCompleted: true };
   }
   if (out.decision.kind === "wait") {
     const output = waitingOutput(ci!, config, headSeenAt);
     if (queued !== undefined) await gh.updateCheck(queued.id, "queued", output);
     else await gh.createQueuedCheck(name, pr.headSha, output, headSeenAt);
     log(`${name} on ${short(pr.headSha)} queued: ${out.decision.reason} (${describeCiConfig(config.ci)})`);
-    return { decision: out.decision, config, pr, checkCompleted: false };
+    return { decision: out.decision, ended, config, pr, checkCompleted: false };
   }
-  return { decision: out.decision, config, pr, checkCompleted: false, ...(out.waiting ? { waiting: out.waiting } : {}) };
+  return { decision: out.decision, ended, config, pr, checkCompleted: false, ...(out.waiting ? { waiting: out.waiting } : {}) };
 }
 
 /**
  * C-9: a new push while waiting supersedes the old head's queued check. The
  * concurrency group cancels the old gate; this ends the check it left.
  */
-async function supersede(gh: Github, event: GateEvent, pr: PullSummary, name: string, log: (line: string) => void): Promise<void> {
+async function supersede(gh: Github, event: GateEvent, pr: PullSummary, name: string, log: (line: string) => void): Promise<GateEnd | undefined> {
   const before = event.before;
-  if (event.action !== "synchronize" || before === undefined || !/^[0-9a-f]{40}$/.test(before) || before === pr.headSha) return;
+  if (event.action !== "synchronize" || before === undefined || !/^[0-9a-f]{40}$/.test(before) || before === pr.headSha) return undefined;
   const old = await latestCheck(gh, name, before);
-  if (old === undefined || old.status !== "queued") return;
-  await gh.completeCheck(old.id, "skipped", {
+  if (old === undefined || old.status !== "queued") return undefined;
+  const output = {
     title: "Superseded by a newer push",
     summary: `New commits were pushed while this commit waited for CI; ${short(pr.headSha)} is reviewed instead (C-9).`,
-  });
+  };
+  await gh.completeCheck(old.id, "skipped", output);
   log(`${name} on ${short(before)} was queued; completed as skipped (superseded by ${short(pr.headSha)})`);
+  // The old head's base is not known here; the PR's current base is recorded.
+  return { pr: { number: pr.number, headSha: before, baseSha: pr.baseSha }, kind: "superseded", conclusion: "skipped", output };
 }
 
 /**
@@ -432,16 +456,17 @@ export async function runResume(gh: Github, event: GateEvent, inputs: GateConfig
   const sweep = event.name === "schedule";
   const sha = event.headSha;
   if (!sweep && (sha === undefined || !/^[0-9a-f]{40}$/.test(sha))) {
-    return { decision: { kind: "ignore", reason: `${event.name} event without a commit SHA` }, config: inputs, checkCompleted: false };
+    return { decision: { kind: "ignore", reason: `${event.name} event without a commit SHA` }, ended: [], config: inputs, checkCompleted: false };
   }
   const name = checkNameOf(inputs);
   const open = await gh.listOpenPulls();
   const candidates = sweep ? open : open.filter((p) => p.headSha === sha);
   if (candidates.length === 0) {
-    return { decision: { kind: "ignore", reason: sweep ? "no open pull requests" : `no open pull request has head ${short(sha!)}` }, config: inputs, checkCompleted: false };
+    return { decision: { kind: "ignore", reason: sweep ? "no open pull requests" : `no open pull request has head ${short(sha!)}` }, ended: [], config: inputs, checkCompleted: false };
   }
   const loadConfig = configLoader(gh, inputs, log);
   let chosen: GateResult | undefined;
+  const ended: GateEnd[] = [];
   let completed = 0;
   let stillWaiting = 0;
   const resumedBy = sweep ? "schedule" : event.name;
@@ -452,10 +477,12 @@ export async function runResume(gh: Github, event: GateEvent, inputs: GateConfig
       // In progress: a review is running. The sweep ends one that died long ago.
       const since = check.startedAt === undefined ? NaN : Date.parse(check.startedAt);
       if (sweep && since + STALE_IN_PROGRESS_MS < now().getTime()) {
-        await gh.completeCheck(check.id, "neutral", {
+        const output = {
           title: "Could not complete",
           summary: `The review of ${short(pr.headSha)} started at ${check.startedAt} and never completed its check. The PR proceeds to human review (S-9).`,
-        });
+        };
+        await gh.completeCheck(check.id, "neutral", output);
+        ended.push({ pr, kind: "stale-in-progress", conclusion: "neutral", output });
         log(`#${pr.number}: ${name} in progress since ${check.startedAt}; completed as neutral`);
         completed++;
       }
@@ -466,7 +493,9 @@ export async function runResume(gh: Github, event: GateEvent, inputs: GateConfig
     const auth = decide({ ...event, prNumber: pr.number }, config, await authorizationFacts(gh, { ...event, prNumber: pr.number }, pr, config));
     if (auth.kind !== "review") {
       const reason = auth.reason;
-      await finishCheck(gh, name, pr.headSha, "skipped", { title: auth.kind === "skip" ? (auth.title ?? NOT_AUTHORIZED) : NOT_AUTHORIZED, summary: sentence(reason) }, log, check);
+      const output = { title: auth.kind === "skip" ? (auth.title ?? NOT_AUTHORIZED) : NOT_AUTHORIZED, summary: sentence(reason) };
+      await finishCheck(gh, name, pr.headSha, "skipped", output, log, check);
+      ended.push({ pr, kind: "not-authorized", conclusion: "skipped", output });
       log(`#${pr.number}: not authorized any more; completed as skipped`);
       completed++;
       continue;
@@ -474,7 +503,9 @@ export async function runResume(gh: Github, event: GateEvent, inputs: GateConfig
     const ci = config.ci.require === "off" ? undefined : await readCi(gh, pr, config.ci, log);
     const out = ciOutcome(auth, config, ci, seenAt);
     if (out.decision.kind === "skip") {
-      await finishCheck(gh, name, pr.headSha, "skipped", { title: out.decision.title ?? CI_FAILED_TITLE, summary: sentence(out.decision.reason) }, log, check);
+      const output = { title: out.decision.title ?? CI_FAILED_TITLE, summary: sentence(out.decision.reason) };
+      await finishCheck(gh, name, pr.headSha, "skipped", output, log, check);
+      ended.push({ pr, kind: "ci-failed", conclusion: "skipped", output, ...(out.waiting ? { waiting: { ...out.waiting, resumedBy } } : {}) });
       log(`#${pr.number}: ${out.decision.reason}; completed as skipped`);
       completed++;
       continue;
@@ -482,10 +513,12 @@ export async function runResume(gh: Github, event: GateEvent, inputs: GateConfig
     if (out.decision.kind === "wait") {
       const waited = now().getTime() - Date.parse(seenAt);
       if (!(waited < config.ci.timeoutMs)) {
-        await gh.completeCheck(check.id, "skipped", {
+        const output = {
           title: "Skipped: CI did not report",
           summary: `CI did not report within ${formatDuration(config.ci.timeoutMs)}: ${nameList(ci!.pending)} (waiting since ${seenAt}). Push again or dispatch the review to retry (C-9).`,
-        });
+        };
+        await gh.completeCheck(check.id, "skipped", output);
+        ended.push({ pr, kind: "ci-timeout", conclusion: "skipped", output, waiting: { headSeenAt: seenAt, ci: "timed-out", required: ci!.required, resumedBy } });
         log(`#${pr.number}: CI did not report within ${formatDuration(config.ci.timeoutMs)}; completed as skipped`);
         completed++;
       } else {
@@ -500,12 +533,13 @@ export async function runResume(gh: Github, event: GateEvent, inputs: GateConfig
     }
     // Claim it: from here on, other runs see it in progress and leave it alone.
     await gh.updateCheck(check.id, "in_progress", { title: "Review starting", summary: sentence(out.decision.reason) });
-    chosen = { decision: out.decision, config, pr, checkCompleted: false, waiting: { ...out.waiting!, resumedBy } };
+    chosen = { decision: out.decision, ended, config, pr, checkCompleted: false, waiting: { ...out.waiting!, resumedBy } };
   }
   log(`${resumedBy}: ${candidates.length} candidate PR(s); ${completed} check(s) completed, ${stillWaiting} still waiting${chosen?.pr ? `, #${chosen.pr.number} resumed` : ""}`);
   if (chosen !== undefined) return chosen;
   return {
     decision: { kind: "ignore", reason: completed > 0 ? `${completed} waiting check(s) completed; nothing to review` : stillWaiting > 0 ? `${stillWaiting} PR(s) still waiting for CI` : "no PR is waiting for CI" },
+    ended,
     config: inputs,
     checkCompleted: completed > 0,
   };

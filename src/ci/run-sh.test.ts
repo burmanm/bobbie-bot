@@ -96,7 +96,7 @@ test("gate: token passed by name, event read-only, well-formed outputs forwarded
   assert.ok(flagValues(argv, "-e").includes("GH_TOKEN"));
   assert.ok(!argv.join(" ").includes("ghs_secret_github_token"));
   assert.ok(flagValues(argv, "-v").includes(`${join(s.dir, "event.json")}:/github/event.json:ro`));
-  assert.deepEqual(argv.slice(argv.indexOf("review-bot-action:local") + 1), ["gate", "--repo", "k8ssandra/cass-operator", "--name", "main", "--label", "ai-review/approved", "--lifetime", "per-pr"]);
+  assert.deepEqual(argv.slice(argv.indexOf("review-bot-action:local") + 1), ["gate", "--repo", "k8ssandra/cass-operator", "--name", "main", "--label", "ai-review/approved", "--lifetime", "per-pr", "--records-dir", "/github/out/records"]);
   assert.match(readFileSync(join(s.dir, "output"), "utf8"), /^review=true\nhead-sha=a{40}\n$/);
   assert.match(readFileSync(join(s.dir, "summary"), "utf8"), /gate summary/);
 });

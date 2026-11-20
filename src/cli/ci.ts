@@ -11,12 +11,14 @@
  * The GitHub token comes from GH_TOKEN (or GITHUB_TOKEN) and is never
  * printed. Exit codes: 0 done, 1 failed, 2 usage error.
  */
-import { appendFileSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { completeIfUnfinished } from "../ci/check.ts";
 import { CI_ON_FAILURE, type CiOnFailure, DEFAULT_CI_WAIT, parseCiRequire, parseCiTimeout } from "../ci/ci-wait.ts";
-import { DEFAULT_AUTH_LABEL, gateEventFrom, LIFETIMES, type LabelLifetime, runGate } from "../ci/gate.ts";
+import { DEFAULT_AUTH_LABEL, type GateResult, gateEventFrom, type WaitingInfo, LIFETIMES, type LabelLifetime, runGate } from "../ci/gate.ts";
+import { BOT_VERSION, FINGERPRINT_VERSION, gateRunRecord, type RunRecord, type WaitingInput } from "../core/index.ts";
+import { PI_VERSION } from "../agent/index.ts";
 import { Github, type Fetch } from "../ci/github.ts";
 import { unpackSnapshot } from "../ci/snapshot.ts";
 import type { Io } from "./main.ts";
@@ -28,7 +30,7 @@ export const CI_USAGE = `CI commands (used by the action; see docs/installing.md
   review-bot gate [--repo o/r] [--event-name N] [--event-path F] [--pr N]
                   [--name main] [--label ai-review/approved] [--lifetime per-push|per-pr]
                   [--ci-require off|required|NAMES] [--ci-on-failure skip|review]
-                  [--ci-timeout 6h] [--ignore-ci] [--output F]
+                  [--ci-timeout 6h] [--ignore-ci] [--output F] [--records-dir D]
   review-bot complete-check --head-sha SHA [--repo o/r] [--name main] [--outcome O]
   review-bot remove-label --pr N [--repo o/r] [--label L]
   review-bot unpack-snapshot --archive F --dest D [--max-gb N]
@@ -84,6 +86,54 @@ function writeOutputs(file: string | undefined, values: Record<string, string>, 
   else io.stdout(lines + "\n");
 }
 
+/**
+ * One run record per check the gate completed itself (R-2 exit: every run
+ * completes its check and leaves a record; A-6). The review job writes the
+ * record of a run that went on to review.
+ */
+export function gateRecords(result: GateResult, o: { repo: string; trigger: string; env: NodeJS.ProcessEnv; startedAt: Date; finishedAt: Date }): RunRecord[] {
+  const base = o.env.GITHUB_RUN_ID ? `${o.env.GITHUB_RUN_ID}-${o.env.GITHUB_RUN_ATTEMPT ?? "1"}` : `local-${o.startedAt.getTime()}`;
+  return result.ended.map((e) =>
+    gateRunRecord({
+      repo: o.repo,
+      prNumber: e.pr.number,
+      baseSha: e.pr.baseSha,
+      headSha: e.pr.headSha,
+      runId: `${base}-gate-pr${e.pr.number}-${e.pr.headSha.slice(0, 7)}`,
+      trigger: o.trigger,
+      startedAt: o.startedAt,
+      finishedAt: o.finishedAt,
+      conclusion: e.conclusion,
+      summary: `${e.output.title}: ${e.output.summary}`,
+      kind: e.kind,
+      piVersion: PI_VERSION,
+      botVersion: BOT_VERSION,
+      fingerprintVersion: FINGERPRINT_VERSION,
+      ...(e.waiting === undefined ? {} : { waiting: waitingInput(e.waiting) }),
+    }),
+  );
+}
+
+const RESUMED_BY = ["workflow_run", "status", "schedule"] as const;
+
+function waitingInput(w: WaitingInfo): WaitingInput {
+  const { resumedBy, ...rest } = w;
+  const r = RESUMED_BY.find((x) => x === resumedBy);
+  return r === undefined ? rest : { ...rest, resumedBy: r };
+}
+
+/** Recording failures never affect the gate's decision (S-8). */
+function writeGateRecords(dir: string, records: RunRecord[], log: (line: string) => void): void {
+  if (records.length === 0) return;
+  try {
+    mkdirSync(dir, { recursive: true });
+    for (const r of records) writeFileSync(join(dir, `run-${r.run.runId}.json`), JSON.stringify(r, null, 2) + "\n");
+    log(`${records.length} gate run record(s) written to ${dir}`);
+  } catch (e) {
+    log(`gate run records could not be written: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 export async function runCi(command: CiCommand, argv: string[], io: Io, deps: CiDeps = {}): Promise<number> {
   const env = deps.env ?? process.env;
   const log = (line: string) => io.stderr(`[review-bot ${command}] ${line}\n`);
@@ -105,9 +155,11 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
             "ci-timeout": { type: "string" },
             "ignore-ci": { type: "boolean" },
             output: { type: "string" },
+            "records-dir": { type: "string" },
           },
           strict: true,
         }).values;
+        const startedAt = new Date();
         const eventName = a["event-name"] ?? env.GITHUB_EVENT_NAME;
         const eventPath = a["event-path"] ?? env.GITHUB_EVENT_PATH;
         if (!eventName) throw new UsageError("no event: give --event-name or set GITHUB_EVENT_NAME");
@@ -163,6 +215,10 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
         );
         if (env.GITHUB_STEP_SUMMARY) {
           appendFileSync(env.GITHUB_STEP_SUMMARY, `### review-bot gate: ${d.kind}\n\n${d.reason}\n`);
+        }
+        const recordsDir = a["records-dir"] ?? env.RB_RECORDS_DIR;
+        if (recordsDir !== undefined && recordsDir !== "") {
+          writeGateRecords(resolve(recordsDir), gateRecords(result, { repo: gh.repo, trigger: eventName, env, startedAt, finishedAt: new Date() }), log);
         }
         return 0;
       }

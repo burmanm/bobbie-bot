@@ -89,7 +89,10 @@ case "$cmd" in
     docker_args+=(-e GH_TOKEN -e GITHUB_EVENT_NAME
       -e GITHUB_EVENT_PATH=/github/event.json -e GITHUB_OUTPUT=/github/out/output -e GITHUB_STEP_SUMMARY=/github/out/summary.md
       -v "${GITHUB_EVENT_PATH:?}:/github/event.json:ro" -v "$out:/github/out")
-    args=(gate --repo "$repo" --name "$name" --label "${RB_AUTH_LABEL:-ai-review/approved}" --lifetime "${RB_AUTH_LIFETIME:-per-push}")
+    # Run records for checks the gate completes itself (R-2 exit, A-6); the
+    # workflow uploads them like the review job's.
+    mkdir -p "$out/records"
+    args=(gate --repo "$repo" --name "$name" --label "${RB_AUTH_LABEL:-ai-review/approved}" --lifetime "${RB_AUTH_LIFETIME:-per-push}" --records-dir /github/out/records)
     if [[ -n "${RB_PR:-}" ]]; then need_pr "$RB_PR"; args+=(--pr "$RB_PR"); fi
     # Waiting for CI (C-9); .review/review-bot.yaml on the base branch overrides these.
     if [[ -n "${RB_CI_REQUIRE:-}" ]]; then
