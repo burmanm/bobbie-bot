@@ -74,14 +74,20 @@ Variables (repository or organization; all optional except the models):
 | `REVIEW_BOT_GO_MODULES` | `.` | Directories with a `go.mod`, space-separated |
 | `REVIEW_BOT_APP_ID` | — | Set it to use the GitHub App identity |
 | `REVIEW_BOT_RECORD_RETENTION_DAYS` | 90 | Retention of the run-record artifact |
+| `REVIEW_BOT_CI_REQUIRE` | `off` | Wait for CI before reviewing ([below](#waiting-for-ci)): `off`, `required`, or names, comma-separated |
+| `REVIEW_BOT_CI_ON_FAILURE` | `skip` | `skip` or `review` when required CI failed |
+| `REVIEW_BOT_CI_TIMEOUT` | `6h` | How long a PR waits for CI |
+| `REVIEW_BOT_IMAGE` | the digest in `action/image.lock` | The action image ([below](#the-action-image)): `build`, or `<registry>/<name>@sha256:<digest>` |
+| `REVIEW_BOT_NO_HISTORY` | — | `true`: no history or issue tools ([private repositories](#private-repositories)) |
+| `REVIEW_BOT_HISTORY_READ` | — | `true`: the App token of the review job also requests `contents: read` and `issues: read` ([private repositories](#private-repositories)) |
 
 Per-step limits (time, idle time, turns, cost per role), skip rules and
 chunking are set in `.review/review-bot.yaml` (format in
 [running-dry-run.md](running-dry-run.md#configuration)).
 
 **`.review/review-bot.yaml` on the base branch overrides the variables**
-(C-2, A-5): roles, limits, skip rules, and `authorization.label` /
-`authorization.lifetime`. The reviewer name is never read from it. Two
+(C-2, A-5): roles, limits, skip rules, `authorization.label` /
+`authorization.lifetime`, and `ci.require` / `ci.onFailure` / `ci.timeout`. The reviewer name is never read from it. Two
 caveats about the label:
 
 - If the YAML sets `authorization.label`, set `REVIEW_BOT_AUTH_LABEL` to the
@@ -106,8 +112,12 @@ not Bot-authored and it cannot create check runs.
 To use an App:
 
 1. Create a GitHub App with repository permissions **Checks: read and
-   write**, **Pull requests: read and write**, **Contents: read** and
-   **Metadata: read**. No webhook, no other permission.
+   write**, **Pull requests: read and write**, **Contents: read**,
+   **Commit statuses: read**, **Actions: read** and **Metadata: read**. No
+   webhook, no other permission. (The gate requests the two CI reads on
+   every run, for [waiting for CI](#waiting-for-ci); a token request for a
+   permission the App lacks fails.) On a private repository that wants the
+   history tools, also **Issues: read**.
 2. Install it on the repository.
 3. Set the variable `REVIEW_BOT_APP_ID` and the secret
    `REVIEW_BOT_APP_PRIVATE_KEY`.
@@ -149,6 +159,99 @@ The repository setting "Require approval for first-time contributors" does
 not apply to `pull_request_target`; keep it on for your other workflows. For
 this workflow the gate is the control.
 
+## Waiting for CI
+
+Optional, per repository (C-9): the bot does not review a head commit until
+the repository's own CI has passed on it. Set it in
+`.review/review-bot.yaml` on the base branch (or with the `REVIEW_BOT_CI_*`
+variables, which the YAML overrides):
+
+```yaml
+ci:
+  require: required        # off | required | [build, "ci/jenkins", Tests]
+  onFailure: skip          # skip | review
+  timeout: 6h
+```
+
+- `required` means the base branch's required status checks (branch
+  protection and rulesets) minus every `ai-review/*` check. A list may name
+  check runs (job names), commit-status contexts or workflow names.
+- After authorization the gate looks at those checks on the head commit:
+  all passed (`success`, `skipped`, `neutral`) → review; one failed →
+  `skip` completes `ai-review/<name>` as *skipped*, "CI failed: <names>",
+  and `review` reviews anyway and says so in the summary; any pending or not
+  yet reported → `ai-review/<name>` is created **queued**, "Waiting for CI:
+  <names>", and nothing else runs (no prepare, no model).
+- A waiting PR is resumed by `workflow_run` (any workflow but this one
+  completing for a PR head), `status` (CI reporting commit statuses from
+  outside Actions) and a sweep every 30 minutes. They run from the default
+  branch, find the PR by listing open PRs whose head is the commit (fork PRs
+  are not named in these events), check authorization again, and claim the
+  check (set it in progress) before reviewing, so two runs never review the
+  same commit.
+- The sweep completes a check queued longer than `ci.timeout` as *skipped*,
+  "CI did not report within <timeout>" (for example a first-time
+  contributor's CI run awaiting approval), and a check left in progress for
+  4 hours as *neutral*. A new push completes the previous commit's queued
+  check as *skipped*, "Superseded by a newer push". A queued check therefore
+  always ends as *success*, *skipped* or *neutral* (I-2 #1).
+- Dispatching the workflow by hand has an `ignore-ci` box to review without
+  waiting.
+- The run record stores when the head commit was first seen, when CI
+  completed and what resumed the review (`run.waiting`, A-6).
+
+Cost when unused: every CI workflow completion for a PR head or push and
+every non-pending commit status starts a short `review-bot` run whose gate
+finds nothing waiting, and the sweep runs every 30 minutes. A repository
+that never waits for CI can delete the `workflow_run`, `status` and
+`schedule` triggers from its copy of the workflow; a repository that does
+can narrow `workflow_run.workflows` to its CI workflow names (it must never
+match `review-bot` itself).
+
+## Private repositories
+
+The reviewer's history tools (`git_log`, `git_blame`, `git_show`) and issue
+search call the GitHub API with the review job's token (C-4). On a private
+repository that token also needs **`contents: read`** and **`issues:
+read`**. Neither lets the job write anything. Choose one:
+
+- Grant them: in your copy of the workflow, uncomment the two lines under
+  the review job's `permissions:`; with the App identity, also give the App
+  **Contents: read** and **Issues: read** and set the variable
+  `REVIEW_BOT_HISTORY_READ` to `true`, so the review job's token requests
+  them.
+- Or set `REVIEW_BOT_NO_HISTORY` to `true`: the reviewer works without those
+  tools and the summary says issue search was not available.
+
+On a public repository nothing is needed.
+
+## The action image
+
+The `gate`, `review`, `complete-check` and `remove-label` steps run in a
+container. By default it is the **prebuilt image named by digest in
+`action/image.lock`** of the pinned action commit (C-4): the job pulls that
+one image, Docker verifies it against the digest, and nothing else is
+downloaded in the job that holds the model key. While `action/image.lock`
+names no digest, or with `REVIEW_BOT_IMAGE=build`, the image is built in the
+job from `action/Dockerfile` instead (pinned and checksum-verified
+downloads, but downloads). A tag that is not a digest is refused.
+
+Publishing (maintainers of this repository):
+
+1. Run the `action-image` workflow (`.github/workflows/action-image.yml`) on
+   the default branch at the commit to release. It builds amd64 and arm64
+   images without cache, pushes `ghcr.io/<owner>/review-bot-action` with
+   BuildKit provenance and an SBOM, adds a GitHub artifact attestation, and
+   prints the line for `action/image.lock`.
+2. Commit that line to `action/image.lock` and change nothing else the image
+   contains (`src/`, `pi-review/`, `package*.json`, `action/Dockerfile`,
+   `action/tools.json`, `action/install-tools.mjs`): the image *is* the
+   bot's code, so any such change needs a new image.
+3. Make the package public (or readable by the consuming organizations) and
+   pin consumers to that commit.
+4. Anyone can check it: `gh attestation verify
+   oci://ghcr.io/<owner>/review-bot-action@sha256:<digest> --owner <owner>`.
+
 ## Time limits
 
 Each job has `timeout-minutes`. The review step stops the review a minute
@@ -161,7 +264,9 @@ time, idle and turn limits and the run has a spend cap.
 
 - The check run `ai-review/<name>` on the head commit: `success` (reviewed),
   `skipped` (not authorized, draft, opted out, not onboarded, already
-  reviewed) or `neutral` (could not complete; the PR proceeds to humans).
+  reviewed, CI failed, CI did not report, superseded) or `neutral` (could
+  not complete; the PR proceeds to humans). While waiting for CI it is
+  `queued`.
 - One review per run with event `COMMENT` (never an approval), thread
   replies on earlier findings, and resolution of its own verified-fixed
   threads.
@@ -181,10 +286,10 @@ checks out the PR, and nothing from the PR is executed anywhere.
 
 | Job | Secrets | Token permissions | Can | Cannot |
 |---|---|---|---|---|
-| `gate` | none with `GITHUB_TOKEN`; the App private key with the App identity | contents: read, pull-requests: read, checks: write | Read PR metadata, collaborators' permission levels, label events and `.review/review-bot.yaml` at the base SHA; create a *skipped* check | Read any PR file content other than through the API metadata above; post comments; change labels; run anything from the PR |
+| `gate` | none with `GITHUB_TOKEN`; the App private key with the App identity | contents: read, pull-requests: read, checks: write, statuses: read, actions: read | Read PR metadata, collaborators' permission levels, label events, `.review/review-bot.yaml` at the base SHA, and the CI results of the head commit; create a *skipped* or *queued* check, and complete a queued one | Read any PR file content other than through the API metadata above; post comments; change labels; run anything from the PR |
 | `remove-label` | as `gate` | pull-requests: write | Remove the authorization label | Anything else; it runs nothing from the PR |
 | `prepare` | **none**, ever (always `GITHUB_TOKEN`) | contents: read | Download the base and head trees as tarballs; run `go mod download` on a copy of the head's `go.mod` | Write to the PR, the repository, the Actions cache or any secret; build, test or `go generate` |
-| `review` | the model provider key (review step only); the App private key with the App identity | pull-requests: write, checks: write | Post one review, thread replies, resolve its own threads, the check; upload the run record | Push, merge, approve, change labels, read other secrets, write to the repository or storage, run anything from the snapshot |
+| `review` | the model provider key (review step only); the App private key with the App identity | pull-requests: write, checks: write; on private repositories with the history tools also contents: read, issues: read | Post one review, thread replies, resolve its own threads, the check; upload the run record | Push, merge, approve, change labels, read other secrets, write to the repository or storage, run anything from the snapshot |
 
 ### The review job
 
@@ -207,10 +312,11 @@ checks out the PR, and nothing from the PR is executed anywhere.
 - **No downloads at review time.** `rg` and `fd` (pi's search) and `gh` (the
   read-only history tools) are built into the action image from pinned
   release assets verified by SHA-256; `PI_OFFLINE=1` stops pi from fetching
-  binaries or refreshing its model catalog. The image itself is
-  built at the start of each job from the pinned action commit: base image
-  pinned by digest, npm dependencies from the lockfile with
-  `--ignore-scripts`, no `apt-get`.
+  binaries or refreshing its model catalog. The image itself is the
+  prebuilt one pinned by digest in the action commit
+  ([above](#the-action-image)); without one, it is built at the start of
+  each job: base image pinned by digest, npm dependencies from the lockfile
+  with `--ignore-scripts`, no `apt-get`.
 - The PR cannot reconfigure the bot: `REVIEW.md`, `AGENTS.md`, guidelines and
   `.review/review-bot.yaml` are read from the base SHA (D-7).
 - The run is pinned to what the gate authorized: `prepare` fetches the head
@@ -253,9 +359,16 @@ the log and the job summary.
 - With the App identity, `gate` and `remove-label` hold the App private key
   (to mint a scoped token). Neither job runs anything from the PR. With
   `GITHUB_TOKEN` they hold no secret at all.
-- The action image is built in each job from the pinned commit. Its downloads
-  are pinned and verified, but they happen in the job; a prebuilt image
-  pinned by digest would move them out entirely (future work).
+- Until `action/image.lock` names a published digest, the action image is
+  built in each job: its downloads are pinned and verified, but they happen
+  in the job.
+- Waiting for CI trusts check names. A fork PR's own `pull_request`
+  workflow can create a check run with any job name, including a required
+  one, and so make the bot review before the real CI finished (it cannot
+  make the bot do anything else; authorization is checked separately). The
+  expected app of a required check is not compared.
+- When two open PRs share a head commit, a CI result resumes one of them;
+  the other is resumed by the next sweep.
 - Labels other than the authorization label start no job and cancel
   nothing. The authorization label applied to a PR whose author already has
   write access is ignored by the gate, but it shares the PR's concurrency
