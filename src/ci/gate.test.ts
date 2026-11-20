@@ -1,15 +1,16 @@
 /** Authorization rules of the gate job (C-4, Q-10). */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { DEFAULT_CI_WAIT } from "./ci-wait.ts";
 import { decide, type GateConfig, type GateEvent, gateEventFrom, type GateFacts, resolveGateConfig, runGate } from "./gate.ts";
 import { Github, type PullSummary } from "./github.ts";
 import { fakeGithub, type FakeRepo, SHA_A, SHA_B, SHA_C } from "./testing.ts";
 
 const LABEL = "ai-review/approved";
-const config: GateConfig = { name: "main", label: LABEL, lifetime: "per-push" };
+const config: GateConfig = { name: "main", label: LABEL, lifetime: "per-push", ci: DEFAULT_CI_WAIT };
 
 function pr(over: Partial<PullSummary> = {}): PullSummary {
-  return { number: 7, state: "open", draft: false, author: { login: "outsider", type: "User" }, labels: [], headSha: SHA_A, baseSha: SHA_B, ...over };
+  return { number: 7, state: "open", draft: false, author: { login: "outsider", type: "User" }, labels: [], headSha: SHA_A, baseSha: SHA_B, baseRef: "main", ...over };
 }
 
 function ev(action: string, over: Partial<GateEvent> = {}): GateEvent {
@@ -98,7 +99,7 @@ test("the base branch's review-bot.yaml overrides label and lifetime; a broken o
   const warnings: string[] = [];
   const warn = (l: string) => void warnings.push(l);
   assert.deepEqual(resolveGateConfig(config, undefined, warn), config);
-  assert.deepEqual(resolveGateConfig({ ...config, lifetime: "per-pr" }, "authorization:\n  label: bot-ok\n", warn), { name: "main", label: "bot-ok", lifetime: "per-pr" });
+  assert.deepEqual(resolveGateConfig({ ...config, lifetime: "per-pr" }, "authorization:\n  label: bot-ok\n", warn), { name: "main", label: "bot-ok", lifetime: "per-pr", ci: DEFAULT_CI_WAIT });
   assert.deepEqual(resolveGateConfig(config, "authorization:\n  lifetime: per-pr\n", warn), { ...config, lifetime: "per-pr" });
   assert.deepEqual(resolveGateConfig({ ...config, lifetime: "per-pr" }, "authorization: [nope\n", warn), config);
   assert.equal(warnings.length, 1);
@@ -180,7 +181,7 @@ test("runGate: label and lifetime come from .review/review-bot.yaml at the base 
   r.pulls[7]!.labels = ["bot-ok"];
   const gh = fakeGithub(r);
   const res = await runGate(new Github({ token: "t", repo: "o/r", fetch: gh.fetch }), ev("synchronize"), config, () => {});
-  assert.deepEqual(res.config, { name: "main", label: "bot-ok", lifetime: "per-pr" });
+  assert.deepEqual(res.config, { name: "main", label: "bot-ok", lifetime: "per-pr", ci: DEFAULT_CI_WAIT });
   assert.equal(res.decision.kind, "review");
 });
 

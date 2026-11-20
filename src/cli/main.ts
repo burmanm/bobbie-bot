@@ -48,6 +48,8 @@ import {
 } from "../platform/index.ts";
 import { type ConfigInputs, parseDuration, PIPELINE_ROLES, type PipelineRole, runReview } from "../pipeline/index.ts";
 import { GhHistory } from "../platform/history-github.ts";
+import { Value } from "typebox/value";
+import { WaitingInput } from "../core/index.ts";
 import { AtHeadReader } from "../platform/history-head.ts";
 
 const USAGE = `Usage:
@@ -109,6 +111,10 @@ Run:
                            model output or tool activity (default 3m)
                            Durations: 90s, 20m, 1.5h; a bare number is seconds.
                            .review/review-bot.yaml on the base branch overrides
+  --waiting <json>         What the CI gate knew about the wait (C-9), as its
+                           "waiting" output: recorded in the run record
+                           (A-6) and a failed CI reviewed anyway is said in
+                           the summary
   --include-drafts         Review draft PRs too
   --out <file>             Also write the would-be review JSON here
   --quiet                  No progress log on stderr
@@ -116,6 +122,22 @@ Run:
 ${CI_USAGE}`;
 
 class UsageError extends Error {}
+
+/** `--waiting`: the gate's JSON line, checked against the record schema (A-6). */
+export function parseWaiting(text: string): WaitingInput {
+  if (text.length > 16_384) throw new UsageError("--waiting is too long");
+  let data: unknown;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new UsageError("--waiting is not JSON");
+  }
+  if (!Value.Check(WaitingInput, data)) {
+    const first = [...Value.Errors(WaitingInput, data)][0];
+    throw new UsageError(`--waiting is invalid: ${first ? `${first.instancePath || "/"}: ${first.message}` : "schema mismatch"}`);
+  }
+  return data;
+}
 
 function pairs(values: string[] | undefined, what: string): Map<PipelineRole, string> {
   const out = new Map<PipelineRole, string>();
@@ -243,6 +265,7 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
         "runs-dir": { type: "string" },
         "max-cost": { type: "string" },
         "run-timeout": { type: "string" },
+        waiting: { type: "string" },
         "step-timeout": { type: "string", multiple: true },
         "idle-timeout": { type: "string", multiple: true },
         "include-drafts": { type: "boolean" },
@@ -347,6 +370,7 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
     }
     if (args["include-drafts"]) inputs.skipDraft = false;
     applyTimeoutFlags(inputs, args["run-timeout"], args["step-timeout"], args["idle-timeout"]);
+    const waiting = args.waiting === undefined || args.waiting.trim() === "" ? undefined : parseWaiting(args.waiting);
 
     const modcache = args["no-modcache"]
       ? undefined
@@ -399,6 +423,7 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
       runsDir: resolve(args["runs-dir"] ?? join(tmpdir(), "review-bot-runs")),
       trigger: live ? "cli" : replay === undefined ? "cli-dry-run" : "cli-dry-run-replay",
       ...(prRef === undefined ? {} : { prRef }),
+      ...(waiting === undefined ? {} : { waiting }),
       ...(history === undefined || args["no-history"]
         ? {}
         : { history: { source: history, ...(replay === undefined ? {} : { asOf: () => replay.cutoff }) } }),

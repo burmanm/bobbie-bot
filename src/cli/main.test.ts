@@ -122,3 +122,11 @@ test("malformed --acp-agent and --acp-config are usage errors", async () => {
   assert.equal(await main(["review", "--dry-run", "--fixture", FIXTURE, "--acp-config", join(work, "none.json")], missing.io), 2);
   assert.match(missing.out.stderr, /cannot read --acp-config/);
 });
+
+test("--waiting: the gate's JSON line is checked against the record schema (A-6)", async () => {
+  const { parseWaiting } = await import("./main.ts");
+  assert.deepEqual(parseWaiting('{"headSeenAt":"2026-11-20T09:00:00Z","ci":"passed","required":["build"]}'), { headSeenAt: "2026-11-20T09:00:00Z", ci: "passed", required: ["build"] });
+  for (const bad of ["nope", '{"ci":"passed"}', '{"headSeenAt":"yesterday","ci":"passed"}', '{"headSeenAt":"2026-11-20T09:00:00Z","ci":"maybe"}', '{"headSeenAt":"2026-11-20T09:00:00Z","ci":"failed","failed":["a\\nb"]}', '{"headSeenAt":"2026-11-20T09:00:00Z","ci":"passed","extra":1}']) {
+    assert.throws(() => parseWaiting(bad), /--waiting/, bad);
+  }
+});

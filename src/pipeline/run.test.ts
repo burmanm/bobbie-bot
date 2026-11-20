@@ -11,7 +11,7 @@ import { after, describe, test } from "node:test";
 import { Value } from "typebox/value";
 import { fauxAssistantMessage, fauxText, type FauxResponseFactory } from "@earendil-works/pi-ai";
 import { createPiSdkAgentStep, createScriptedProvider, type Script } from "../agent/index.ts";
-import { decodeMarkers, encodeMarker, fingerprintFinding, RunRecord, type ProducerFinding } from "../core/index.ts";
+import { decodeMarkers, encodeMarker, fingerprintFinding, RunRecord, type ProducerFinding, type WaitingInput } from "../core/index.ts";
 import { DryRunPlatform, FixturePrReader, type PrComment, type PrReader } from "../platform/index.ts";
 import { snapshotLookup } from "./lookup.ts";
 import { type ConfigInputs } from "./config.ts";
@@ -50,6 +50,7 @@ interface RunOpts {
   script: Script;
   reader?: (fixture: FixturePrReader) => PrReader;
   inputs?: ConfigInputs;
+  waiting?: WaitingInput;
 }
 
 async function run(o: RunOpts): Promise<{ result: ReviewRunResult; platform: DryRunPlatform; calls: string[]; logs: string[] }> {
@@ -64,6 +65,7 @@ async function run(o: RunOpts): Promise<{ result: ReviewRunResult; platform: Dry
     inputs: o.inputs ?? { models: { reviewer: "scripted/reviewer", verifier: "scripted/verifier" } },
     runsDir: join(work, "runs"),
     log: (l) => logs.push(l),
+    ...(o.waiting === undefined ? {} : { waiting: o.waiting }),
   });
   return { result, platform, calls: scripted.calls, logs };
 }
@@ -205,6 +207,31 @@ describe("skipped repository without REVIEW.md (A-5, S-1)", () => {
     assert.ok(existsSync(join(dir, "head", "REVIEW.md")));
     const { result } = await run({ dir, script: basicScript() });
     assert.equal(result.conclusion, "skipped");
+  });
+});
+
+describe("waiting for CI (A-6 Waiting, C-9)", () => {
+  test("the gate's wait is in the record; a failed CI reviewed anyway is said in the summary", async () => {
+    const waiting: WaitingInput = {
+      headSeenAt: "2026-11-20T09:00:00Z",
+      ci: "failed",
+      required: ["build", "lint"],
+      failed: ["lint"],
+      ciCompletedAt: "2026-11-20T09:40:00Z",
+      resumedBy: "workflow_run",
+    };
+    const { result, platform } = await run({ script: basicScript(), waiting });
+    const record = readRecord(result);
+    assert.deepEqual(record.run.waiting, { ...waiting, reviewStartedAt: record.run.startedAt });
+    assert.match(platform.output.review!.body, /\*\*CI:\*\* CI failed \(lint\); reviewed anyway because the repository sets `ci\.onFailure: review`\./);
+  });
+
+  test("a passed CI adds no summary line; a local run has no waiting block", async () => {
+    const { result, platform } = await run({ script: basicScript(), waiting: { headSeenAt: "2026-11-20T09:00:00.000Z", ci: "passed", required: ["build"] } });
+    assert.equal(readRecord(result).run.waiting?.ci, "passed");
+    assert.doesNotMatch(platform.output.review!.body, /\*\*CI:\*\*/);
+    const local = await run({ script: basicScript() });
+    assert.equal(readRecord(local.result).run.waiting, undefined);
   });
 });
 

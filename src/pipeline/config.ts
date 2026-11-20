@@ -121,6 +121,22 @@ export const BotConfigYaml = Type.Object(
         { additionalProperties: false },
       ),
     ),
+    /**
+     * C-9 waiting for CI, used by the gate job only; accepted and ignored by
+     * the review run. `require`: off, required (the base branch's required
+     * status checks minus ai-review/*), or check-run / status-context /
+     * workflow names. `timeout`: "6h", "90m", or seconds.
+     */
+    ci: Type.Optional(
+      Type.Object(
+        {
+          require: Type.Optional(Type.Union([Type.Enum(["off", "required"] as const), Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { minItems: 1, maxItems: 50 })])),
+          onFailure: Type.Optional(Type.Enum(["skip", "review"] as const)),
+          timeout: Type.Optional(Type.Union([Type.String({ minLength: 1 }), Type.Number({ exclusiveMinimum: 0 })])),
+        },
+        { additionalProperties: false },
+      ),
+    ),
     /** C-4, used by the R-2 gate job; accepted and ignored by the dry run. */
     authorization: Type.Optional(
       Type.Object(

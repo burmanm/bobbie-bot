@@ -68,6 +68,38 @@ export const FileRecord = Type.Object({
 });
 export type FileRecord = Static<typeof FileRecord>;
 
+const ISO_TIME = "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,3})?Z$";
+const CheckName = Type.String({ minLength: 1, maxLength: 200, pattern: "^[^\\u0000-\\u001f\\u007f]+$" });
+
+/**
+ * What the gate knew about the wait before this review (A-6 Waiting, C-9),
+ * as it hands it to the review job. Input to the queue-time metrics (O-1):
+ * head seen → CI completed is the CI wait; CI completed (or head seen) →
+ * `reviewStartedAt` is the rest, runner wait included.
+ */
+export const WaitingInput = Type.Object(
+  {
+    /** When the bot first saw the head SHA (the queued check's start, else the gate's time). */
+    headSeenAt: Type.String({ pattern: ISO_TIME }),
+    /** passed / failed: required CI completed; not-required; ignored (dispatch with ignore-ci); unavailable (could not be read). */
+    ci: Type.Enum(["passed", "failed", "not-required", "ignored", "unavailable"] as const),
+    required: Type.Optional(Type.Array(CheckName, { maxItems: 100 })),
+    failed: Type.Optional(Type.Array(CheckName, { maxItems: 100 })),
+    /** When the last required check completed. */
+    ciCompletedAt: Type.Optional(Type.String({ pattern: ISO_TIME })),
+    /** The event that resumed a waiting review: workflow_run, status, schedule. */
+    resumedBy: Type.Optional(Type.Enum(["workflow_run", "status", "schedule"] as const)),
+  },
+  { additionalProperties: false },
+);
+export type WaitingInput = Static<typeof WaitingInput>;
+
+export const Waiting = Type.Object(
+  { ...WaitingInput.properties, reviewStartedAt: Type.String({ description: "When this review run started (= run.startedAt)" }) },
+  { additionalProperties: false },
+);
+export type Waiting = Static<typeof Waiting>;
+
 export const RunInfo = Type.Object({
   schemaVersion: Type.Literal(RUN_RECORD_SCHEMA_VERSION),
   // Identity
@@ -80,6 +112,8 @@ export const RunInfo = Type.Object({
   trigger: Type.String(),
   scope: Type.Enum(["full", "incremental"] as const),
   round: Type.Integer({ minimum: 1 }),
+  /** A-6 Waiting: absent when the run was not started by the CI gate (local runs). */
+  waiting: Type.Optional(Waiting),
   // Versions
   versions: Type.Object({
     bot: Type.String(),

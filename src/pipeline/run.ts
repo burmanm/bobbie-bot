@@ -46,6 +46,7 @@ import {
   type StepRecord,
   summaryCounts,
   type Verdict,
+  type WaitingInput,
 } from "../core/index.ts";
 import type { EarlierFinding } from "../core/summary.ts";
 import {
@@ -105,6 +106,12 @@ export interface ReviewRunOptions {
    * through the code host's API. Without it the reviewer has neither and
    * the summary says so.
    */
+  /**
+   * What the CI gate knew about the wait (A-6 Waiting, C-9): recorded, and
+   * a failed CI that was reviewed anyway (`ci.onFailure: review`) is said
+   * in the summary.
+   */
+  waiting?: WaitingInput;
   history?: {
     source: HistorySource;
     /** Replay cutoff, read once the PR is known (E-2, `--head`). */
@@ -732,6 +739,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       checked,
       notRun,
       ...(partialText === undefined ? {} : { partial: partialText }),
+      ...(ciNote(o.waiting) === undefined ? {} : { ci: ciNote(o.waiting)! }),
       needsHuman,
       marker: { kind: "summary", bot: botId, run: runId, sha: pr.headSha, fingerprintVersion: FINGERPRINT_VERSION },
     });
@@ -830,6 +838,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
         trigger: o.trigger ?? "dry-run",
         scope,
         round,
+        ...(o.waiting === undefined ? {} : { waiting: { ...o.waiting, reviewStartedAt: startedAt.toISOString() } }),
         versions: {
           bot: BOT_VERSION,
           pi: PI_VERSION,
@@ -845,6 +854,16 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       },
     };
   }
+}
+
+/** C-9: the summary line about CI, when the review did not wait for it to pass. */
+export function ciNote(w: WaitingInput | undefined): string | undefined {
+  if (w === undefined) return undefined;
+  if (w.ci === "failed") {
+    return `CI failed (${(w.failed ?? []).join(", ") || "required checks"}); reviewed anyway because the repository sets \`ci.onFailure: review\`.`;
+  }
+  if (w.ci === "unavailable") return "The required CI checks could not be read, so this review did not wait for them.";
+  return undefined;
 }
 
 function numericId(id: string): number | string {

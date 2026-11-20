@@ -2,7 +2,8 @@
  * CI subcommands of `review-bot` (C-2, C-4, S-9), run by the action in
  * `action/`:
  *
- *   review-bot gate             decide whether this PR event is reviewed
+ *   review-bot gate             decide whether this PR event is reviewed;
+ *                               wait for CI, resume or time out (C-9)
  *   review-bot complete-check   always-run: complete ai-review/<name> if unfinished
  *   review-bot remove-label     remove the authorization label (per-push lifetime)
  *   review-bot unpack-snapshot  extract the prepared snapshot artifact safely
@@ -14,6 +15,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { completeIfUnfinished } from "../ci/check.ts";
+import { CI_ON_FAILURE, type CiOnFailure, DEFAULT_CI_WAIT, parseCiRequire, parseCiTimeout } from "../ci/ci-wait.ts";
 import { DEFAULT_AUTH_LABEL, gateEventFrom, LIFETIMES, type LabelLifetime, runGate } from "../ci/gate.ts";
 import { Github, type Fetch } from "../ci/github.ts";
 import { unpackSnapshot } from "../ci/snapshot.ts";
@@ -25,14 +27,18 @@ export type CiCommand = (typeof CI_COMMANDS)[number];
 export const CI_USAGE = `CI commands (used by the action; see docs/installing.md):
   review-bot gate [--repo o/r] [--event-name N] [--event-path F] [--pr N]
                   [--name main] [--label ai-review/approved] [--lifetime per-push|per-pr]
-                  [--output F]
+                  [--ci-require off|required|NAMES] [--ci-on-failure skip|review]
+                  [--ci-timeout 6h] [--ignore-ci] [--output F]
   review-bot complete-check --head-sha SHA [--repo o/r] [--name main] [--outcome O]
   review-bot remove-label --pr N [--repo o/r] [--label L]
   review-bot unpack-snapshot --archive F --dest D [--max-gb N]
 
 Defaults come from the Actions environment (GITHUB_REPOSITORY,
 GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_OUTPUT, GITHUB_API_URL). The
-token is read from GH_TOKEN or GITHUB_TOKEN.
+token is read from GH_TOKEN or GITHUB_TOKEN. The gate handles
+pull_request_target and workflow_dispatch for one PR, and workflow_run,
+status and schedule to resume or time out PRs waiting for CI (C-9);
+.review/review-bot.yaml on the base branch overrides the --ci-* inputs.
 `;
 
 class UsageError extends Error {}
@@ -94,6 +100,10 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
             name: { type: "string" },
             label: { type: "string" },
             lifetime: { type: "string" },
+            "ci-require": { type: "string" },
+            "ci-on-failure": { type: "string" },
+            "ci-timeout": { type: "string" },
+            "ignore-ci": { type: "boolean" },
             output: { type: "string" },
           },
           strict: true,
@@ -112,23 +122,42 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
         } catch (e) {
           throw new UsageError(e instanceof Error ? e.message : String(e));
         }
+        const ci = { ...DEFAULT_CI_WAIT };
+        try {
+          if (a["ci-require"] !== undefined) ci.require = parseCiRequire(a["ci-require"]);
+          if (a["ci-timeout"] !== undefined && a["ci-timeout"].trim() !== "") ci.timeoutMs = parseCiTimeout(a["ci-timeout"].trim());
+        } catch (e) {
+          throw new UsageError(e instanceof Error ? e.message : String(e));
+        }
+        if (a["ci-on-failure"] !== undefined && a["ci-on-failure"].trim() !== "") {
+          const f = a["ci-on-failure"].trim() as CiOnFailure;
+          if (!CI_ON_FAILURE.includes(f)) throw new UsageError(`--ci-on-failure must be ${CI_ON_FAILURE.join(" or ")}`);
+          ci.onFailure = f;
+        }
+        if (a["ignore-ci"] === true) {
+          if (event.name !== "workflow_dispatch") throw new UsageError("--ignore-ci is for a manual dispatch only");
+          event.ignoreCi = true;
+        }
         const gh = github(env, a.repo, deps.fetch);
-        const result = await runGate(gh, event, { name: checkName(a.name), label, lifetime }, log);
+        const result = await runGate(gh, event, { name: checkName(a.name), label, lifetime, ci }, log);
         const d = result.decision;
-        log(`${d.kind}${d.kind === "review" ? ` (${d.via})` : ""}: ${d.reason}`);
+        log(`${d.kind}${d.kind === "review" ? ` (${d.via})` : ""}${result.pr ? ` #${result.pr.number}` : ""}: ${d.reason}`);
+        const review = d.kind === "review" && result.pr !== undefined;
         writeOutputs(
           a.output ?? env.GITHUB_OUTPUT,
           {
-            review: String(d.kind === "review"),
-            "remove-label": String(d.kind === "skip" && d.removeLabel),
+            review: String(review),
+            "remove-label": String(d.kind === "skip" && d.removeLabel && result.pr !== undefined),
             decision: d.kind,
             reason: d.reason,
             repo: gh.repo,
-            pr: String(result.pr.number),
-            "head-sha": result.pr.headSha,
-            "base-sha": result.pr.baseSha,
+            pr: result.pr ? String(result.pr.number) : "",
+            "head-sha": result.pr?.headSha ?? "",
+            "base-sha": result.pr?.baseSha ?? "",
             name: result.config.name,
             label: result.config.label,
+            // A-6 Waiting, one JSON line for the review job (validated again there).
+            waiting: review && result.waiting ? JSON.stringify(result.waiting) : "",
           },
           io,
         );
