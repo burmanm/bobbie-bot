@@ -208,3 +208,25 @@ test("the image: pinned base by digest, pinned checksummed tools, npm ci --ignor
 test("shell scripts parse", () => {
   for (const f of ["action/prepare.sh", "action/run.sh"]) execFileSync("bash", ["-n", join(ROOT, f)]);
 });
+
+test("the image publish workflow (C-4): manual, default branch only, pinned, provenance and attestation", () => {
+  const text = read(".github/workflows/action-image.yml");
+  const pub = parse(text) as { on: Record<string, unknown>; permissions: Record<string, string>; jobs: Record<string, Job> };
+  assert.deepEqual(Object.keys(pub.on), ["workflow_dispatch"]);
+  assert.deepEqual(pub.permissions, {});
+  const job = pub.jobs.publish!;
+  assert.equal(job.if, "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)");
+  assert.deepEqual(job.permissions, { contents: "read", packages: "write", "id-token": "write", attestations: "write" });
+  for (const s of job.steps) {
+    if (s.uses) assert.match(s.uses, PINNED, s.uses);
+    assert.ok(s.run === undefined || !s.run.includes("${{"), String(s.name));
+  }
+  const build = job.steps.find((s) => s.uses?.startsWith("docker/build-push-action@"))!;
+  assert.equal(build.with?.file, "action/Dockerfile");
+  assert.equal(build.with?.provenance, "mode=max");
+  assert.equal(build.with?.sbom, true);
+  assert.equal(build.with?.["no-cache"], true);
+  const attest = job.steps.find((s) => s.uses?.startsWith("actions/attest-build-provenance@"))!;
+  assert.equal(attest.with?.["subject-digest"], "${{ steps.build.outputs.digest }}");
+  assert.equal(job.steps.find((s) => s.uses?.startsWith("actions/checkout@"))!.with?.["persist-credentials"], false);
+});
