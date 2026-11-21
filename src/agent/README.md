@@ -118,7 +118,14 @@ A model `acp/<name>` runs the step in an external agent that speaks the
 ACP adapter for Claude Code, Codex or Gemini CLI). The operator defines the
 agent (`--acp-agent`, `--acp-config`); `.review/review-bot.yaml` can only
 pick one by name, never give a command. One agent process and one ACP
-session per step, started in the head snapshot.
+session per step, started in a workspace: a fresh directory beside the head
+snapshot with one symlink per read root (`head`, `base`, `modcache`,
+`inputs`), removed after the step. Agents such as bob confine their own
+tools to the working directory and never call `fs/read_text_file`, so the
+roots must be reachable from it. The links resolve to the real roots, so
+path checks are unchanged; relative paths are relative to the workspace.
+The prompt's `<read_roots>` gives the linked paths and says to search
+inside a root, since a search from the workspace may not follow the links.
 
 How it differs from the pi step:
 

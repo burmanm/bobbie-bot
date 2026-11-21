@@ -3,7 +3,7 @@
  * scenario (argv[2]). No model, no network. What it gets back from the
  * client is written as JSON lines to the file in FAKE_ACP_LOG.
  */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readdirSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const scenario = process.argv[2] ?? "outputs";
@@ -29,7 +29,7 @@ let cancelled = false;
 let cancelPrompt: (() => void) | undefined;
 const untilCancelled = () => (cancelled ? Promise.resolve() : new Promise<void>((resolve) => (cancelPrompt = resolve)));
 
-log({ env: { GH_TOKEN: process.env.GH_TOKEN ?? null, FAKE_EXTRA: process.env.FAKE_EXTRA ?? null }, cwd: process.cwd() });
+log({ env: { GH_TOKEN: process.env.GH_TOKEN ?? null, FAKE_EXTRA: process.env.FAKE_EXTRA ?? null }, cwd: process.cwd(), workspace: readdirSync(process.cwd()).sort() });
 
 async function onRequest(method: string, params: Record<string, unknown>): Promise<unknown> {
   switch (method) {
@@ -62,9 +62,10 @@ async function onRequest(method: string, params: Record<string, unknown>): Promi
         update(sessionId, { sessionUpdate: "tool_call", toolCallId: "t1", title: "Run go test", kind: "execute", status: "pending" });
         log({ execute: await call("session/request_permission", permission(sessionId, "t1", "execute")) });
         log({ read: await call("session/request_permission", permission(sessionId, "t2", "read")) });
-        log({ inside: await call("fs/read_text_file", { sessionId, path: "main.go", line: 2, limit: 1 }) });
+        log({ inside: await call("fs/read_text_file", { sessionId, path: "head/main.go", line: 2, limit: 1 }) });
+        log({ base: await call("fs/read_text_file", { sessionId, path: `${process.cwd()}/base/old.go` }) });
         log({ outside: await call("fs/read_text_file", { sessionId, path: "/etc/hosts" }) });
-        log({ write: await call("fs/write_text_file", { sessionId, path: "main.go", content: "x" }) });
+        log({ write: await call("fs/write_text_file", { sessionId, path: "head/main.go", content: "x" }) });
         update(sessionId, { sessionUpdate: "usage_update", used: 100, size: 1000, cost: { amount: 0.01, currency: "USD" } });
         say(sessionId, "Looked around.\n\n```json\n");
         say(sessionId, JSON.stringify({ outputs: [

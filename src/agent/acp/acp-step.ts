@@ -8,7 +8,8 @@
  * - **Isolation is weaker than C-3a.** The agent brings its own tools,
  *   system prompt and configuration. We offer it only `fs/read_text_file`
  *   confined to the read roots, no terminal and no file writes, start it in
- *   the head snapshot, deny every permission request that is not a read,
+ *   a workspace of links to the read roots (`createWorkspace`), deny every
+ *   permission request that is not a read,
  *   search or think, and keep GitHub tokens out of its environment. Tools
  *   the agent runs without asking are outside our control.
  * - **Outputs come back as a JSON block** in the agent's last message, not
@@ -20,7 +21,9 @@
  *   (`usage` on the prompt response, `usage_update` notifications);
  *   otherwise `usageComplete` is false and the cost is 0.
  */
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { canonicalize } from "../../../pi-review/extension/paths.ts";
 import { BOT_VERSION } from "../../core/version.ts";
 import { AllowedRoots, READ_TOOLS } from "../../../pi-review/extension/index.ts";
 import type {
@@ -79,15 +82,41 @@ function agentEnv(extra: Record<string, string> | undefined): NodeJS.ProcessEnv 
   return { ...env, ...extra };
 }
 
-function composePrompt(request: AgentStepRequest<OutputTool>): string {
-  const { head, base, modcache, inputs } = request.roots;
-  const roots = [`head: ${head} (working directory)`];
-  if (base !== undefined) roots.push(`base: ${base}`);
-  if (modcache !== undefined) roots.push(`modcache: ${modcache}`);
-  if (inputs !== undefined) roots.push(`inputs: ${inputs} (review inputs prepared for you, not part of the repository)`);
+/** The read roots in workspace order; the workspace has one link per root, named after it. */
+const ROOT_NAMES = ["head", "base", "modcache", "inputs"] as const;
+type RootName = (typeof ROOT_NAMES)[number];
+
+/**
+ * The agent's working directory: a fresh directory next to the head
+ * snapshot holding one symlink per read root (`head`, `base`, `modcache`,
+ * `inputs`). Agents such as bob confine their own tools to the workspace
+ * and never call `fs/read_text_file`, so roots outside the working
+ * directory would be unreachable. The links resolve to the real roots, so
+ * `AllowedRoots` (canonical paths) checks them as before. It is created
+ * beside head because the pipeline placed head where C-3a holds (no `.git`
+ * or context file above it).
+ */
+function createWorkspace(roots: Partial<Record<RootName, string>>): string {
+  const ws = realpathSync(mkdtempSync(join(dirname(roots.head!), "acp-workspace-")));
+  for (const name of ROOT_NAMES) {
+    const target = roots[name];
+    if (target !== undefined) symlinkSync(target, join(ws, name), "dir");
+  }
+  return ws;
+}
+
+const ROOT_NOTES: Record<RootName, string> = {
+  head: "the PR head; paths in your outputs are relative to it",
+  base: "the base branch",
+  modcache: "dependency source cache",
+  inputs: "review inputs prepared for you, not part of the repository",
+};
+
+function composePrompt(request: AgentStepRequest<OutputTool>, ws: string): string {
+  const roots = ROOT_NAMES.filter((n) => request.roots[n] !== undefined).map((n) => `${n}: ${join(ws, n)} (${ROOT_NOTES[n]})`);
   return [
     `<instructions>\n${request.systemPrompt}\n</instructions>`,
-    `<read_roots>\nRead only inside these directories. Use absolute paths for any root other than head.\n${roots.join("\n")}\n</read_roots>`,
+    `<read_roots>\nYour working directory is ${ws}. It holds one directory per read root, listed below; where the instructions call the PR head your working directory, use ${join(ws, "head")}. Read only inside these directories. Search inside a root directory (for example ${join(ws, "head")}), not the working directory itself: the roots are links that a search from the top may not follow. Evidence and locations still name the root and a path relative to it.\n${roots.join("\n")}\n</read_roots>`,
     `<output_tools>\nReport results only through these output tools.\n\n${describeOutputTools(request.outputTools)}\n\n${OUTPUT_FORMAT}\n</output_tools>`,
     `<task>\n${request.prompt}\n</task>`,
   ].join("\n\n");
@@ -169,7 +198,12 @@ async function runStep<T extends OutputTool>(request: AgentStepRequest<T>, optio
   } catch (e) {
     return fail("config", e instanceof Error ? e.message : String(e));
   }
-  const head = roots.roots[0]!;
+  let ws: string;
+  try {
+    ws = createWorkspace(request.roots);
+  } catch (e) {
+    return fail("config", `cannot create the ACP agent's workspace next to ${request.roots.head}: ${e instanceof Error ? e.message : String(e)}`);
+  }
   const outputTools = new Map<string, OutputTool>(request.outputTools.map((t) => [t.name, t]));
   result.harness.tools = [...outputTools.keys()];
 
@@ -212,6 +246,16 @@ async function runStep<T extends OutputTool>(request: AgentStepRequest<T>, optio
     idleTimer = setTimeout(() => stop("idle"), limits.idleTimeoutMs);
   };
 
+  /**
+   * Relative paths are relative to the workspace, the agent's cwd. The
+   * workspace directory itself only lists the root names, so it is allowed
+   * too (a permission request to list it, say); a file read of it fails.
+   */
+  const checkPath = (raw: unknown) => {
+    if (typeof raw === "string" && canonicalize(resolve(ws, raw)) === ws) return { ok: true as const, path: ws };
+    return roots.check(raw, ws);
+  };
+
   const onRequest = async (method: string, params: unknown): Promise<unknown> => {
     resetIdle();
     const p = (params ?? {}) as Record<string, unknown>;
@@ -220,7 +264,7 @@ async function runStep<T extends OutputTool>(request: AgentStepRequest<T>, optio
         const toolCall = (p.toolCall ?? {}) as { toolCallId?: string; kind?: string; title?: string; locations?: Array<{ path?: unknown }> };
         const opts = (Array.isArray(p.options) ? p.options : []) as Array<{ optionId: string; kind: string }>;
         const kind = toolCall.kind ?? "other";
-        const outsidePath = (toolCall.locations ?? []).map((l) => roots.check(l.path, head)).find((c) => !c.ok);
+        const outsidePath = (toolCall.locations ?? []).map((l) => checkPath(l.path)).find((c) => !c.ok);
         const allowed = ALLOWED_KINDS.has(kind) && outsidePath === undefined;
         const pick = allowed
           ? opts.find((o) => o.kind === "allow_once") ?? opts.find((o) => o.kind === "allow_always")
@@ -232,13 +276,14 @@ async function runStep<T extends OutputTool>(request: AgentStepRequest<T>, optio
         return pick === undefined ? { outcome: { outcome: "cancelled" } } : { outcome: { outcome: "selected", optionId: pick.optionId } };
       }
       case "fs/read_text_file": {
-        const check = roots.check(p.path, head);
+        const check = checkPath(p.path);
         if (!check.ok) {
           guardReject("fs/read_text_file", check.reason);
           throw new RpcError(INVALID_PARAMS, check.reason);
         }
         let text: string;
         try {
+          if (check.path === ws) throw new Error(`${ws} is a directory`);
           text = readFileSync(roots.resolveForAccess(check.path), "utf8");
         } catch (e) {
           throw new RpcError(RESOURCE_NOT_FOUND, e instanceof Error ? e.message : String(e));
@@ -315,7 +360,7 @@ async function runStep<T extends OutputTool>(request: AgentStepRequest<T>, optio
   const setupStopped = new Promise<"stopped">((r) => void stopped.then(() => r("stopped")));
   const duringSetup = <R>(p: Promise<R>): Promise<R | "stopped"> => Promise.race([p, setupStopped]);
   try {
-    conn = new AcpConnection({ command: agent.command, args: agent.args ?? [], cwd: head, env: agentEnv(agent.env), onRequest, onNotification });
+    conn = new AcpConnection({ command: agent.command, args: agent.args ?? [], cwd: ws, env: agentEnv(agent.env), onRequest, onNotification });
 
     const init = await duringSetup(
       conn.request<{ protocolVersion?: number; agentInfo?: { name?: string; version?: string } }>("initialize", {
@@ -332,7 +377,7 @@ async function runStep<T extends OutputTool>(request: AgentStepRequest<T>, optio
     result.harness.extensions = [`acp:${init.agentInfo?.name ?? agentName}`];
 
     const session = await duringSetup(
-      conn.request<{ sessionId: string; models?: { currentModelId?: string } }>("session/new", { cwd: head, mcpServers: [] }),
+      conn.request<{ sessionId: string; models?: { currentModelId?: string } }>("session/new", { cwd: ws, mcpServers: [] }),
     );
     if (session === "stopped") return finishStopped();
     sessionId = session.sessionId;
@@ -345,7 +390,7 @@ async function runStep<T extends OutputTool>(request: AgentStepRequest<T>, optio
     result.servedModels = [modelId ?? `${ACP_PROVIDER}/${agentName}`];
 
     const accepted = (): number => result.outputs.length;
-    let text = composePrompt(request);
+    let text = composePrompt(request, ws);
     for (let correction = 0; ; correction++) {
       roundText = "";
       countTurn();
@@ -423,6 +468,8 @@ async function runStep<T extends OutputTool>(request: AgentStepRequest<T>, optio
     // Complete only when the agent reported tokens for every round and a cost.
     result.usage.usageComplete = settled && stoppedBy === undefined && rounds > 0 && usageRounds === rounds && costReported;
     await conn?.close();
+    // Removes the links only; rm never follows them into the roots.
+    rmSync(ws, { recursive: true, force: true });
   }
   if (stoppedBy !== undefined) return finishStopped();
   return finish();

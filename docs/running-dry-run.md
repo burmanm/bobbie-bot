@@ -243,11 +243,13 @@ spaces, environment variables or a model choice, use `--acp-config`:
 }
 ```
 
-The agent starts in the head snapshot, so use absolute paths for local
-scripts. It needs its own credentials (environment or a prior login);
-review-bot withholds GitHub tokens from it. Its isolation is weaker than the
-pi step's (see `src/agent/README.md`, "ACP agents"), and spend is only
-counted if the agent reports a cost.
+The agent starts in a workspace directory beside the head snapshot that
+holds one link per read root (`head`, `base`, `inputs`, `modcache`), so
+agents that confine their tools to the working directory can read every
+root. Use absolute paths for local scripts. It needs its own credentials
+(environment or a prior login); review-bot withholds GitHub tokens from
+it. Its isolation is weaker than the pi step's (see `src/agent/README.md`,
+"ACP agents"), and spend is only counted if the agent reports a cost.
 
 ## Offline, with the scripted model
 

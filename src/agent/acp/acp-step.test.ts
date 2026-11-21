@@ -5,7 +5,7 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, before, describe, test } from "node:test";
 import { noteTool } from "../testing.ts";
@@ -16,15 +16,19 @@ import { extractCalls } from "./outputs.ts";
 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), "fake-agent.ts");
 let head: string;
+let base: string;
 let work: string;
 
 before(() => {
   head = realpathSync(mkdtempSync(join(tmpdir(), "review-bot-acp-head-")));
   work = realpathSync(mkdtempSync(join(tmpdir(), "review-bot-acp-")));
   writeFileSync(join(head, "main.go"), "package main\nfunc main() {}\n// end\n");
+  base = realpathSync(mkdtempSync(join(tmpdir(), "review-bot-acp-base-")));
+  writeFileSync(join(base, "old.go"), "package old\n");
 });
 after(() => {
   rmSync(head, { recursive: true, force: true });
+  rmSync(base, { recursive: true, force: true });
   rmSync(work, { recursive: true, force: true });
 });
 
@@ -58,7 +62,7 @@ describe("ACP agent step", () => {
     const { step, request, logged } = setup("outputs");
     let result;
     try {
-      result = await step.run(request());
+      result = await step.run(request({ roots: { head, base } }));
     } finally {
       if (prevToken === undefined) delete process.env.GH_TOKEN;
       else process.env.GH_TOKEN = prevToken;
@@ -83,22 +87,32 @@ describe("ACP agent step", () => {
     assert.equal(result.harness.version, "9.9.9");
 
     const log = logged();
-    const first = log.find((e) => e.env) as { env: Record<string, unknown>; cwd: string };
+    const first = log.find((e) => e.env) as { env: Record<string, unknown>; cwd: string; workspace: string[] };
     assert.equal(first.env.GH_TOKEN, null, "GitHub tokens are withheld from the agent");
     assert.equal(first.env.FAKE_EXTRA, "yes");
-    assert.equal(first.cwd, head);
+    // The agent starts in a workspace beside head with one link per root, removed afterwards.
+    const ws = first.cwd;
+    assert.equal(dirname(ws), dirname(head));
+    assert.match(basename(ws), /^acp-workspace-/);
+    assert.deepEqual(first.workspace, ["base", "head"]);
+    assert.equal(existsSync(ws), false, "the workspace is removed after the step");
+    assert.equal(existsSync(join(head, "main.go")), true, "removing the workspace leaves the roots alone");
+    assert.equal(existsSync(join(base, "old.go")), true);
     const init = log.find((e) => e.initialize)!.initialize as { clientCapabilities: unknown };
     assert.deepEqual(init.clientCapabilities, { fs: { readTextFile: true, writeTextFile: false }, terminal: false });
     assert.deepEqual(log.find((e) => e.execute)!.execute, { jsonrpc: "2.0", id: 1000, result: { outcome: { outcome: "selected", optionId: "no" } } });
     assert.deepEqual((log.find((e) => e.read)!.read as { result: unknown }).result, { outcome: { outcome: "selected", optionId: "yes" } });
     assert.deepEqual((log.find((e) => e.inside)!.inside as { result: unknown }).result, { content: "func main() {}" });
+    assert.deepEqual((log.find((e) => e.base)!.base as { result: unknown }).result, { content: "package old\n" });
     assert.match(JSON.stringify(log.find((e) => e.outside)), /outside the allowed read roots/);
     assert.match(JSON.stringify(log.find((e) => e.write)), /-32601/);
     const prompts = log.filter((e) => e.prompt) as Array<{ text: string }>;
     assert.equal(prompts.length, 2);
     assert.match(prompts[0]!.text, /<instructions>\nReview\.\n<\/instructions>/);
     assert.match(prompts[0]!.text, /### report_note/);
-    assert.match(prompts[0]!.text, new RegExp(`head: ${head}`));
+    assert.ok(prompts[0]!.text.includes(`Your working directory is ${ws}.`));
+    assert.ok(prompts[0]!.text.includes(`head: ${join(ws, "head")} (`));
+    assert.ok(prompts[0]!.text.includes(`base: ${join(ws, "base")} (`));
     assert.match(prompts[1]!.text, /1 accepted/);
     assert.match(prompts[1]!.text, /report_note: Validation failed/);
   });
