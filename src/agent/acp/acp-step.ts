@@ -35,7 +35,7 @@ import type {
   ToolOutput,
 } from "../types.ts";
 import { AcpConnection, AgentExitedError, AUTH_REQUIRED, INVALID_PARAMS, METHOD_NOT_FOUND, RESOURCE_NOT_FOUND, RpcError } from "./connection.ts";
-import { checkCall, describeOutputTools, extractCalls, OUTPUT_FORMAT } from "./outputs.ts";
+import { checkCall, describeOutputTools, extractCalls, OUTPUT_FORMAT, OUTPUT_TOOLS_ARE_NOT_TOOLS } from "./outputs.ts";
 import { stopReasonOf } from "../limits.ts";
 
 /** The provider name that selects an ACP agent: model `acp/<agent name>`. */
@@ -117,7 +117,7 @@ function composePrompt(request: AgentStepRequest<OutputTool>, ws: string): strin
   return [
     `<instructions>\n${request.systemPrompt}\n</instructions>`,
     `<read_roots>\nYour working directory is ${ws}. It holds one directory per read root, listed below; where the instructions call the PR head your working directory, use ${join(ws, "head")}. Read only inside these directories. Search inside a root directory (for example ${join(ws, "head")}), not the working directory itself: the roots are links that a search from the top may not follow. Evidence and locations still name the root and a path relative to it.\n${roots.join("\n")}\n</read_roots>`,
-    `<output_tools>\nReport results only through these output tools.\n\n${describeOutputTools(request.outputTools)}\n\n${OUTPUT_FORMAT}\n</output_tools>`,
+    `<output_tools>\nReport results only through these output tools.\n\n${OUTPUT_TOOLS_ARE_NOT_TOOLS}\n\n${describeOutputTools(request.outputTools)}\n\n${OUTPUT_FORMAT}\n</output_tools>`,
     `<task>\n${request.prompt}\n</task>`,
   ].join("\n\n");
 }

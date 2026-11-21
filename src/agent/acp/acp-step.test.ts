@@ -12,7 +12,8 @@ import { noteTool } from "../testing.ts";
 import type { AgentStepRequest } from "../types.ts";
 import { createRoutedAgentStep } from "../routed-step.ts";
 import { createAcpAgentStep } from "./acp-step.ts";
-import { extractCalls } from "./outputs.ts";
+import { Type } from "typebox";
+import { extractCalls, requiredFields } from "./outputs.ts";
 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), "fake-agent.ts");
 let head: string;
@@ -110,6 +111,8 @@ describe("ACP agent step", () => {
     assert.equal(prompts.length, 2);
     assert.match(prompts[0]!.text, /<instructions>\nReview\.\n<\/instructions>/);
     assert.match(prompts[0]!.text, /### report_note/);
+    assert.match(prompts[0]!.text, /they are NOT tools you can call/);
+    assert.ok(prompts[0]!.text.includes("Required: title, severity, line\n"));
     assert.ok(prompts[0]!.text.includes(`Your working directory is ${ws}.`));
     assert.ok(prompts[0]!.text.includes(`head: ${join(ws, "head")} (`));
     assert.ok(prompts[0]!.text.includes(`base: ${join(ws, "base")} (`));
@@ -180,5 +183,22 @@ describe("ACP output block", () => {
     assert.deepEqual(extractCalls('[{"name":"b","arguments":{"x":1}}]'), { calls: [{ tool: "b", arguments: { x: 1 } }] });
     assert.ok("error" in extractCalls("no json here"));
     assert.ok("error" in extractCalls('```json\n{"other": 1}\n```'));
+  });
+
+  test("required fields are listed with nested objects and arrays", () => {
+    const loc = Type.Object({ path: Type.String(), startLine: Type.Integer(), endLine: Type.Integer(), note: Type.Optional(Type.String()) });
+    const schema = Type.Object({
+      title: Type.String(),
+      locations: Type.Array(loc),
+      evidence: Type.Array(Type.Object({ root: Type.String(), at: loc })),
+      meta: Type.Object({ possible: Type.Boolean(), sketch: Type.Optional(Type.String()) }),
+      tags: Type.Array(Type.String()),
+      extra: Type.Optional(Type.String()),
+    });
+    assert.equal(
+      requiredFields(schema),
+      "title, locations[].{path, startLine, endLine}, evidence[].{root, at.{path, startLine, endLine}}, meta.{possible}, tags[]",
+    );
+    assert.equal(requiredFields(Type.Object({ a: Type.Optional(Type.String()) })), "");
   });
 });

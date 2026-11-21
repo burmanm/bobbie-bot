@@ -12,18 +12,48 @@ export interface ParsedCall {
   arguments: unknown;
 }
 
+/**
+ * The shared method speaks of "calling" output tools. Over ACP they are not
+ * in the agent's tool list, and an agent that tries to call one gets its own
+ * "tool does not exist" error (seen with bob), so say so up front.
+ */
+export const OUTPUT_TOOLS_ARE_NOT_TOOLS = `The instructions call these "output tools" and talk about calling them. In this session they are NOT tools you can call: they are not in your tool list, and calling one fails ("tool does not exist"). Use your own tools only to read. To "call" an output tool, add an entry for it to the json block at the end of your answer; that block is the only place outputs are read from. "Stop calling tools" in the instructions means: stop reading and write that block.`;
+
 export const OUTPUT_FORMAT = `When you have finished, end your answer with exactly one fenced \`\`\`json block of this shape, and nothing after it:
 
 \`\`\`json
 {"outputs": [{"tool": "<output tool name>", "arguments": { ... }}]}
 \`\`\`
 
-Each entry is one call of an output tool. Use an empty list if you have nothing to report. Do not write or change any file and do not run commands; read only.`;
+Each entry is one call of an output tool. Use an empty list if you have nothing to report. Every entry is checked against its schema; an entry missing a required field is rejected, so check each against the "Required" line of its tool before you answer. Do not write or change any file and do not run commands; read only.`;
 
-/** The output tool definitions as the agent sees them: name, description, JSON Schema. */
+type Schema = { type?: unknown; properties?: Record<string, Schema>; required?: unknown; items?: Schema };
+
+/**
+ * The required fields of a schema, nested ones included, in a compact form:
+ * `a, b[].{c, d}, e.{f}`. Long minified JSON Schema is easy to skim past;
+ * an agent once left out a nested required `endLine`.
+ */
+export function requiredFields(schema: Schema): string {
+  const req = Array.isArray(schema.required) ? (schema.required as string[]) : [];
+  return req
+    .map((name) => {
+      const prop = schema.properties?.[name];
+      const obj = prop?.type === "array" ? prop.items : prop;
+      const inner = obj?.properties !== undefined ? requiredFields(obj) : "";
+      const suffix = prop?.type === "array" ? "[]" : "";
+      return inner === "" ? `${name}${suffix}` : `${name}${suffix}.{${inner}}`;
+    })
+    .join(", ");
+}
+
+/** The output tool definitions as the agent sees them: name, description, required fields, JSON Schema. */
 export function describeOutputTools(tools: readonly OutputTool[]): string {
   return tools
-    .map((t) => `### ${t.name}\n\n${t.description}\n\nArguments (JSON Schema):\n\n\`\`\`json\n${JSON.stringify(t.parameters)}\n\`\`\``)
+    .map((t) => {
+      const req = requiredFields(t.parameters as Schema);
+      return `### ${t.name}\n\n${t.description}\n\nRequired: ${req === "" ? "(none)" : req}\n\nArguments (JSON Schema):\n\n\`\`\`json\n${JSON.stringify(t.parameters)}\n\`\`\``;
+    })
     .join("\n\n");
 }
 
