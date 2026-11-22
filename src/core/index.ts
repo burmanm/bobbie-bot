@@ -10,6 +10,7 @@ export * from "./review-md.ts";
 export * from "./skip.ts";
 export * from "./fingerprint.ts";
 export * from "./marker.ts";
+export * from "./markdown.ts";
 export * from "./grounding.ts";
 export * from "./reconcile.ts";
 export * from "./summary.ts";

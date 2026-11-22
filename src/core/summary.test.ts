@@ -26,6 +26,7 @@ test("minimal summary starts with the count line and ends with the resolve line 
 
 test("full summary: sections appear in S-7 order", () => {
   const body = renderSummary({
+    repo: "o/r",
     round: { number: 2, headSha: SHA, sinceSha: SINCE },
     counts: { important: 1, nits: 2, preExisting: 1 },
     earlier: {

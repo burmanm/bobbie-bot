@@ -68,6 +68,7 @@ them up, and merging it is the maintainers' decision
 | The model cannot read outside the snapshots | pi does **not** confine its read tools: they accept absolute paths, `..` and `~`. The same guard resolves the path argument of `read`, `grep`, `find` and `ls` (following symlinks), also for calls made by other tools, and rejects anything outside the allowed roots: head, base, module cache, inputs. This is the only barrier between the model and the runner's filesystem |
 | The model cannot exfiltrate | No network tools, no shell. The GitHub token and provider key are in the runner process, and no tool returns them. Codemode's sandbox has no process, file system or network |
 | The PR cannot hide anything from the reviewer | The search tools ignore `.gitignore`, `.ignore` and similar files in the snapshot (pi's own `find` and `grep` honour them, so ours replace or wrap them). What is skipped comes only from `REVIEW.md` on the base branch. A PR's changes to ignore files, and to the knowledge files above, are in the diff and reviewed like any other change |
+| Posted text cannot act | Text from the model or the PR is inert Markdown: nothing in it is fetched, linked to another host, notifies, or is a command line ([S-7](03-review-pipeline.md#s-7--publish)) |
 | Worst case is bounded | A fully subverted reviewer can only emit findings. Those pass mechanical grounding and limits, and are posted as comments by a bot that cannot approve |
 
 Untrusted text sits in clearly delimited sections of `context.md`, with

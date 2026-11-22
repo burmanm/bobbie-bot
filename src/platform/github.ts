@@ -33,6 +33,7 @@ import type {
   ReviewPayload,
   ThreadResolution,
 } from "./types.ts";
+import { codeSpan } from "../core/index.ts";
 
 const DIFF_ACCEPT = "application/vnd.github.v3.diff";
 
@@ -510,7 +511,7 @@ export class GitHubPlatform implements Platform {
 export function foldInlineComments(review: ReviewPayload): ReviewPayload {
   const parts = review.comments.map((c) => {
     const where = c.start_line !== undefined && c.start_line !== c.line ? `${c.path}:${c.start_line}-${c.line}` : `${c.path}:${c.line}`;
-    return `#### \`${where}\`\n\n${stripMarkers(c.body).trim()}`;
+    return `#### ${codeSpan(where)}\n\n${stripMarkers(c.body).trim()}`;
   });
   const lines = review.body.replace(/\s+$/, "").split("\n");
   // Keep the summary marker last.

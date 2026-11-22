@@ -39,6 +39,7 @@ import {
   quoteFound,
   reconcile,
   renderSummary,
+  safeSummary,
   RUN_RECORD_SCHEMA_VERSION,
   RUN_RECORD_TOOL,
   RunRecord,
@@ -278,7 +279,8 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
         headSha: pr?.headSha ?? "",
         conclusion: c,
         title: c === "success" ? "Reviewed" : c === "skipped" ? "Skipped" : "Could not complete",
-        summary,
+        // The record keeps the text as it is; GitHub renders this as Markdown (H-51).
+        summary: safeSummary(summary),
       });
     } catch (e) {
       log(`check completion failed: ${errorMessage(e)}`);
@@ -731,6 +733,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     const partialText = partial.length > 0 ? `${partial.join("; ")}.` : undefined;
     partialNote = partialText;
     const summary = renderSummary({
+      repo: pr.repo,
       round: { number: round, headSha: pr.headSha, ...(sinceSha === undefined ? {} : { sinceSha }) },
       counts: summaryCounts(findings),
       earlier,

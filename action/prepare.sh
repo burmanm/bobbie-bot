@@ -146,9 +146,11 @@ members=(manifest.json base head)
 tar -czf "$work/out/snapshot.tar.gz" -C "$stage" "${members[@]}"
 log "snapshot $(du -h "$work/out/snapshot.tar.gz" | cut -f1) at $work/out/snapshot.tar.gz (module cache: $modcache_status)"
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  # Go's error text comes from the PR: one code span it cannot close (H-51).
+  shown_detail="${modcache_detail//\`/}"
   {
     echo "### review-bot prepare"
     echo
-    echo "Base \`${RB_BASE_SHA:0:7}\`, head \`${RB_HEAD_SHA:0:7}\`. Module cache: **$modcache_status**${modcache_detail:+ ($modcache_detail)}."
+    echo "Base \`${RB_BASE_SHA:0:7}\`, head \`${RB_HEAD_SHA:0:7}\`. Module cache: **$modcache_status**${shown_detail:+ (\`$shown_detail\`)}."
   } >> "$GITHUB_STEP_SUMMARY"
 fi

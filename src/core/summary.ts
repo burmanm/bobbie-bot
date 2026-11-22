@@ -16,11 +16,12 @@
  * The hidden summary marker (last reviewed SHA) follows on its own line; it
  * does not render, so the visible body still ends with the Needs-human line.
  *
- * All free text (from the model or the PR) is passed through
- * neutralizeMarkers, so it cannot forge the bot's state.
+ * All free text (from the model or the PR) is passed through markdown.ts,
+ * so it cannot forge the bot's state or become live Markdown (C-3, H-51).
  */
 import { isLive } from "./grounding.ts";
-import { encodeMarker, neutralizeMarkers, type SummaryMarker } from "./marker.ts";
+import { codeSpan, safeLine, safeText, sameRepoIssueUrl } from "./markdown.ts";
+import { encodeMarker, type SummaryMarker } from "./marker.ts";
 import type { Finding, Location, NeedsHumanNote, Question } from "./schemas.ts";
 
 export interface SummaryCounts {
@@ -44,6 +45,8 @@ export interface PreExistingItem {
 }
 
 export interface SummaryParts {
+  /** owner/name of the reviewed repository: only its issue URLs stay live (H-51). */
+  repo?: string;
   round?: { number: number; headSha: string; sinceSha?: string };
   counts: SummaryCounts;
   earlier?: { stillOpen: EarlierFinding[]; verifiedFixed: EarlierFinding[] };
@@ -85,21 +88,14 @@ export function formatLocation(l: Location): string {
   return l.endLine > l.startLine ? `${l.path}:${l.startLine}-${l.endLine}` : `${l.path}:${l.startLine}`;
 }
 
-/** Untrusted text as one markdown list item body: markers neutralized, continuation lines indented. */
-function text(s: string): string {
-  return neutralizeMarkers(s.trim()).replace(/\r\n?/g, "\n").replace(/\n/g, "\n  ");
+/** Untrusted text inside a list item, continuation lines indented. */
+function item(s: string): string {
+  return safeText(s, { indent: 2, inline: true });
 }
 
-/** Untrusted text on a single line. */
-function oneLine(s: string): string {
-  return neutralizeMarkers(s).replace(/\s+/g, " ").trim();
-}
-
-function code(s: string): string {
-  const clean = oneLine(s);
-  const ticks = clean.includes("`") ? "``" : "`";
-  const pad = clean.startsWith("`") || clean.endsWith("`") ? " " : "";
-  return `${ticks}${pad}${clean}${pad}${ticks}`;
+/** Untrusted text after a bold label. */
+function labelled(s: string): string {
+  return safeText(s, { inline: true });
 }
 
 const short = (sha: string) => sha.slice(0, 7);
@@ -112,17 +108,22 @@ export function countLine(c: SummaryCounts, stillOpen = 0): string {
 }
 
 export function needsHumanLine(n: NeedsHumanNote): string {
-  const where = n.locations.map(formatLocation).join(", ");
-  return `Needs human: ${oneLine(n.what)} in ${where}. Explained in the description: ${n.explainedInDescription ? "yes" : "no"}.`;
+  const where = safeLine(n.locations.map(formatLocation).join(", "));
+  return `Needs human: ${safeLine(n.what)} in ${where}. Explained in the description: ${n.explainedInDescription ? "yes" : "no"}.`;
 }
 
-function preExistingLine(p: PreExistingItem): string {
-  const where = p.location ? ` (${code(formatLocation(p.location))})` : "";
+function preExistingLine(p: PreExistingItem, repo: string | undefined): string {
+  const where = p.location ? ` (${codeSpan(formatLocation(p.location))})` : "";
   let issue: string;
   if (p.proposedIssue === undefined) issue = "No `tech-debt` issue proposed.";
-  else if (/^https?:\/\/\S+$/.test(p.proposedIssue.trim())) issue = `Existing issue: ${oneLine(p.proposedIssue)}`;
-  else issue = `Proposed \`tech-debt\` issue: *${oneLine(p.proposedIssue).replace(/\*/g, "\\*")}*`;
-  return `- ${text(p.title)}${where}. ${issue}`;
+  else if (/^https?:\/\/\S+$/.test(p.proposedIssue.trim())) {
+    issue = `Existing issue: ${sameRepoIssueUrl(p.proposedIssue, repo) ?? safeLine(p.proposedIssue)}`;
+  } else {
+    const title = safeLine(p.proposedIssue);
+    // A star in the title would end the italics.
+    issue = `Proposed \`tech-debt\` issue: ${title.includes("*") ? title : `*${title}*`}`;
+  }
+  return `- ${safeLine(p.title)}${where}. ${issue}`;
 }
 
 export const RESOLVE_LINE =
@@ -143,17 +144,17 @@ export function renderSummary(p: SummaryParts): string {
   blocks.push(countLine(p.counts, stillOpen.length));
 
   if (stillOpen.length + fixed.length > 0) {
-    const item = (label: string, e: EarlierFinding) => {
+    const line = (label: string, e: EarlierFinding) => {
       const tag = e.tag ? ` (${e.tag === "important" ? "Important" : "Nit"})` : "";
-      return `- **${label}${tag}:** ${text(e.title)}${e.detail ? ` — ${text(e.detail)}` : ""}`;
+      return `- **${label}${tag}:** ${safeLine(e.title)}${e.detail ? ` — ${item(e.detail)}` : ""}`;
     };
     blocks.push(
-      ["**Earlier findings:**", ...stillOpen.map((e) => item("Still open", e)), ...fixed.map((e) => item("Verified fixed", e))].join("\n"),
+      ["**Earlier findings:**", ...stillOpen.map((e) => line("Still open", e)), ...fixed.map((e) => line("Verified fixed", e))].join("\n"),
     );
   }
 
   if (p.preExisting?.length) {
-    blocks.push(["**Pre-existing:**", ...p.preExisting.map(preExistingLine)].join("\n"));
+    blocks.push(["**Pre-existing:**", ...p.preExisting.map((x) => preExistingLine(x, p.repo))].join("\n"));
   }
 
   if (p.questions?.length) {
@@ -161,21 +162,21 @@ export function renderSummary(p: SummaryParts): string {
       [
         "**Questions for the author:**",
         ...p.questions.map((q) => {
-          const where = q.locations.length ? ` (${q.locations.map((l) => code(formatLocation(l))).join(", ")})` : "";
-          return `- ${text(q.body)}${where}`;
+          const where = q.locations.length ? ` (${q.locations.map((l) => codeSpan(formatLocation(l))).join(", ")})` : "";
+          return `- ${item(q.body)}${where}`;
         }),
       ].join("\n"),
     );
   }
 
   if (p.checked?.length) {
-    blocks.push(["**Checked, nothing found:**", ...p.checked.map((c) => `- ${text(c)}`)].join("\n"));
+    blocks.push(["**Checked, nothing found:**", ...p.checked.map((c) => `- ${item(c)}`)].join("\n"));
   }
 
   const notRun: string[] = [];
-  if (p.ci !== undefined) notRun.push(`**CI:** ${text(p.ci)}`);
-  if (p.partial !== undefined) notRun.push(`**Partial review:** ${text(p.partial)}`);
-  if (p.notRun?.length) notRun.push(["**Not run:**", ...p.notRun.map((n) => `- ${text(n)}`)].join("\n"));
+  if (p.ci !== undefined) notRun.push(`**CI:** ${labelled(p.ci)}`);
+  if (p.partial !== undefined) notRun.push(`**Partial review:** ${labelled(p.partial)}`);
+  if (p.notRun?.length) notRun.push(["**Not run:**", ...p.notRun.map((n) => `- ${item(n)}`)].join("\n"));
   if (notRun.length) blocks.push(notRun.join("\n\n"));
 
   blocks.push(RESOLVE_LINE);

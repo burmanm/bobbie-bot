@@ -12,6 +12,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
 import { main } from "../cli/main.ts";
+import { assertInert } from "../core/markdown-testing.ts";
 import { PreparedSnapshots, unpackSnapshot } from "./snapshot.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -49,6 +50,7 @@ set -euo pipefail
 [[ "$1 $2" == "mod download" ]] || exit 2
 env | sort > "$HOME/go-env.txt"
 pwd > "$HOME/go-cwd.txt"
+if grep -q EVIL go.mod; then echo 'go: x\`![p](https://evil.example/p?q=1) @org/team <img src=x>' >&2; exit 1; fi
 if grep -q FAIL go.mod; then echo "go: example.com/evil@v0.0.1: reading https://proxy/...: 404 Not Found" >&2; exit 1; fi
 mkdir -p "$GOMODCACHE/example.com/lib@v1.2.3" "$GOMODCACHE/cache/download/example.com/lib/@v"
 echo "package lib" > "$GOMODCACHE/example.com/lib@v1.2.3/lib.go"
@@ -144,6 +146,15 @@ test("a failing go mod download still produces a snapshot, without a module cach
   assert.equal(manifest.modcache.status, "failed");
   assert.match(manifest.modcache.detail ?? "", /go mod download failed/);
   assert.equal(existsSync(join(dest, "modcache")), false);
+});
+
+test("go's error, which the PR controls, is inert in the job summary (H-51)", async () => {
+  const s = setup("summary", (head) => writeFileSync(join(head, "go.mod"), "module example.com/widget\n\n// EVIL\n"));
+  const summary = join(s.dir, "summary.md");
+  assert.equal((await runPrepare(s, { GITHUB_STEP_SUMMARY: summary })).code, 0);
+  const text = readFileSync(summary, "utf8");
+  assert.match(text, /evil\.example/);
+  assertInert(text);
 });
 
 test("no go.mod → modcache skipped; a module cache over the cap is dropped", async () => {

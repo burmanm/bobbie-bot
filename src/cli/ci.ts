@@ -17,7 +17,7 @@ import { parseArgs } from "node:util";
 import { completeIfUnfinished } from "../ci/check.ts";
 import { CI_ON_FAILURE, type CiOnFailure, DEFAULT_CI_WAIT, parseCiRequire, parseCiTimeout } from "../ci/ci-wait.ts";
 import { DEFAULT_AUTH_LABEL, type GateResult, gateEventFrom, type WaitingInfo, LIFETIMES, type LabelLifetime, runGate } from "../ci/gate.ts";
-import { BOT_VERSION, FINGERPRINT_VERSION, gateRunRecord, type RunRecord, type WaitingInput } from "../core/index.ts";
+import { BOT_VERSION, FINGERPRINT_VERSION, gateRunRecord, safeSummary, type RunRecord, type WaitingInput } from "../core/index.ts";
 import { PI_VERSION } from "../agent/index.ts";
 import { Github, type Fetch } from "../ci/github.ts";
 import { unpackSnapshot } from "../ci/snapshot.ts";
@@ -214,7 +214,7 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
           io,
         );
         if (env.GITHUB_STEP_SUMMARY) {
-          appendFileSync(env.GITHUB_STEP_SUMMARY, `### review-bot gate: ${d.kind}\n\n${d.reason}\n`);
+          appendFileSync(env.GITHUB_STEP_SUMMARY, `### review-bot gate: ${d.kind}\n\n${safeSummary(d.reason)}\n`);
         }
         const recordsDir = a["records-dir"] ?? env.RB_RECORDS_DIR;
         if (recordsDir !== undefined && recordsDir !== "") {
