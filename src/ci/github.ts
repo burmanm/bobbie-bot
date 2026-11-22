@@ -102,6 +102,16 @@ export class GithubError extends Error {
 
 const REPO = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
 
+/** One entry of a git tree (GitHub's recursive tree listing). */
+export interface TreeEntry {
+  path: string;
+  /** 100644, 100755, 120000 (symlink), 040000 (tree), 160000 (submodule). */
+  mode: string;
+  type: "blob" | "tree" | "commit";
+  sha: string;
+  size?: number;
+}
+
 /** Repository permission levels that count as "maintainer" (C-4: write access or above). */
 export const MAINTAINER_ROLES = ["admin", "maintain", "write"] as const;
 
@@ -290,6 +300,30 @@ export class Github {
       path = nextLink(res.headers.get("link"));
     }
     return out;
+  }
+
+  /** The default branch and the commit it points at now. */
+  async getDefaultBranchHead(): Promise<{ branch: string; sha: string }> {
+    const repo = await this.json<{ default_branch?: unknown }>("GET", this.base());
+    const branch = repo?.default_branch;
+    if (typeof branch !== "string" || branch === "") throw new Error(`${this.repo}: no default branch`);
+    const commit = await this.json<{ sha?: unknown }>("GET", `${this.base()}/commits/${encodeURIComponent(branch)}`);
+    if (typeof commit?.sha !== "string" || !/^[0-9a-f]{40}$/.test(commit.sha)) throw new Error(`${this.repo}: cannot resolve ${branch}`);
+    return { branch, sha: commit.sha };
+  }
+
+  /** Every entry of the commit's tree. Refuses a tree GitHub truncated. */
+  async getTree(commitSha: string): Promise<TreeEntry[]> {
+    const tree = await this.json<{ tree?: TreeEntry[]; truncated?: boolean }>("GET", `${this.base()}/git/trees/${encodeURIComponent(commitSha)}?recursive=1`);
+    if (tree?.truncated === true) throw new Error(`${this.repo}@${commitSha}: the tree is too large to list`);
+    return tree?.tree ?? [];
+  }
+
+  /** A blob's bytes. */
+  async getBlob(sha: string): Promise<Buffer> {
+    const blob = await this.json<{ content?: unknown; encoding?: unknown }>("GET", `${this.base()}/git/blobs/${encodeURIComponent(sha)}`);
+    if (blob?.encoding !== "base64" || typeof blob.content !== "string") throw new Error(`blob ${sha}: unexpected encoding`);
+    return Buffer.from(blob.content, "base64");
   }
 
   /** A file's text at `ref`, or undefined when it does not exist. */

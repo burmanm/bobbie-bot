@@ -130,3 +130,38 @@ test("--waiting: the gate's JSON line is checked against the record schema (A-6)
     assert.throws(() => parseWaiting(bad), /--waiting/, bad);
   }
 });
+
+test("--agent-dir (F-7): settings reach the run; a broken settings.json is a configuration error, not 'no configuration'", async () => {
+  const { mkdirSync, writeFileSync } = await import("node:fs");
+  const dir = join(work, "agent");
+  mkdirSync(dir);
+  writeFileSync(join(dir, "settings.json"), JSON.stringify({ reviewBot: { roles: { reviewer: { tools: ["+codemode"] } } } }));
+  const base = ["review", "--dry-run", "--fixture", FIXTURE, "--script", join(FIXTURE, "script.json"), "--no-modcache", "--runs-dir", join(work, "runs"), "--quiet"];
+  const cap = io();
+  assert.equal(await main([...base, "--agent-dir", dir], cap.io), 1);
+  assert.match(cap.out.stdout, /tools in settings\.json names codemode/);
+
+  writeFileSync(join(dir, "settings.json"), '{"reviewBot": ');
+  const broken = io();
+  assert.equal(await main([...base, "--agent-dir", dir], broken.io), 1);
+  assert.match(broken.out.stderr, /configuration error: .*settings\.json is not valid JSON/);
+  assert.equal(broken.out.stdout, "", "nothing ran");
+  const missing = io();
+  assert.equal(await main([...base, "--agent-dir", join(work, "no-such-dir")], missing.io), 1);
+  assert.match(missing.out.stderr, /cannot read/);
+});
+
+test("pi's thinking levels, the run-timeout ceiling, and help text that no longer says the YAML overrides", async () => {
+  const base = ["review", "--dry-run", "--fixture", FIXTURE, "--script", join(FIXTURE, "script.json"), "--no-modcache", "--runs-dir", join(work, "runs"), "--quiet"];
+  const ok = io();
+  assert.equal(await main([...base, "--thinking", "reviewer=xhigh", "--thinking", "verifier=max", "--max-run-timeout", "30m"], ok.io), 0, ok.out.stderr);
+  const bad = io();
+  assert.equal(await main([...base, "--thinking", "reviewer=ultra"], bad.io), 2);
+  assert.match(bad.out.stderr, /invalid thinking level: ultra \(use off, minimal, low, medium, high, xhigh, max\)/);
+  assert.equal(await main([...base, "--max-run-timeout", "soon"], io().io), 2);
+  const help = io();
+  assert.equal(await main(["--help"], help.io), 0);
+  assert.doesNotMatch(help.out.stdout, /overrides? (it|them|the)\b|review-bot\.yaml[^\n]*overrides/);
+  assert.match(help.out.stdout, /--agent-dir <dir>/);
+  assert.match(help.out.stdout, /can only\s+narrow/);
+});

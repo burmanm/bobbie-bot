@@ -59,18 +59,23 @@ import {
   type PullRequestInfo,
   type SnapshotSource,
 } from "../platform/index.ts";
+import { type AgentSettings, modelsJsonSha256, NO_AGENT_SETTINGS, resolveRoleTools } from "./agent-settings.ts";
 import {
   type ConfigInputs,
   ConfigError,
-  DEFAULT_LIMITS,
+  type EnabledModel,
   formatDuration,
   formatModel,
+  initialRunTimeoutMs,
+  type ModelCatalog,
   type PipelineConfig,
+  PIPELINE_ROLES,
   type PipelineRole,
   resolveConfig,
+  resolveEnabledModels,
 } from "./config.ts";
 import { buildContext } from "./context.ts";
-import { historyTools } from "./history-tools.ts";
+import { HISTORY_TOOL_NAMES, historyTools } from "./history-tools.ts";
 import { type Chunk, chunkByDirectory, deterministicPass, type DeterministicResult } from "./deterministic.ts";
 import { isKnowledgePath, type Knowledge, knowledgeFileList, type KnowledgeOverride, loadAreaReviews, loadKnowledge } from "./knowledge.ts";
 import { snapshotLookup } from "./lookup.ts";
@@ -84,8 +89,25 @@ export interface ReviewRunOptions {
   platform: Platform;
   snapshots: SnapshotSource;
   agentStep: AgentStep;
-  /** Workflow inputs / CLI flags; `.review/review-bot.yaml` from base overrides them (C-2). */
+  /**
+   * Workflow inputs / CLI flags: over the agent directory's settings, and
+   * narrowed by `.review/review-bot.yaml` from base (F-7, C-2).
+   */
   inputs: ConfigInputs;
+  /**
+   * The operator's agent directory (F-7), its `settings.json` already read
+   * by the caller. Absent: no agent directory, so no settings and no
+   * `enabledModels` (`NO_AGENT_SETTINGS`).
+   */
+  agent?: {
+    dir: string;
+    settings: AgentSettings;
+    /**
+     * pi's models with credentials, to resolve `enabledModels`
+     * (src/agent/model-runtime.ts). Without it no model is enabled.
+     */
+    models?: () => Promise<ModelCatalog>;
+  };
   /** Reviewer name: the check run is `ai-review/<name>` and markers carry the same id. Default "main". */
   name?: string;
   knowledgeOverride?: KnowledgeOverride;
@@ -142,6 +164,11 @@ export interface RecheckOutcome {
 }
 
 const READ_TOOLS = ["read", "ls", "grep", "find"] as const;
+/**
+ * A role's read-only default (S-4, F-7): what `tools` in settings.json is
+ * relative to. Output tools are added to whatever it resolves to.
+ */
+const ROLE_DEFAULT_TOOLS: readonly string[] = [...READ_TOOLS, ...HISTORY_TOOL_NAMES];
 const short = (sha: string) => sha.slice(0, 7);
 
 /** A run that cannot continue; becomes a neutral check (S-9). */
@@ -189,19 +216,23 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
   let checkCompleted = false;
   let spentUsd = 0;
   let publishedIds: string[] = [];
+  /** Each role's tools as configured (F-7), before output tools; set with the config. */
+  const roleTools: Partial<Record<PipelineRole, ReadonlySet<string>>> = {};
+  let modelsJsonHash: string | undefined;
   let partialNote: string | undefined;
 
   // Run deadline (S-4 Limits, S-9). One signal for the whole run: aborted
   // with the caller's reason on cancellation, or with RUN_DEADLINE when the
   // run's time is up. Steps stop on it; non-model stages race it. The
-  // deadline comes from the inputs first and is re-armed once
+  // deadline comes from the inputs and settings first and is re-armed once
   // .review/review-bot.yaml is read, always measured from the run's start.
   const runController = new AbortController();
   const runSignal = runController.signal;
   const onOuterAbort = () => runController.abort(o.signal?.reason ?? "cancelled");
   if (o.signal?.aborted) onOuterAbort();
   else o.signal?.addEventListener("abort", onOuterAbort, { once: true });
-  let deadlineMs = o.inputs.runTimeoutMs ?? DEFAULT_LIMITS.runTimeoutMs;
+  const settings = o.agent?.settings ?? NO_AGENT_SETTINGS;
+  let deadlineMs = initialRunTimeoutMs(o.inputs, settings);
   let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
   const armDeadline = (ms: number) => {
     deadlineMs = ms;
@@ -308,6 +339,8 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     }
     const roleLimits = config!.limits[role];
     const maxCostUsd = Math.min(roleLimits.maxCostUsd ?? Infinity, remaining);
+    const tools = roleTools[role] ?? new Set(ROLE_DEFAULT_TOOLS);
+    const queryTools = (req.queryTools ?? []).filter((t) => tools.has(t.name));
     let lastBeat = 0;
     const t = performance.now();
     const result = await o.agentStep.run({
@@ -316,9 +349,9 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       systemPrompt: req.systemPrompt,
       prompt: req.prompt,
       roots: req.roots,
-      readTools: READ_TOOLS,
+      readTools: READ_TOOLS.filter((t) => tools.has(t)),
       outputTools: req.outputTools,
-      ...(req.queryTools === undefined || req.queryTools.length === 0 ? {} : { queryTools: req.queryTools }),
+      ...(queryTools.length === 0 ? {} : { queryTools }),
       limits: { ...roleLimits, maxCostUsd },
       signal: runSignal,
       onProgress: (p) => {
@@ -333,6 +366,8 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       name: stepName,
       role,
       configuredModel: formatModel(model),
+      ...(model.thinkingLevel === undefined ? {} : { thinkingLevel: model.thinkingLevel }),
+      tools: result.harness.tools,
       servedModels: result.servedModels,
       outcome: result.outcome,
       usage: {
@@ -385,8 +420,26 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     const currentPr = pr;
     await timed("S-1 base snapshot", () => o.snapshots.extract("base", currentPr.baseSha, heads.base));
     knowledge = loadKnowledge(heads.base, o.knowledgeOverride ?? {});
-    config = resolveConfig(o.inputs, knowledge.botConfig?.text);
+    const agentDir = o.agent?.dir;
+    if (agentDir !== undefined) modelsJsonHash = modelsJsonSha256(agentDir);
+    // F-7: what the repository may pick, as pi resolves enabledModels; only
+    // models with credentials match.
+    let enabled: EnabledModel[] = [];
+    const catalog = o.agent?.models;
+    if (settings.enabledModels.length > 0 && catalog !== undefined) {
+      const scope = await timed("S-1 enabled models", async () => resolveEnabledModels(settings, await catalog()), (r) => `${r.models.length}`);
+      for (const w of scope.warnings) log(`S-1 enabledModels: ${w}`);
+      enabled = scope.models;
+    }
+    config = resolveConfig(o.inputs, knowledge.botConfig?.text, settings, enabled);
     if (config.limits.runTimeoutMs !== deadlineMs) armDeadline(config.limits.runTimeoutMs);
+    for (const role of PIPELINE_ROLES) {
+      const tools = resolveRoleTools(config.tools[role], ROLE_DEFAULT_TOOLS);
+      // Module tools (codemode included) need module loading, R-1a steps 4b and 5b.
+      const unknown = tools.filter((t) => !ROLE_DEFAULT_TOOLS.includes(t));
+      if (unknown.length > 0) throw new ConfigError(`reviewBot.roles.${role}.tools in settings.json names ${unknown.join(", ")}, which this version does not provide; it offers ${ROLE_DEFAULT_TOOLS.join(", ")}`);
+      roleTools[role] = new Set(tools);
+    }
     const prior: PriorState = derivePriorState(comments, botId);
     round = prior.rounds + 1;
 
@@ -451,7 +504,9 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
 
     const reviewerModel = config.roles.reviewer;
     if (reviewerModel === undefined) {
-      throw new ConfigError("no model is configured for the reviewer role (set --model reviewer=<provider>/<id> or roles.reviewer in .review/review-bot.yaml)");
+      throw new ConfigError(
+        "no model is configured for the reviewer role (set reviewBot.roles.reviewer.model in the agent directory's settings.json, or --model reviewer=<provider>/<id>)",
+      );
     }
     const verifierModel = config.roles.verifier;
     await timed("S-1 head snapshot", () => o.snapshots.extract("head", currentPr.headSha, heads.head));
@@ -815,7 +870,13 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
   function buildRecord(): RunRecord {
     const finishedAt = now();
     const roles: Record<string, string> = {};
-    for (const [k, v] of Object.entries(config?.roles ?? {})) roles[k] = formatModel(v);
+    const thinking: Record<string, string> = {};
+    for (const [k, v] of Object.entries(config?.roles ?? {})) {
+      roles[k] = formatModel(v);
+      thinking[k] = v.thinkingLevel ?? "off";
+    }
+    const tools: Record<string, string[]> = {};
+    for (const [k, v] of Object.entries(roleTools)) tools[k] = [...v];
     const result: RunRecord["run"]["result"] = { checkConclusion: conclusion, summary: checkSummary, publishedCommentIds: publishedIds };
     if (skipReason !== undefined) result.skipReason = skipReason;
     if (skipKind !== undefined) result.skipKind = skipKind;
@@ -849,6 +910,9 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
           knowledgeBaseSha: pr?.baseSha ?? "",
           fingerprintVersion: FINGERPRINT_VERSION,
           roles,
+          thinking,
+          tools,
+          ...(modelsJsonHash === undefined ? {} : { modelsJsonSha256: modelsJsonHash }),
         },
         files,
         knowledgeFiles: knowledge === undefined ? [] : knowledgeFileList(knowledge),

@@ -40,18 +40,36 @@ inputs:
   base-sha:
     description: Base SHA (prepare)
     default: ""
+  agent-dir:
+    description: >-
+      gate, review: the operator's pi agent directory (F-7), a directory path
+      in the repository holding settings.json (pi's keys and reviewBot) and
+      models.json. Read from the default branch's head, or from
+      agent-dir-repo; never from the PR. The gate fetches it, and the
+      workflow passes it to the review job as an artifact. Empty: none.
+    default: ""
+  agent-dir-repo:
+    description: >-
+      gate: take agent-dir from this repository at a pinned commit instead,
+      owner/name@<40-hex SHA> (an organization configuration repository).
+      The gate's token must be able to read it.
+    default: ""
   auth-label:
-    description: Authorization label for PRs from authors without write access (C-4, Q-10)
-    default: ai-review/approved
+    description: >-
+      Authorization label for PRs from authors without write access (C-4,
+      Q-10). Empty: reviewBot.authorization.label in settings.json, else
+      ai-review/approved
+    default: ""
   auth-label-lifetime:
-    description: "per-push (removed on the author's next push) or per-pr (kept)"
-    default: per-push
+    description: "per-push (removed on the author's next push) or per-pr (kept). Empty: settings.json, else per-push"
+    default: ""
   ci-require:
     description: >-
       gate: wait for CI before reviewing (C-9). off; required (the base
       branch's required status checks minus ai-review/*); or check-run,
-      status-context or workflow names, comma- or newline-separated.
-      ci.require in .review/review-bot.yaml on the base branch overrides it.
+      status-context or workflow names, comma- or newline-separated. Over
+      reviewBot.ci in settings.json; ci.require in .review/review-bot.yaml on
+      the base branch replaces it (the repository's own policy).
     default: ""
   ci-on-failure:
     description: "gate: skip (complete the check as skipped) or review (review anyway and say so) when required CI failed"
@@ -75,23 +93,30 @@ inputs:
       pinned by digest, <registry>/<name>@sha256:<64 hex>.
     default: ""
   models:
-    description: "Role→model map, one per line: reviewer=<provider>/<id>, verifier=<provider>/<id> (C-6). .review/review-bot.yaml on the base branch overrides it."
+    description: >-
+      Role→model map, one per line: reviewer=<provider>/<id>[:<thinking>],
+      verifier=... (C-6). Replaces reviewBot.roles in settings.json.
+      .review/review-bot.yaml on the base branch can only pick among
+      enabledModels in settings.json; without that list it cannot change a model.
     default: ""
   thinking:
-    description: "One per line: <role>=off|minimal|low|medium|high"
+    description: "One per line: <role>=off|minimal|low|medium|high|xhigh|max (over a :suffix, as pi's --thinking)"
     default: ""
   providers:
     description: "OpenRouter only, one per line: <role>=<provider>,<provider>"
     default: ""
   max-cost:
-    description: Run spend cap in USD (per-step limits go in .review/review-bot.yaml)
+    description: >-
+      Run spend cap in USD, over reviewBot.limits.runCostUsd in settings.json
+      (per-step limits go there). .review/review-bot.yaml can only lower it.
     default: ""
   timeout-minutes:
     description: >-
       The review step's own time limit. Set the step's timeout-minutes to the
-      same value. The pipeline's run deadline (--run-timeout) is set three
-      minutes inside it, so a slow review publishes a partial result and
-      completes its check; the action stops the container a minute before the
+      same value. The pipeline's run deadline is capped three minutes inside
+      it (--max-run-timeout), so a slow review publishes a partial result and
+      completes its check; a lower runTimeoutSeconds in settings.json or the
+      YAML still applies. The action stops the container a minute before the
       limit as a last resort.
     default: "40"
   provider-env:
@@ -191,6 +216,8 @@ runs:
         RB_HEAD_SHA: ${{ inputs.head-sha }}
         RB_AUTH_LABEL: ${{ inputs.auth-label }}
         RB_AUTH_LIFETIME: ${{ inputs.auth-label-lifetime }}
+        RB_AGENT_DIR: ${{ inputs.agent-dir }}
+        RB_AGENT_DIR_REPO: ${{ inputs.agent-dir-repo }}
         RB_MODELS: ${{ inputs.models }}
         RB_THINKING: ${{ inputs.thinking }}
         RB_PROVIDERS: ${{ inputs.providers }}

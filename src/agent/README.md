@@ -8,6 +8,7 @@ backed by the pi SDK; the guard and tools it loads live in
 |---|---|
 | `types.ts` | `AgentStep`, request and result types |
 | `pi-sdk-step.ts` | The pi SDK implementation: isolation and the neutral working directory (C-3a, D-15), limits (F-3), usage (A-6) |
+| `model-runtime.ts` | pi's model runtime: pi's catalog plus the operator's `models.json` (F-7), credentials and catalog cache in memory, offline |
 | `accounting.ts` | Usage sums and the turn and spend caps, pure |
 | `testing.ts` | Hostile snapshot fixture, working-directory payloads and a module that would trigger them, scripted-model helpers; tests only |
 | `acp/acp-step.ts` | `AgentStep` over the Agent Client Protocol: the step runs in an external agent |
@@ -157,8 +158,9 @@ that is never the snapshot (C-3a).
 A model `acp/<name>` runs the step in an external agent that speaks the
 [Agent Client Protocol](https://agentclientprotocol.com) (for example an
 ACP adapter for Claude Code, Codex or Gemini CLI). The operator defines the
-agent (`--acp-agent`, `--acp-config`); `.review/review-bot.yaml` can only
-pick one by name, never give a command. One agent process and one ACP
+agent (`--acp-agent`, `--acp-config`); `.review/review-bot.yaml` cannot
+pick one: it chooses among `enabledModels` as pi resolves them, and ACP
+agents are not in pi's model list (F-7). One agent process and one ACP
 session per step, started in a workspace: a fresh directory beside the head
 snapshot with one symlink per read root (`head`, `base`, `modcache`,
 `inputs`), removed after the step. Agents such as bob confine their own
@@ -184,6 +186,9 @@ How it differs from the pi step:
   against the schema and `validate` like pi tool calls. Rejected calls are
   sent back for one correction round (`maxCorrections`). A step stopped by a
   limit has no outputs.
+- **Thinking level and role tools** (`:<level>` suffix, `--thinking`,
+  `reviewBot.roles.<role>.tools`) are not applied: the agent has its own
+  tools and is always offered `fs/read_text_file`.
 - **System prompt** goes at the top of the first prompt in
   `<instructions>`; ACP has no system prompt.
 - **Turns:** each prompt round and each tool call the agent reports counts
@@ -200,3 +205,16 @@ How it differs from the pi step:
   with an error is a `provider` error. Timeouts, idle, turns and
   cancellation send `session/cancel`; an agent that does not answer within
   the grace period is killed.
+
+## Models and the agent directory
+
+`createModelRuntime` (`model-runtime.ts`) builds the runtime each pi step
+uses, and the one the pipeline asks to resolve `enabledModels` (F-7): pi's
+built-in catalog plus `models.json` from the operator's agent directory
+(`PiSdkAgentStepOptions.agentDir`, the CLI's `--agent-dir`). Credentials are
+held in memory (keys from the environment or `models.json`'s `apiKey`), and
+pi's refreshed-catalog cache too, so nothing is written next to
+`models.json` and no `auth.json` is read. A malformed `models.json` is a
+`config` error whose message does not quote the file. Nothing else in the
+agent directory is read here yet: modules are R-1a step 4b. The session's own
+agent directory stays the private, empty one (C-3a).

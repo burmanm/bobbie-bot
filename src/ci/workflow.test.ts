@@ -237,3 +237,28 @@ test("the image publish workflow (C-4): manual, default branch only, pinned, pro
   assert.equal(attest.with?.["subject-digest"], "${{ steps.build.outputs.digest }}");
   assert.equal(job.steps.find((s) => s.uses?.startsWith("actions/checkout@"))!.with?.["persist-credentials"], false);
 });
+
+test("the agent directory (F-7, D-19): fetched by the gate, never from the PR, handed to the review job as an artifact", () => {
+  const gate = wf.jobs.gate!.steps;
+  const gateStep = gate.find((s) => s.id === "gate")!;
+  assert.equal(gateStep.with?.["agent-dir"], "${{ vars.REVIEW_BOT_AGENT_DIR }}");
+  assert.equal(gateStep.with?.["agent-dir-repo"], "${{ vars.REVIEW_BOT_AGENT_DIR_REPO }}");
+  // Unset variables reach the action empty, so settings.json shows through.
+  assert.equal(gateStep.with?.["auth-label"], "${{ vars.REVIEW_BOT_AUTH_LABEL }}");
+  assert.equal(gateStep.with?.["auth-label-lifetime"], "${{ vars.REVIEW_BOT_AUTH_LABEL_LIFETIME }}");
+  const upload = gate.find((s) => s.with?.name === "review-bot-agent-dir")!;
+  assert.ok(gate.indexOf(upload) > gate.indexOf(gateStep));
+  assert.match(String(upload.if), /vars\.REVIEW_BOT_AGENT_DIR != ''/);
+  assert.match(String(upload.with?.path), /review-bot\/agent\/dir$/);
+
+  const review = wf.jobs.review!.steps;
+  const download = review.find((s) => s.with?.name === "review-bot-agent-dir")!;
+  const reviewStep = review.find((s) => s.id === "review")!;
+  assert.ok(download.uses?.startsWith("actions/download-artifact@"));
+  assert.ok(review.indexOf(download) < review.indexOf(reviewStep));
+  assert.equal(reviewStep.with?.["agent-dir"], "${{ vars.REVIEW_BOT_AGENT_DIR }}");
+  assert.equal(reviewStep.with?.["agent-dir-repo"], undefined, "only the gate fetches");
+  // The review job keeps its C-4 permissions: no contents read for this.
+  assert.equal(wf.jobs.review!.permissions?.contents, undefined);
+  assert.doesNotMatch(wfText, /actions\/checkout/);
+});

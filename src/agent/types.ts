@@ -16,7 +16,9 @@ export type { OutputTool, ProviderRequestSummary, QueryTool, ReadToolName };
 
 export type Role = "reviewer" | "verifier" | "learner";
 
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high";
+/** pi's levels (`--thinking`, the `--model` suffix); pi maps each to what the model supports. */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 export interface ModelRef {
   /**

@@ -22,9 +22,15 @@
  * the PR comment (S-9), and nothing runs under settings other than the ones
  * the repository reads in its file.
  *
- * Until R-1a step 2b passes settings, a caller without them keeps the YAML's
- * free choice of model and its `thinking`, `providers` and `routing` fields.
- * The limit rules apply to every caller.
+ * Every caller passes settings (R-1a step 2b). Without an agent directory
+ * they are `NO_AGENT_SETTINGS`: no `enabledModels`, so the YAML cannot change
+ * a model at all and the run uses the models the inputs name (local dry
+ * runs). There is no other path: the YAML's former `thinking`, `providers`
+ * and `routing` fields are gone (H-42, H-45).
+ *
+ * The run timeout input may instead be a ceiling (`runTimeoutCeilingMs`, the
+ * action's job limit): applied last, it lowers whatever 1-4 chose and is
+ * never refused, so a lower value in settings or the YAML takes effect.
  *
  * There is **no default model** anywhere in code: a role without a model is
  * a configuration error for `reviewer`, and turns adversarial verification
@@ -42,6 +48,7 @@ import type { ModelRef, StepLimits, ThinkingLevel } from "../agent/index.ts";
 import {
   type AgentSettings,
   AuthorizationSchema,
+  NO_AGENT_SETTINGS,
   CiSchema,
   ConfigError,
   LimitsSchema,
@@ -55,7 +62,7 @@ import {
 } from "./agent-settings.ts";
 import { cloneSkipConfig, DEFAULT_SKIP, type SkipConfig } from "./skip.ts";
 
-export { ConfigError, parseDuration, parseModelSpec, PIPELINE_ROLES, type PipelineRole } from "./agent-settings.ts";
+export { ConfigError, NO_AGENT_SETTINGS, parseDuration, parseModelSpec, PIPELINE_ROLES, type PipelineRole } from "./agent-settings.ts";
 
 export interface PipelineConfig {
   roles: Partial<Record<PipelineRole, ModelRef>>;
@@ -90,25 +97,18 @@ export const DEFAULT_LIMITS: PipelineConfig["limits"] = {
 };
 
 
-const THINKING = ["off", "minimal", "low", "medium", "high"] as const;
-
 export function formatModel(m: Pick<ModelRef, "provider" | "id">): string {
   return `${m.provider}/${m.id}`;
 }
 
+/**
+ * A role in the YAML: `provider/id[:thinking]`, or `{ model: ... }`. Nothing
+ * else: thinking is the suffix, and upstream providers and routing are the
+ * operator's `models.json` and inputs (F-7, H-45).
+ */
 const RoleYaml = Type.Union([
   Type.String({ minLength: 3 }),
-  Type.Object(
-    {
-      model: Type.String({ minLength: 3 }),
-      // The next three are refused when settings are given (F-7) and leave the schema with step 2b.
-      thinking: Type.Optional(Type.Enum(THINKING)),
-      /** OpenRouter only: the upstream providers allowed to serve the model (routing `only`). */
-      providers: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
-      routing: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
-    },
-    { additionalProperties: false },
-  ),
+  Type.Object({ model: Type.String({ minLength: 3 }) }, { additionalProperties: false }),
 ]);
 
 /** `.review/review-bot.yaml` (A-5). Bot settings only; never review guidance. */
@@ -135,6 +135,11 @@ export interface ConfigInputs {
   providers?: Partial<Record<PipelineRole, string[]>>;
   runCostUsd?: number;
   runTimeoutMs?: number;
+  /**
+   * The longest the run may take whatever the configuration says: the CI
+   * job's own limit (S-9). Lowers the result; a lower value stands.
+   */
+  runTimeoutCeilingMs?: number;
   chunkPatchLines?: number;
   skipDraft?: boolean;
   /** S-1 skip labels and dependency paths (workflow inputs); each replaces its default. */
@@ -160,16 +165,6 @@ export function withProviders(ref: ModelRef, providers: readonly string[], where
   return { ...ref, routing: { ...ref.routing, only: list, allow_fallbacks: false } };
 }
 
-/** A YAML role as callers without settings still take it (until R-1a step 2b). */
-function roleFromYaml(v: Static<typeof RoleYaml>, where: string): ModelRef {
-  if (typeof v === "string") return parseModelSpec(v);
-  let ref = parseModelSpec(v.model);
-  if (v.thinking !== undefined) ref.thinkingLevel = v.thinking;
-  if (v.routing !== undefined) ref.routing = v.routing;
-  if (v.providers !== undefined) ref = withProviders(ref, v.providers, where);
-  return ref;
-}
-
 export function parseBotConfigYaml(text: string): BotConfigYaml {
   let data: unknown;
   try {
@@ -192,6 +187,9 @@ export interface EnabledModel {
   thinkingLevel?: ThinkingLevel;
 }
 
+/** What `resolveEnabledModels` needs of pi's model runtime. */
+export type ModelCatalog = Pick<ModelRuntime, "getAvailable">;
+
 /**
  * `enabledModels` resolved by pi itself, so globs, bare ids, fuzzy matches
  * and suffixes mean what they mean to `pi --models`. Only models pi can use
@@ -200,7 +198,7 @@ export interface EnabledModel {
  */
 export async function resolveEnabledModels(
   settings: AgentSettings,
-  runtime: Pick<ModelRuntime, "getAvailable">,
+  runtime: ModelCatalog,
 ): Promise<{ models: EnabledModel[]; warnings: string[] }> {
   if (settings.enabledModels.length === 0) return { models: [], warnings: [] };
   const { resolveModelScopeWithDiagnostics } = await import("@earendil-works/pi-coding-agent");
@@ -211,7 +209,7 @@ export async function resolveEnabledModels(
   const models = scope.scopedModels.map(({ model, thinkingLevel }): EnabledModel => ({
     provider: model.provider,
     id: model.id,
-    ...(thinkingLevel === undefined ? {} : { thinkingLevel: thinkingLevel as ThinkingLevel }),
+    ...(thinkingLevel === undefined ? {} : { thinkingLevel }),
   }));
   return { models, warnings: scope.diagnostics.map((d) => d.message) };
 }
@@ -219,13 +217,14 @@ export async function resolveEnabledModels(
 /**
  * The run's configuration, by the precedence at the top of this file.
  *
- * `enabled` is what `resolveEnabledModels` returned for `settings`. Without
- * it the YAML cannot change a model.
+ * `settings` is the agent directory's, or `NO_AGENT_SETTINGS` without one.
+ * `enabled` is what `resolveEnabledModels` returned for them; without it the
+ * YAML cannot change a model.
  */
 export function resolveConfig(
   inputs: ConfigInputs,
-  yamlText?: string,
-  settings?: AgentSettings,
+  yamlText: string | undefined,
+  settings: AgentSettings,
   enabled: readonly EnabledModel[] = [],
 ): PipelineConfig {
   const config: PipelineConfig = {
@@ -234,16 +233,22 @@ export function resolveConfig(
     limits: { ...DEFAULT_LIMITS, reviewer: { ...DEFAULT_LIMITS.reviewer }, verifier: { ...DEFAULT_LIMITS.verifier } },
     skip: cloneSkipConfig(DEFAULT_SKIP),
   };
-  if (settings !== undefined) applySettings(config, settings);
+  applySettings(config, settings);
   applyInputs(config, inputs);
   if (yamlText !== undefined) applyYaml(config, parseBotConfigYaml(yamlText), settings, enabled);
-  for (const role of PIPELINE_ROLES) {
-    const ref = config.roles[role];
-    if (ref?.routing !== undefined && ref.provider !== OPENROUTER) {
-      throw new ConfigError(`roles.${role}: routing preferences need an ${OPENROUTER} model, not "${formatModel(ref)}"`);
-    }
-  }
+  if (inputs.runTimeoutCeilingMs !== undefined) config.limits.runTimeoutMs = Math.min(config.limits.runTimeoutMs, inputs.runTimeoutCeilingMs);
   return config;
+}
+
+/**
+ * The run deadline before the YAML is read (S-4 Limits): inputs, else
+ * settings, else the default; never above the ceiling. The YAML can only
+ * lower it, so this is the longest the run can be allowed.
+ */
+export function initialRunTimeoutMs(inputs: ConfigInputs, settings: AgentSettings = NO_AGENT_SETTINGS): number {
+  const seconds = settings.reviewBot.limits?.runTimeoutSeconds;
+  const ms = inputs.runTimeoutMs ?? (seconds === undefined ? DEFAULT_LIMITS.runTimeoutMs : secondsToMs(seconds));
+  return Math.min(ms, inputs.runTimeoutCeilingMs ?? Infinity);
 }
 
 function applySettings(config: PipelineConfig, settings: AgentSettings): void {
@@ -299,30 +304,19 @@ function applyInputs(config: PipelineConfig, inputs: ConfigInputs): void {
 }
 
 /** The base branch's file on top: narrowing only, every refusal reported at once (F-7). */
-function applyYaml(config: PipelineConfig, y: BotConfigYaml, settings: AgentSettings | undefined, enabled: readonly EnabledModel[]): void {
+function applyYaml(config: PipelineConfig, y: BotConfigYaml, settings: AgentSettings, enabled: readonly EnabledModel[]): void {
   const refused: string[] = [];
   narrowLimits(config.limits, y.limits, refused);
   for (const role of PIPELINE_ROLES) {
     const wanted = y.roles?.[role];
     if (wanted === undefined) continue;
-    const where = `roles.${role}`;
-    if (settings === undefined) {
-      config.roles[role] = roleFromYaml(wanted, `.review/review-bot.yaml ${where}`);
-      continue;
-    }
-    if (typeof wanted !== "string") {
-      if (wanted.thinking !== undefined) refused.push(`${where}.thinking (use a model:<level> suffix)`);
-      for (const key of ["providers", "routing"] as const) {
-        if (wanted[key] !== undefined) refused.push(`${where}.${key} (only the operator's models.json sets it)`);
-      }
-    }
     const spec = typeof wanted === "string" ? wanted : wanted.model;
     const allowed = settings.enabledModels.length > 0 ? enabled : [];
     const ref = chooseModel(spec, config.roles[role], allowed);
     if (ref !== undefined) config.roles[role] = ref;
     else {
       const why = settings.enabledModels.length > 0 ? "not in enabledModels" : "no enabledModels, so the model is fixed";
-      refused.push(`${where} ${quoteValue(spec)} (${why})`);
+      refused.push(`roles.${role} ${quoteValue(spec)} (${why})`);
     }
   }
   if (refused.length > 0) {

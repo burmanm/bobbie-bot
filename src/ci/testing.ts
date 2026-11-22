@@ -39,6 +39,12 @@ export interface FakeRepo {
   forbidden?: string[];
   /** Check run ids whose update is refused (created by another identity). */
   foreignChecks?: number[];
+  /** The default branch and its head commit. */
+  defaultBranch?: { name: string; sha: string };
+  /** Commit SHA → recursive tree listing. */
+  trees?: Record<string, Array<{ path: string; mode: string; type: string; sha: string; size?: number }>>;
+  /** Blob SHA → content. */
+  blobs?: Record<string, string>;
 }
 
 export interface Call {
@@ -107,6 +113,18 @@ export function fakeGithub(repo: FakeRepo, eventsPerPage = 100): { fetch: Fetch;
       const headers: Record<string, string> = {};
       if (page * eventsPerPage < all.length) headers.link = `<${u.origin}/repos/o/r/issues/${m[1]}/events?per_page=100&page=${page + 1}>; rel="next"`;
       return reply(200, slice, headers);
+    }
+    if (init.method === "GET" && path === "" && repo.defaultBranch !== undefined) return reply(200, { default_branch: repo.defaultBranch.name });
+    if (init.method === "GET" && (m = /^\/commits\/([^/]+)$/.exec(path)) && decodeURIComponent(m[1]!) === repo.defaultBranch?.name) {
+      return reply(200, { sha: repo.defaultBranch.sha });
+    }
+    if (init.method === "GET" && (m = /^\/git\/trees\/([0-9a-f]+)$/.exec(path))) {
+      const tree = repo.trees?.[m[1]!];
+      return tree === undefined ? reply(404, { message: "Not Found" }) : reply(200, { sha: m[1], tree, truncated: false });
+    }
+    if (init.method === "GET" && (m = /^\/git\/blobs\/([0-9a-z]+)$/.exec(path))) {
+      const text = repo.blobs?.[m[1]!];
+      return text === undefined ? reply(404, { message: "Not Found" }) : reply(200, { encoding: "base64", content: Buffer.from(text).toString("base64") });
     }
     if (init.method === "GET" && (m = /^\/contents\/(.+)$/.exec(path))) {
       const text = repo.files?.[`${decodeURIComponent(m[1]!)}@${u.searchParams.get("ref")}`];
