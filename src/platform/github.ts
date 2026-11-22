@@ -5,9 +5,11 @@
  *
  * - One `COMMENT` review per run with inline comments (S-7, I-2 #8).
  * - Thread replies only on this bot's own finding threads.
- * - A thread is resolved only when it is this bot's own (Bot-type author and
- *   this bot's finding marker, never login alone) and this run has just
- *   posted a "Verified fixed" reply in it (S-7, Q-9).
+ * - The id of the review posted is recorded on this run's check at once;
+ *   only recorded comments are the bot's own (D-5, H-50; github-markers.ts).
+ * - A thread is resolved only when it is this bot's own (posted with a
+ *   recorded review and carrying this bot's finding marker) and this run has
+ *   just posted a "Verified fixed" reply in it (S-7, Q-9).
  * - The "review could not complete" comment is found by its hidden marker
  *   and updated in place (S-9); a later successful run updates it again
  *   instead of leaving the stale failure text.
@@ -19,9 +21,9 @@
  * Reply and resolution failures do not undo the posted review; they are
  * returned as warnings. A failed review post throws.
  */
-import { completeCheckRun, openCheckRun } from "./github-checks.ts";
+import { completeCheckRun, listCheckRuns, openCheckRun, recordOnCheckRun } from "./github-checks.ts";
 import { type GitHubClient, GitHubApiError, RateLimitError } from "./github-client.ts";
-import { failureMarker, isOwnFailureComment, isOwnFindingRoot, stripMarkers } from "./github-markers.ts";
+import { attributeComments, failureMarker, isOwnFailureComment, isOwnFindingRoot, newPostMarker, reviewRecord, stripMarkers } from "./github-markers.ts";
 import type {
   Author,
   CheckRunCompletion,
@@ -59,6 +61,7 @@ interface ReviewCommentJson {
   line?: number | null;
   start_line?: number | null;
   in_reply_to_id?: number;
+  pull_request_review_id?: number | null;
   created_at?: string;
 }
 interface IssueCommentJson {
@@ -71,6 +74,7 @@ interface ReviewJson {
   id: number;
   user?: UserJson | null;
   body?: string | null;
+  commit_id?: string | null;
   submitted_at?: string;
 }
 interface ThreadInfo {
@@ -102,6 +106,7 @@ export function reviewCommentOf(c: ReviewCommentJson, resolved?: boolean): PrCom
   if (typeof c.start_line === "number") pc.startLine = c.start_line;
   if (c.in_reply_to_id !== undefined) pc.inReplyTo = String(c.in_reply_to_id);
   else if (resolved !== undefined) pc.threadResolved = resolved;
+  if (typeof c.pull_request_review_id === "number") pc.reviewId = String(c.pull_request_review_id);
   if (c.created_at !== undefined) pc.createdAt = c.created_at;
   return pc;
 }
@@ -165,6 +170,10 @@ export class GitHubPlatform implements Platform {
   private comments: PrComment[] | undefined;
   private threads: Map<string, ThreadInfo> | undefined;
   private checkRunId: number | undefined;
+  /** The App this run acts as, from the check run it opened. */
+  private app: string | undefined;
+  /** The review this run posted, to record on its check. */
+  private posted: { headSha: string; record: string } | undefined;
   private superseded: SupersededError | undefined;
 
   constructor(o: GitHubPlatformOptions) {
@@ -247,11 +256,12 @@ export class GitHubPlatform implements Platform {
     for (const r of reviews) {
       if (!r.body) continue;
       const pc: PrComment = { id: String(r.id), kind: "review", author: author(r.user), body: r.body };
+      if (r.commit_id) pc.commitId = r.commit_id;
       if (r.submitted_at !== undefined) pc.createdAt = r.submitted_at;
       out.push(pc);
     }
-    this.comments = out;
-    return out;
+    this.comments = await attributeComments(out, this.botId, (sha) => listCheckRuns(this.client, this.repo, this.botId, sha), this.app);
+    return this.comments;
   }
 
   /** Thread root comment id → GraphQL thread id and state. */
@@ -285,10 +295,12 @@ export class GitHubPlatform implements Platform {
   // ---- check run -----------------------------------------------------------
 
   async startCheck(name: string, headSha: string): Promise<void> {
-    this.checkRunId = await openCheckRun(this.client, this.repo, name, headSha, {
+    const opened = await openCheckRun(this.client, this.repo, name, headSha, {
       now: this.now,
       ...(this.detailsUrl === undefined ? {} : { detailsUrl: this.detailsUrl }),
     });
+    this.checkRunId = opened.id;
+    this.app = opened.app;
   }
 
   async completeCheck(c: CheckRunCompletion): Promise<void> {
@@ -301,6 +313,8 @@ export class GitHubPlatform implements Platform {
     const r = await completeCheckRun(this.client, this.repo, completion, {
       onlyIfIncomplete: false,
       now: this.now,
+      // Again, in case the write straight after posting failed.
+      ...(this.posted?.headSha === headSha ? { externalId: this.posted.record } : {}),
       ...(this.checkRunId === undefined ? {} : { id: this.checkRunId }),
       ...(this.detailsUrl === undefined ? {} : { detailsUrl: this.detailsUrl }),
     });
@@ -387,16 +401,17 @@ export class GitHubPlatform implements Platform {
   private async createReview(review: ReviewPayload, warn: (w: string) => void): Promise<string[]> {
     if (review.event !== "COMMENT") throw new Error(`refusing review event ${String(review.event)}: the bot only comments (P-8, I-2 #8)`);
     const path = `${this.base}/pulls/${this.number}/reviews`;
-    const markerLine = review.body.split(/\r?\n/).find((l) => /^<!-- review-bot:summary .* -->$/.test(l.trim()))?.trim();
-    // A 5xx after GitHub created the review must not post a second one: look for this run's summary marker first.
-    const probe =
-      markerLine === undefined
-        ? undefined
-        : async () =>
-            (await this.client.paginate<ReviewJson>(path)).find(
-              (r) => r.user?.type === "Bot" && (r.body ?? "").split(/\r?\n/).some((l) => l.trim() === markerLine),
-            );
-    const post = (payload: ReviewPayload) => this.client.request<ReviewJson>("POST", path, { body: payload, ...(probe === undefined ? {} : { probe }) });
+    const postMarker = newPostMarker();
+    // A 5xx after GitHub created the review must not post a second one: look for this attempt's marker first.
+    const probe = async () =>
+      (await this.client.paginate<ReviewJson>(path)).find(
+        (r) => r.user?.type === "Bot" && (r.body ?? "").split(/\r?\n/).some((l) => l.trim() === postMarker),
+      );
+    const post = (payload: ReviewPayload) => {
+      const lines = payload.body.trimEnd().split("\n");
+      lines.splice(-1, 0, postMarker); // the summary marker stays last
+      return this.client.request<ReviewJson>("POST", path, { body: { ...payload, body: `${lines.join("\n")}\n` }, probe });
+    };
 
     let res;
     try {
@@ -409,6 +424,7 @@ export class GitHubPlatform implements Platform {
       res = await post(foldInlineComments(review));
     }
     const id = String(res.data.id);
+    await this.recordReview(id, review.commit_id, warn);
     const out = [id];
     try {
       const inline = await this.client.paginate<{ id: number }>(`${path}/${id}/comments`);
@@ -419,16 +435,25 @@ export class GitHubPlatform implements Platform {
     return out;
   }
 
-  /** The thread root with this id if it is this bot's own finding (Bot author + marker). */
-  private async ownRoot(id: string): Promise<PrComment | undefined> {
-    let c = this.comments?.find((x) => x.id === id && x.kind === "review-comment");
-    if (c === undefined) {
-      // Not seen at intake (or listComments not called): read again once.
-      const fresh = await this.client.get<ReviewCommentJson>(`${this.base}/pulls/comments/${encodeURIComponent(id)}`).catch(() => undefined);
-      if (fresh === undefined) return undefined;
-      c = reviewCommentOf(fresh);
+  /**
+   * D-5, H-50: what later runs take as proof that this review is the bot's.
+   * Written before anything else can fail, so a re-run posts nothing new (C-1).
+   */
+  private async recordReview(id: string, headSha: string, warn: (w: string) => void): Promise<void> {
+    this.posted = { headSha, record: reviewRecord(id) };
+    if (this.checkRunId === undefined) return; // completeCheck writes it
+    try {
+      await recordOnCheckRun(this.client, this.repo, this.checkRunId, this.posted.record);
+    } catch (e) {
+      warn(`review ${id} not yet recorded on the check run, retried when the check completes: ${message(e)}`);
     }
-    return isOwnFindingRoot(c, this.botId) ? c : undefined;
+  }
+
+  /** The thread root with this id if it is this bot's own finding (recorded review + marker). */
+  private async ownRoot(id: string): Promise<PrComment | undefined> {
+    const all = this.comments ?? (await this.listComments());
+    const c = all.find((x) => x.id === id && x.kind === "review-comment");
+    return c !== undefined && isOwnFindingRoot(c, this.botId) ? c : undefined;
   }
 
   private async reply(rootId: string, body: string): Promise<string> {

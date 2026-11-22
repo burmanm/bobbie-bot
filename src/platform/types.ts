@@ -11,7 +11,7 @@
 
 export interface Author {
   login: string;
-  /** GitHub user type: "Bot", "User", "Organization". Markers are trusted only from "Bot" (S-7). */
+  /** GitHub user type: "Bot", "User", "Organization". Only a "Bot" comment can be the bot's own (S-7). */
   type: string;
 }
 
@@ -48,6 +48,16 @@ export interface PrComment {
   startLine?: number;
   /** Review comments: id of the thread's first comment, for replies. */
   inReplyTo?: string;
+  /** For review: the commit it was made on, as GitHub reports it. */
+  commitId?: string;
+  /** For review-comment: the review it was posted with. */
+  reviewId?: string;
+  /**
+   * The bot id whose check run records this review, or the review this
+   * thread root was posted with. Set by the platform, never from the body.
+   * A marker is state only on such a comment (D-5, H-50).
+   */
+  recordedBy?: string;
   /** Thread roots: whether the thread is resolved, when known. */
   threadResolved?: boolean;
   createdAt?: string;

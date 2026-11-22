@@ -11,8 +11,12 @@
  * A check run can be updated only by the identity that created it (the
  * Actions app or the review App, C-5), so the gate job, the review job and
  * the always-run step must use the same identity.
+ *
+ * The run that posted a review also records its id in `external_id`
+ * (D-5, H-50; github-markers.ts). An update without that field keeps it.
  */
-import type { GitHubClient } from "./github-client.ts";
+import { GitHubApiError, type GitHubClient } from "./github-client.ts";
+import type { RecordingRun } from "./github-markers.ts";
 import type { CheckRunCompletion } from "./types.ts";
 
 export const CHECK_NAME_RE = /^ai-review\/[A-Za-z0-9][A-Za-z0-9._-]{0,40}$/;
@@ -21,14 +25,18 @@ const REPO_RE = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
 /** GitHub's limit on `output.summary`. */
 const SUMMARY_MAX = 65_535;
 const TITLE_MAX = 255;
+/** GitHub keeps at most 1000 runs of one name in a check suite. */
+const MAX_PAGES = 10;
 
 export interface CheckRunRef {
   id: number;
   status: string;
   conclusion: string | null;
+  /** Slug of the App that created it. */
+  app?: string;
 }
 
-interface CheckRunJson {
+interface CheckRunJson extends RecordingRun {
   id: number;
   name: string;
   status: string;
@@ -53,7 +61,39 @@ export async function findCheckRun(client: GitHubClient, repo: string, name: str
   );
   // Newest first; filter=latest already keeps one per app.
   const run = (res.check_runs ?? []).filter((r) => r.name === name).sort((a, b) => b.id - a.id)[0];
-  return run === undefined ? undefined : { id: run.id, status: run.status, conclusion: run.conclusion };
+  if (run === undefined) return undefined;
+  const ref: CheckRunRef = { id: run.id, status: run.status, conclusion: run.conclusion };
+  if (run.app?.slug !== undefined) ref.app = run.app.slug;
+  return ref;
+}
+
+/**
+ * Every check run with this name on a commit, to look up review records.
+ * None for a commit the repository does not have (any more).
+ */
+export async function listCheckRuns(client: GitHubClient, repo: string, name: string, sha: string): Promise<RecordingRun[]> {
+  validate(repo, name, sha);
+  const out: RecordingRun[] = [];
+  try {
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const res = await client.get<{ check_runs?: CheckRunJson[] }>(
+        `repos/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}&filter=all&per_page=100&page=${page}`,
+      );
+      const runs = res.check_runs ?? [];
+      out.push(...runs.filter((r) => r.name === name));
+      if (runs.length < 100) break;
+    }
+  } catch (e) {
+    // Anything else is thrown: guessing "no record" would post the review twice (C-1).
+    if (e instanceof GitHubApiError && (e.status === 404 || e.status === 422)) return [];
+    throw e;
+  }
+  return out;
+}
+
+/** Write the record of a posted review on this run's check. */
+export async function recordOnCheckRun(client: GitHubClient, repo: string, id: number, externalId: string): Promise<void> {
+  await client.request("PATCH", `repos/${repo}/check-runs/${id}`, { body: { external_id: externalId } });
 }
 
 export interface OpenCheckOptions {
@@ -64,9 +104,10 @@ export interface OpenCheckOptions {
 /**
  * S-1: the check in progress on the head SHA. An open run of the same name
  * (queued by the workflow, or left by a crashed attempt of this SHA) is
- * reused; otherwise a new one is created. Returns its id.
+ * reused; otherwise a new one is created. Returns its id and the App it
+ * belongs to, which is the identity this run acts as.
  */
-export async function openCheckRun(client: GitHubClient, repo: string, name: string, headSha: string, o: OpenCheckOptions = {}): Promise<number> {
+export async function openCheckRun(client: GitHubClient, repo: string, name: string, headSha: string, o: OpenCheckOptions = {}): Promise<{ id: number; app?: string }> {
   validate(repo, name, headSha);
   const now = (o.now ?? (() => new Date()))().toISOString();
   const existing = await findCheckRun(client, repo, name, headSha);
@@ -74,16 +115,20 @@ export async function openCheckRun(client: GitHubClient, repo: string, name: str
   if (o.detailsUrl !== undefined) body.details_url = o.detailsUrl;
   if (existing !== undefined && existing.status !== "completed") {
     await client.request("PATCH", `repos/${repo}/check-runs/${existing.id}`, { body });
-    return existing.id;
+    // Only its creator can update a check run, so its App is ours.
+    return { id: existing.id, ...(existing.app === undefined ? {} : { app: existing.app }) };
   }
   const created = await client.request<CheckRunJson>("POST", `repos/${repo}/check-runs`, {
     body: { name, head_sha: headSha, ...body },
     probe: async () => {
       const r = await findCheckRun(client, repo, name, headSha);
-      return r !== undefined && r.status !== "completed" && r.id !== existing?.id ? ({ id: r.id, name, status: r.status, conclusion: r.conclusion } as CheckRunJson) : undefined;
+      return r !== undefined && r.status !== "completed" && r.id !== existing?.id
+        ? ({ id: r.id, name, status: r.status, conclusion: r.conclusion, ...(r.app === undefined ? {} : { app: { slug: r.app } }) } as CheckRunJson)
+        : undefined;
     },
   });
-  return created.data.id;
+  const app = created.data.app?.slug;
+  return { id: created.data.id, ...(app === undefined ? {} : { app }) };
 }
 
 export interface CompleteCheckOptions {
@@ -94,6 +139,8 @@ export interface CompleteCheckOptions {
    * always-run step must not overwrite the conclusion the pipeline set.
    */
   onlyIfIncomplete?: boolean;
+  /** The record of the review this run posted. Left out, the run keeps what it has. */
+  externalId?: string;
   detailsUrl?: string;
   now?: () => Date;
 }
@@ -120,6 +167,7 @@ export async function completeCheckRun(
     output: { title: clip(c.title.replace(/\s+/g, " ").trim() || c.conclusion, TITLE_MAX), summary: clip(c.summary || c.title, SUMMARY_MAX) },
   };
   if (o.detailsUrl !== undefined) body.details_url = o.detailsUrl;
+  if (o.externalId !== undefined) body.external_id = o.externalId;
 
   let id = o.id;
   if (id === undefined) {

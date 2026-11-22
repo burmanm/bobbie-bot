@@ -106,7 +106,7 @@ not Bot-authored and it cannot create check runs.
 |---|---|---|
 | Setup | none | an App per organization, installed on the repository |
 | Posts as | `github-actions[bot]` | the App's own name |
-| Recognises its own comments | by hidden marker | by hidden marker |
+| Recognises its own comments | by hidden marker and the review ID on its check run | by hidden marker and the review ID on its check run |
 | Check run owner | the Actions app | the App |
 
 To use an App:

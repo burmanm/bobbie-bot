@@ -1,11 +1,11 @@
 /**
  * Prior state (S-1, D-5): what earlier runs of this bot left on the PR,
- * recovered from hidden markers. A marker counts only on a comment by a
- * Bot-type author (core `decodeMarker` proves the text well formed; the
- * author check is ours). The bot's comments are recognised by marker, not
- * by login, because the Actions login is shared (S-7, C-5).
+ * recovered from hidden markers. A marker counts only on a comment the
+ * platform found recorded for this bot (`recordedBy`; H-50, S-7, C-5): core
+ * decoding proves the text well formed, and neither the login nor the
+ * author type proves who wrote it. Everything else is someone else's comment.
  */
-import { decodeMarker } from "../core/index.ts";
+import { decodeMarker, decodeOwnMarker } from "../core/index.ts";
 import type { PrComment } from "../platform/index.ts";
 
 export const OUTCOME_PREFIXES = ["wrong", "intentional", "not-worth-it"] as const;
@@ -59,12 +59,12 @@ export function derivePriorState(comments: readonly PrComment[], botId: string):
 
   comments.forEach((c, index) => {
     if (c.kind === "review" || c.kind === "issue-comment") {
-      const m = isBot(c) ? decodeMarker(c.body, "summary", botId) : undefined;
+      const m = c.recordedBy === botId ? decodeOwnMarker(c.body, "summary", botId) : undefined;
       if (m) summaries.push({ sha: m.sha, run: m.run, at: c.createdAt ?? "", index });
       return;
     }
     if (c.inReplyTo !== undefined) return;
-    const m = isBot(c) ? decodeMarker(c.body, "finding", botId) : undefined;
+    const m = c.recordedBy === botId ? decodeOwnMarker(c.body, "finding", botId) : undefined;
     if (!m) {
       state.othersInline.push(c);
       return;

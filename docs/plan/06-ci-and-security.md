@@ -193,7 +193,7 @@ decided):
 |---|---|---|
 | Review, comments, check runs | yes | yes |
 | Posts as a Bot-type author (state workflow needs this) | yes, own name | yes, as `github-actions[bot]` |
-| Recognising own comments | by marker | by marker (the login is shared with other workflows) |
+| Recognising own comments | by marker and check-run record ([S-7](03-review-pipeline.md#s-7--publish)) | by marker and check-run record (the login is shared with other workflows, so any that has `checks: write` could also write a record) |
 | Learn job opening PRs | yes, and CI runs on them | Only if the repository allows Actions to create PRs; CI does **not** run on PRs it opens. Otherwise the learn job stays report-only |
 | Setup | App per organization | none |
 

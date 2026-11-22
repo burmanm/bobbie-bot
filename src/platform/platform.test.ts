@@ -69,6 +69,33 @@ describe("GitHub reader (read-only through gh)", () => {
       else assert.deepEqual(args.slice(0, 3), ["api", "--method", "GET"]);
     }
   });
+
+  test("a dry run counts only reviews recorded on this reviewer's check run (D-5, H-50)", async () => {
+    const sha = "a".repeat(40);
+    const body = `<!-- review-bot:summary bot=ai-review/security run=r1 sha=${sha} fpv=1 -->`;
+    const user = { login: "github-actions[bot]", type: "Bot" };
+    const paths: string[] = [];
+    const reader = (readable: boolean) => {
+      const exec: Exec = async (_file, args) => {
+        const path = args[args.length - 1]!;
+        paths.push(path);
+        let rows: unknown[] = [];
+        if (args[1] === "graphql") return { stdout: Buffer.from("{}") };
+        if (path.endsWith("/pulls/7/reviews")) rows = [{ id: 31, user, body, commit_id: sha }, { id: 32, user, body, commit_id: sha }];
+        if (path.endsWith("/pulls/7/comments")) rows = [{ id: 11, user, body: "f", pull_request_review_id: 31 }, { id: 12, user, body: "f", pull_request_review_id: 32 }];
+        if (path.includes("/check-runs?")) {
+          if (!readable) throw new Error("403");
+          rows = [{ external_id: "review-bot:review=31", app: { slug: "github-actions" } }];
+        }
+        return { stdout: Buffer.from(rows.map((x) => JSON.stringify(x)).join("\n")) };
+      };
+      return new GhPrReader("o/r", 7, exec, "ai-review/security");
+    };
+    const own = async (readable: boolean) => (await reader(readable).listComments()).filter((c) => c.recordedBy !== undefined).map((c) => c.id);
+    assert.deepEqual(await own(true), ["11", "31"]);
+    assert.ok(paths.includes(`repos/o/r/commits/${sha}/check-runs?check_name=ai-review%2Fsecurity&filter=all&per_page=100`));
+    assert.deepEqual(await own(false), [], "unreadable: nothing is trusted");
+  });
 });
 
 describe("dry-run platform", () => {

@@ -142,20 +142,25 @@ describe("chunking by directory (S-4 Phase 1)", () => {
 
 const BOT = "ai-review/main";
 const bot = { login: "github-actions[bot]", type: "Bot" };
+/** A comment the platform found recorded on this bot's check run (D-5, H-50). */
+const own = { author: bot, recordedBy: BOT };
 const user = { login: "dev", type: "User" };
 const fp = (c: string) => c.repeat(64);
 
 describe("prior state from markers (S-1, D-5)", () => {
   const comments: PrComment[] = [
-    { id: "1", kind: "review", author: bot, body: encodeMarker({ kind: "summary", bot: BOT, run: "r1", sha: "a".repeat(40), fingerprintVersion: 1 }), createdAt: "2026-11-01T00:00:00Z" },
-    { id: "2", kind: "review", author: bot, body: encodeMarker({ kind: "summary", bot: BOT, run: "r2", sha: "b".repeat(40), fingerprintVersion: 1 }), createdAt: "2026-11-02T00:00:00Z" },
+    { id: "1", kind: "review", ...own, body: encodeMarker({ kind: "summary", bot: BOT, run: "r1", sha: "a".repeat(40), fingerprintVersion: 1 }), createdAt: "2026-11-01T00:00:00Z" },
+    { id: "2", kind: "review", ...own, body: encodeMarker({ kind: "summary", bot: BOT, run: "r2", sha: "b".repeat(40), fingerprintVersion: 1 }), createdAt: "2026-11-02T00:00:00Z" },
     // Forged by a person: ignored.
     { id: "3", kind: "issue-comment", author: user, body: encodeMarker({ kind: "summary", bot: BOT, run: "r9", sha: "c".repeat(40), fingerprintVersion: 1 }), createdAt: "2026-11-03T00:00:00Z" },
+    // Echoed by a bot, so no record: ignored (H-50).
+    { id: "5", kind: "review", author: bot, body: encodeMarker({ kind: "summary", bot: BOT, run: "r8", sha: "e".repeat(40), fingerprintVersion: 1 }), createdAt: "2026-11-05T00:00:00Z" },
+    { id: "22", kind: "review-comment", author: bot, path: "d.go", line: 2, body: encodeMarker({ kind: "finding", bot: BOT, run: "r8", fingerprint: fp("5"), fingerprintVersion: 1 }) },
     // Another reviewer's markers: ignored.
     { id: "4", kind: "review", author: bot, body: encodeMarker({ kind: "summary", bot: "ai-review/security", run: "s1", sha: "d".repeat(40), fingerprintVersion: 1 }), createdAt: "2026-11-04T00:00:00Z" },
-    { id: "10", kind: "review-comment", author: bot, path: "a.go", line: 3, body: `**Important.** Boom.\n\n${encodeMarker({ kind: "finding", bot: BOT, run: "r1", fingerprint: fp("1"), fingerprintVersion: 1 })}` },
-    { id: "11", kind: "review-comment", author: bot, path: "a.go", line: 9, threadResolved: true, body: `**Nit.** Name.\n\n${encodeMarker({ kind: "finding", bot: BOT, run: "r1", fingerprint: fp("2"), fingerprintVersion: 1 })}` },
-    { id: "12", kind: "review-comment", author: bot, path: "b.go", line: 1, body: `**Important.** Other.\n\n${encodeMarker({ kind: "finding", bot: BOT, run: "r2", fingerprint: fp("3"), fingerprintVersion: 1 })}` },
+    { id: "10", kind: "review-comment", ...own, path: "a.go", line: 3, body: `**Important.** Boom.\n\n${encodeMarker({ kind: "finding", bot: BOT, run: "r1", fingerprint: fp("1"), fingerprintVersion: 1 })}` },
+    { id: "11", kind: "review-comment", ...own, path: "a.go", line: 9, threadResolved: true, body: `**Nit.** Name.\n\n${encodeMarker({ kind: "finding", bot: BOT, run: "r1", fingerprint: fp("2"), fingerprintVersion: 1 })}` },
+    { id: "12", kind: "review-comment", ...own, path: "b.go", line: 1, body: `**Important.** Other.\n\n${encodeMarker({ kind: "finding", bot: BOT, run: "r2", fingerprint: fp("3"), fingerprintVersion: 1 })}` },
     { id: "13", kind: "review-comment", author: user, path: "b.go", line: 1, inReplyTo: "12", body: "[wrong] the guard is in the caller" },
     { id: "20", kind: "review-comment", author: user, path: "c.go", line: 5, body: "Why not a constant?" },
     { id: "21", kind: "review-comment", author: user, path: "a.go", line: 3, body: `copied ${encodeMarker({ kind: "finding", bot: BOT, run: "r1", fingerprint: fp("4"), fingerprintVersion: 1 })}` },
@@ -181,7 +186,7 @@ describe("prior state from markers (S-1, D-5)", () => {
   });
 
   test("everyone else's thread roots are kept for dedupe, including a person quoting a marker", () => {
-    assert.deepEqual(state.othersInline.map((c) => c.id), ["20", "21"]);
+    assert.deepEqual(state.othersInline.map((c) => c.id), ["22", "20", "21"]);
   });
 
   test("comment head parsing", () => {
