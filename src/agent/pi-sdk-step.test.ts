@@ -1,12 +1,15 @@
 /**
- * The SDK step's limits, outcomes and output handling, run against pi's
- * scripted ("faux") model: no network, no key (AGENTS.md).
+ * The SDK step's limits, outcomes, output handling, working directory and
+ * environment (C-3a), run against pi's scripted ("faux") model: no network,
+ * no key (AGENTS.md).
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
+import { ExtensionRunner, SessionManager } from "@earendil-works/pi-coding-agent";
 import {
   fauxAssistantMessage,
   type FauxResponseStep,
@@ -14,8 +17,8 @@ import {
   fauxText,
   fauxToolCall,
 } from "@earendil-works/pi-ai";
-import { createPiSdkAgentStep } from "./pi-sdk-step.ts";
-import { noteTool, toolResultsIn } from "./testing.ts";
+import { createPiSdkAgentStep, requireExplicitBareRepository } from "./pi-sdk-step.ts";
+import { noteTool, PLAIN_GIT_ENV, setEnv, toolResultsIn, withTestExtension, workingDirectoryModule } from "./testing.ts";
 import type { AgentStepRequest, StepProgress } from "./types.ts";
 
 let head: string;
@@ -266,6 +269,158 @@ describe("configuration errors fail before any model call", () => {
       await configError({ readTools: ["read", "grep"] }, /ripgrep \(rg\) is not installed/);
     } finally {
       process.env.PATH = saved;
+    }
+  });
+});
+
+describe("working directory (C-3a, D-15)", () => {
+  test("each step gets its own, removed whether the step ends well or not", async () => {
+    const endings: Array<[FauxResponseStep, string]> = [
+      [fauxAssistantMessage(fauxText("DONE")), "ok"],
+      [fauxAssistantMessage([], { stopReason: "error", errorMessage: "HTTP 500" }), "error"],
+      [hang(), "timeout"],
+    ];
+    const seen: string[] = [];
+    for (const [response, outcome] of endings) {
+      const module = workingDirectoryModule();
+      const { step, request } = setup([response]);
+      const limits = { timeoutMs: outcome === "timeout" ? 500 : 20_000, maxTurns: 3 };
+      const result = await withTestExtension(module.factory, () => step.run(request({ limits })));
+      assert.equal(result.outcome, outcome, JSON.stringify(result.error));
+      const cwd = module.saw.cwds.get("ctx.cwd")!;
+      assert.ok(cwd, "the module did not run");
+      assert.ok(!existsSync(cwd), `${cwd} was not removed`);
+      seen.push(cwd);
+    }
+    assert.equal(new Set(seen).size, endings.length);
+  });
+
+  describe("the live invariant: a cwd inside a read root stops the step before extensions start and before any model call", () => {
+    const faults = {
+      "session manager": () => {
+        const saved = SessionManager.prototype.getCwd;
+        SessionManager.prototype.getCwd = () => head;
+        return () => void (SessionManager.prototype.getCwd = saved);
+      },
+      "extension context": () => {
+        const saved = ExtensionRunner.prototype.createContext;
+        ExtensionRunner.prototype.createContext = function () {
+          return Object.create(saved.call(this), { cwd: { value: head } });
+        };
+        return () => void (ExtensionRunner.prototype.createContext = saved);
+      },
+    };
+    for (const [name, inject] of Object.entries(faults)) {
+      test(name, async () => {
+        const module = workingDirectoryModule();
+        const { faux, step, request } = setup([fauxAssistantMessage(fauxText("DONE"))]);
+        const restore = inject();
+        try {
+          const result = await withTestExtension(module.factory, () => step.run(request()));
+          assert.equal(result.error?.kind, "internal", JSON.stringify(result.error));
+          assert.match(result.error.message, /^isolation: the working directory/);
+          assert.equal(module.saw.entries, undefined, "session_start ran");
+          assert.equal(faux.state.callCount, 0);
+        } finally {
+          restore();
+        }
+      });
+    }
+  });
+
+  describe("an unsafe temporary directory is a configuration error, and nothing is written in it", () => {
+    const refused = async (temp: string, roots: { head: string }, pattern: RegExp) => {
+      const { faux, step, request } = setup([fauxAssistantMessage(fauxText("DONE"))]);
+      const entries = readdirSync(temp);
+      const restore = setEnv({ TMPDIR: temp });
+      try {
+        const result = await step.run(request({ roots }));
+        assert.equal(result.error?.kind, "config", JSON.stringify(result.error));
+        assert.match(result.error.message, pattern);
+        assert.deepEqual(readdirSync(temp), entries);
+        assert.equal(faux.state.callCount, 0);
+      } finally {
+        restore();
+      }
+    };
+    const scratch = async (body: (dir: string) => Promise<void>) => {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "review-bot-temp-")));
+      try {
+        await body(dir);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+
+    test("inside a read root, also through a symlink", () =>
+      scratch(async (dir) => {
+        const root = join(dir, "root");
+        mkdirSync(join(root, "sub"), { recursive: true });
+        symlinkSync(join(root, "sub"), join(dir, "link"));
+        await refused(root, { head: root }, /inside a read root/);
+        await refused(join(dir, "link"), { head: root }, /inside a read root/);
+      }));
+
+    for (const name of [".git", "AGENTS.md", "AGENTS.override.md", "CLAUDE.md"]) {
+      test(`with ${name} above it`, () =>
+        scratch(async (dir) => {
+          writeFileSync(join(dir, name), "");
+          mkdirSync(join(dir, "tmp"));
+          await refused(join(dir, "tmp"), { head }, /is not isolated/);
+        }));
+    }
+  });
+});
+
+describe("git's environment (C-3a)", () => {
+  test("appends to the entries already there, once", () => {
+    const env: NodeJS.ProcessEnv = { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "user.name", GIT_CONFIG_VALUE_0: "Someone" };
+    const expected = { ...env, GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_1: "safe.bareRepository", GIT_CONFIG_VALUE_1: "explicit" };
+    requireExplicitBareRepository(env);
+    assert.deepEqual(env, expected);
+    requireExplicitBareRepository(env);
+    assert.deepEqual(env, expected);
+  });
+
+  test("starts from no count and from an empty one", () => {
+    for (const env of [{}, { GIT_CONFIG_COUNT: "" }] as NodeJS.ProcessEnv[]) {
+      requireExplicitBareRepository(env);
+      assert.deepEqual(env, { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "safe.bareRepository", GIT_CONFIG_VALUE_0: "explicit" });
+    }
+  });
+
+  test("a step keeps the existing entries, and wins over an earlier weaker one, as git reads them", async () => {
+    const restore = setEnv({
+      ...PLAIN_GIT_ENV,
+      GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_KEY_0: "reviewbot.kept",
+      GIT_CONFIG_VALUE_0: "yes",
+      GIT_CONFIG_KEY_1: "safe.bareRepository",
+      GIT_CONFIG_VALUE_1: "all",
+      GIT_CONFIG_KEY_2: undefined,
+      GIT_CONFIG_VALUE_2: undefined,
+    });
+    try {
+      const { step, request } = setup([fauxAssistantMessage(fauxText("DONE"))]);
+      assert.equal((await step.run(request())).outcome, "ok");
+      const get = (key: string) => execFileSync("git", ["config", "--get", key], { cwd: head, encoding: "utf8" }).trim();
+      assert.equal(get("reviewbot.kept"), "yes");
+      assert.equal(get("safe.bareRepository"), "explicit");
+    } finally {
+      restore();
+    }
+  });
+
+  test("a count git cannot read is a configuration error", async () => {
+    const restore = setEnv({ GIT_CONFIG_COUNT: "two" });
+    try {
+      const { faux, step, request } = setup([fauxAssistantMessage(fauxText("DONE"))]);
+      const result = await step.run(request());
+      assert.equal(result.error?.kind, "config");
+      assert.match(result.error.message, /GIT_CONFIG_COUNT/);
+      assert.equal(faux.state.callCount, 0);
+    } finally {
+      restore();
     }
   });
 });

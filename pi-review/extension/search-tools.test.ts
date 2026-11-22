@@ -34,16 +34,21 @@ before(() => {
   writeFileSync(join(head, ".hidden.go"), "package main // NEEDLE hidden\n");
   writeFileSync(join(work, "outside.go"), "package x // NEEDLE outside\n");
   symlinkSync(work, join(head, "up"));
+  // The session's cwd (C-3a): outside the root. The decoys would show up if
+  // a search resolved a path against it.
+  mkdirSync(join(work, "cwd", "src", "deep"), { recursive: true });
+  writeFileSync(join(work, "cwd", "decoy.go"), "package x // NEEDLE decoy outside\n");
+  writeFileSync(join(work, "cwd", "src", "deep", "decoy.go"), "package x // NEEDLE decoy outside\n");
   roots = new AllowedRoots([head]);
 });
 
 after(() => rmSync(work, { recursive: true, force: true }));
 
 const text = (r: { content: Array<{ type: string; text?: string }> }) => r.content.map((c) => c.text ?? "").join("");
-const ctx = () => ({ cwd: roots.roots[0]! }) as never;
+const ctx = () => ({ cwd: join(work, "cwd") }) as never;
 
 describe("grep", { skip: skipRg }, () => {
-  const grep = () => createSearchGrepTool(roots.roots[0]!, roots);
+  const grep = () => createSearchGrepTool(roots);
 
   test("finds matches in ignored, hidden and vendored files", async () => {
     const out = text(await grep().execute("1", { pattern: "NEEDLE" }, undefined, undefined, ctx()));
@@ -84,7 +89,7 @@ describe("grep", { skip: skipRg }, () => {
 });
 
 describe("find", { skip: skipRg }, () => {
-  const find = () => createSearchFindTool(roots.roots[0]!, roots);
+  const find = () => createSearchFindTool(roots);
   const lines = async (args: { pattern: string; path?: string; limit?: number }) =>
     text(await find().execute("1", args, undefined, undefined, ctx())).split("\n");
 
@@ -115,12 +120,12 @@ describe("find", { skip: skipRg }, () => {
 
 describe("rg availability", () => {
   test("a missing rg is a clear error, not a download", async () => {
-    const grep = createSearchGrepTool(roots.roots[0]!, roots);
+    const grep = createSearchGrepTool(roots);
     const saved = process.env.PATH;
     process.env.PATH = "";
     try {
       await assert.rejects(grep.execute("1", { pattern: "x" }, undefined, undefined, ctx()), (e: Error) => e.message === RG_MISSING);
-      const find = createSearchFindTool(roots.roots[0]!, roots);
+      const find = createSearchFindTool(roots);
       await assert.rejects(find.execute("1", { pattern: "*" }, undefined, undefined, ctx()), (e: Error) => e.message === RG_MISSING);
     } finally {
       process.env.PATH = saved;

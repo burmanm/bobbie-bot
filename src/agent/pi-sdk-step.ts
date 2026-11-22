@@ -1,15 +1,17 @@
 /**
  * `AgentStep` on the pi SDK (F-3, D-2): one short-lived `createAgentSession`
  * per step, isolated as C-3a requires, with our extension passed in-process
- * (Q-15). Limits are enforced by counting events and calling
- * `session.abort()`; pi has no turn cap, step timeout or spend cap.
+ * (Q-15). Its working directory is an empty directory of the step's own,
+ * never the snapshot (D-15, D-19). Limits are enforced by counting events
+ * and calling `session.abort()`; pi has no turn cap, step timeout or spend
+ * cap.
  *
  * The provider API key comes from the environment only (C-5). This module
  * never reads, stores or logs it.
  */
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   type AgentSession,
   type AgentSessionEvent,
@@ -22,6 +24,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Value } from "typebox/value";
 import {
+  AllowedRoots,
   createReviewExtension,
   EXTENSION_NAME,
   findExecutable,
@@ -64,20 +67,65 @@ export interface PiSdkAgentStepOptions {
 const DEFAULT_RETRY = { enabled: true, maxRetries: 2, baseDelayMs: 1000 };
 const TOOL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+/** A `.git` entry, or a context file pi would pick up walking to the filesystem root (C-3a). */
+const FORBIDDEN_ABOVE_CWD = [".git", "AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
+
+/**
+ * Where the step may create its directories: the temporary directory, as
+ * long as it is outside every read root and has no `.git` entry or context
+ * file in it or above it (C-3a). Checked before anything is created there.
+ */
+function safeTempDir(roots: AllowedRoots): string {
+  const dir = realpathSync(tmpdir());
+  if (roots.contains(dir)) {
+    throw new ConfigError(`the temporary directory ${dir} is inside a read root (C-3a); set TMPDIR to another directory`);
+  }
+  for (let current = dir; ; current = dirname(current)) {
+    for (const name of FORBIDDEN_ABOVE_CWD) {
+      if (existsSync(join(current, name))) {
+        throw new ConfigError(
+          `the temporary directory ${dir} is not isolated: ${join(current, name)} exists (C-3a); set TMPDIR to a directory with no .git or context files above it`,
+        );
+      }
+    }
+    if (current === dirname(current)) return dir;
+  }
+}
+
+/**
+ * Append `safe.bareRepository=explicit` to git's environment configuration
+ * (C-3a), so git started inside an embedded bare repository of the PR refuses
+ * it instead of running its `core.fsmonitor`. The last entry wins in git, so
+ * it is appended unless it already is last; existing entries are kept.
+ */
+export function requireExplicitBareRepository(env: NodeJS.ProcessEnv): void {
+  const raw = env.GIT_CONFIG_COUNT || "0";
+  if (!/^\d+$/.test(raw)) throw new ConfigError(`GIT_CONFIG_COUNT is not a number: ${raw}`);
+  const count = Number(raw);
+  const key = "safe.bareRepository";
+  const value = "explicit";
+  if (count > 0 && env[`GIT_CONFIG_KEY_${count - 1}`] === key && env[`GIT_CONFIG_VALUE_${count - 1}`] === value) return;
+  env[`GIT_CONFIG_KEY_${count}`] = key;
+  env[`GIT_CONFIG_VALUE_${count}`] = value;
+  env.GIT_CONFIG_COUNT = String(count + 1);
+}
+
 let processAgentDir: string | undefined;
 
 /**
- * Process-wide pi environment (C-3a). Read by pi at call time, so it is set
- * before every step:
+ * Process-wide environment (C-3a), inherited by whatever the process spawns.
+ * pi reads its part at call time, so it is set before every step:
  * - `PI_OFFLINE=1`: no catalog refresh, no download of `rg`/`fd`.
  * - `PI_CODING_AGENT_DIR`: a private, empty directory, so any pi code path
  *   that falls back to the default agent directory never reaches
  *   `~/.pi/agent` (extensions, auth.json, settings, AGENTS.md). Each step
  *   also gets its own agent directory, passed explicitly.
+ * - git's `safe.bareRepository=explicit`.
  */
-function preparePiEnvironment(): void {
+function preparePiEnvironment(temp: string): void {
+  requireExplicitBareRepository(process.env);
   if (processAgentDir === undefined) {
-    processAgentDir = realpathSync(mkdtempSync(join(tmpdir(), "review-bot-pi-")));
+    processAgentDir = mkdtempSync(join(temp, "review-bot-pi-"));
   }
   process.env.PI_CODING_AGENT_DIR = processAgentDir;
   process.env.PI_OFFLINE = "1";
@@ -122,11 +170,11 @@ function validateRequest(request: AgentStepRequest<OutputTool>, options: PiSdkAg
 
 function composeSystemPrompt(request: AgentStepRequest<OutputTool>): string {
   const { head, base, modcache, inputs } = request.roots;
-  const lines = [`head: ${head} (working directory; relative paths resolve here)`];
+  const lines = [`head: ${head} (relative paths, and omitted ones, resolve here)`];
   if (base !== undefined) lines.push(`base: ${base}`);
   if (modcache !== undefined) lines.push(`modcache: ${modcache}`);
   if (inputs !== undefined) lines.push(`inputs: ${inputs} (review inputs prepared for you, not part of the repository)`);
-  return `${request.systemPrompt}\n\n<read_roots>\nThe read tools can reach only these directories. Use absolute paths for any root other than head.\n${lines.join("\n")}\n</read_roots>`;
+  return `${request.systemPrompt}\n\n<read_roots>\nThe read tools (read, ls, grep, find) can reach only these directories. Give paths in head relative to head, and use absolute paths for any other root.\n${lines.join("\n")}\n</read_roots>`;
 }
 
 function emptyResult<T extends OutputTool>(): AgentStepResult<T> {
@@ -180,11 +228,17 @@ async function runStep<T extends OutputTool>(
   }
 
   let agentDir: string | undefined;
+  let cwd: string | undefined;
   let session: AgentSession | undefined;
   try {
     validateRequest(request, options);
-    preparePiEnvironment();
-    agentDir = realpathSync(mkdtempSync(join(tmpdir(), "review-bot-agent-")));
+    const roots = new AllowedRoots(rootList(request));
+    const temp = safeTempDir(roots);
+    preparePiEnvironment(temp);
+    agentDir = mkdtempSync(join(temp, "review-bot-agent-"));
+    // C-3a, D-15: empty and the step's own, so neither a module nor a program
+    // it starts finds configuration from the PR in its working directory.
+    cwd = mkdtempSync(join(temp, "review-bot-cwd-"));
 
     // Model runtime: credentials file in the private, empty agent dir;
     // models.json not read; the API key comes from the environment.
@@ -223,11 +277,9 @@ async function runStep<T extends OutputTool>(
       throw new ConfigError(`no credentials for provider "${request.model.provider}"; set its API key in the environment`);
     }
 
-    const roots = rootList(request);
-    const head = realpathSync(request.roots.head);
     const guardRejections = new Map<string, GuardRejection>();
     const extension = createReviewExtension({
-      roots,
+      roots: roots.roots,
       readTools: request.readTools,
       outputTools: request.outputTools,
       ...(request.queryTools === undefined ? {} : { queryTools: request.queryTools }),
@@ -248,7 +300,7 @@ async function runStep<T extends OutputTool>(
       { projectTrusted: false },
     );
     const resourceLoader = new DefaultResourceLoader({
-      cwd: head,
+      cwd,
       agentDir,
       settingsManager,
       noExtensions: true,
@@ -272,17 +324,24 @@ async function runStep<T extends OutputTool>(
       ]),
     ];
     const created = await createAgentSession({
-      cwd: head,
+      cwd,
       agentDir,
       modelRuntime,
       model,
       thinkingLevel: request.model.thinkingLevel ?? "off",
       tools: allowlist,
-      sessionManager: SessionManager.inMemory(head),
+      sessionManager: SessionManager.inMemory(cwd),
       settingsManager,
       resourceLoader,
     });
     session = created.session;
+    // Isolation invariant (C-3a), checked before extensions get session_start:
+    // the directory the session and its extensions work in is ours.
+    for (const live of [session.sessionManager.getCwd(), session.extensionRunner.createContext().cwd]) {
+      if (live !== cwd || roots.contains(realpathSync(live))) {
+        return fail("internal", `isolation: the working directory ${live} is not the step's own directory outside the read roots`);
+      }
+    }
     await session.bindExtensions({ mode: "json" });
 
     result.harness.extensions = created.extensionsResult.extensions.map((e) => e.path);
@@ -310,7 +369,14 @@ async function runStep<T extends OutputTool>(
     return fail(error instanceof ConfigError || /^read root/.test(message) ? "config" : "internal", message);
   } finally {
     session?.dispose();
-    if (agentDir !== undefined) rmSync(agentDir, { recursive: true, force: true });
+    for (const dir of [agentDir, cwd]) {
+      if (dir === undefined) continue;
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // `run` never throws (types.ts). What a tool made unremovable is left in the temporary directory.
+      }
+    }
   }
 }
 

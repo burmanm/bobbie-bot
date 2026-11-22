@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
-import { checkToolCall } from "./guard.ts";
+import { checkToolCall, createToolCallGuard } from "./guard.ts";
 import { AllowedRoots } from "./paths.ts";
 
 let work: string;
@@ -106,21 +106,29 @@ describe("AllowedRoots construction", () => {
 });
 
 describe("checkToolCall", () => {
-  const options = () => ({ allowedTools: new Set(["read", "grep", "report_x"]), roots, cwd: roots.roots[0]! });
+  const options = () => ({ allowedTools: new Set(["read", "grep", "report_x"]), roots });
   const call = (toolName: string, input: Record<string, unknown>, parentToolCallId?: string) =>
     ({ type: "tool_call", toolCallId: "1", toolName, input, ...(parentToolCallId ? { parentToolCallId } : {}) }) as never;
 
   test("allowlist", () => {
-    assert.match(checkToolCall(call("bash", { command: "id" }), head, options()) ?? "", /not on this step's allowlist/);
-    assert.match(checkToolCall(call("ls", {}), head, options()) ?? "", /not on this step's allowlist/);
-    assert.equal(checkToolCall(call("report_x", { path: "/etc/passwd" }), head, options()), undefined);
+    assert.match(checkToolCall(call("bash", { command: "id" }), options()) ?? "", /not on this step's allowlist/);
+    assert.match(checkToolCall(call("ls", {}), options()) ?? "", /not on this step's allowlist/);
+    assert.equal(checkToolCall(call("report_x", { path: "/etc/passwd" }), options()), undefined);
   });
   test("path arguments", () => {
-    assert.equal(checkToolCall(call("grep", { pattern: "x" }), head, options()), undefined);
-    assert.match(checkToolCall(call("read", {}), head, options()) ?? "", /path must be a string/);
-    assert.match(checkToolCall(call("grep", { pattern: "x", path: ".." }), head, options()) ?? "", /outside/);
+    assert.equal(checkToolCall(call("grep", { pattern: "x" }), options()), undefined);
+    assert.match(checkToolCall(call("read", {}), options()) ?? "", /path must be a string/);
+    assert.match(checkToolCall(call("grep", { pattern: "x", path: ".." }), options()) ?? "", /outside/);
+  });
+  test("relative paths are judged against head, whatever the session's cwd is (C-3a)", () => {
+    // Judged against the neutral cwd this is rejected: the trap of R-1a step 1.
+    assert.equal(roots.check("a.txt", join(work, "cwd")).ok, false);
+    assert.equal(roots.head, realpathSync(head));
+    const guard = createToolCallGuard(options());
+    assert.equal(guard(call("read", { path: "a.txt" })), undefined);
+    assert.equal(guard(call("read", { path: "../secret.txt" }))?.block, true);
   });
   test("nested calls are refused", () => {
-    assert.match(checkToolCall(call("read", { path: "a.txt" }, "p"), head, options()) ?? "", /from another tool/);
+    assert.match(checkToolCall(call("read", { path: "a.txt" }, "p"), options()) ?? "", /from another tool/);
   });
 });

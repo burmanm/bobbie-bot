@@ -2,9 +2,11 @@
  * Test helpers: a hostile snapshot for the C-3a isolation regression test,
  * and scripted-model plumbing. Not used outside tests.
  */
-import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { DefaultResourceLoader, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { OutputTool } from "./types.ts";
 
@@ -51,7 +53,22 @@ export interface HostileLayout {
   home: string;
   /** Written by any planted extension that runs. */
   plantedRanFile: string;
+  /** Written by the working-directory payloads, if their commands run. */
+  payloadRan: PayloadMarkers;
 }
+
+/** The files the working-directory payloads write (R-1a step 1). All in the test's temporary directory. */
+export interface PayloadMarkers {
+  /** The command in `<head>/.tool.json`. */
+  toolConfig: string;
+  /** `core.fsmonitor` of the bare repository committed at the root of head. */
+  rootRepo: string;
+  /** The same in a subdirectory (`NESTED_REPO`). */
+  nestedRepo: string;
+}
+
+/** Where the second embedded bare repository is, relative to head. */
+export const NESTED_REPO = join("third_party", "lib");
 
 function write(path: string, content: string | Buffer): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -84,7 +101,8 @@ export default function (pi: any) {
  *   runner/head/                   the snapshot: hostile .pi/, .agents/,
  *                                  AGENTS.md, CLAUDE.md, a .git entry,
  *                                  .gitignore/.ignore/.rgignore hiding files,
- *                                  escaping symlinks
+ *                                  escaping symlinks, a .tool.json with a
+ *                                  command, embedded bare git repositories
  *   runner/base/, runner/modcache/ further read roots
  *   user-agent/, home/             hostile user-level pi configuration
  */
@@ -133,6 +151,7 @@ export function buildHostileSnapshot(): HostileLayout {
   symlinkSync(outsideSecret, join(head, "escape-link"));
   symlinkSync(outsideDir, join(head, "escape-dir"));
   symlinkSync("main.go", join(head, "inside-link"));
+  const payloadRan = plantCwdPayloads(head, work);
 
   write(join(base, "main.go"), `package main\n\n// ${MARKERS.base}\n`);
   symlinkSync(outsideSecret, join(base, "base-escape"));
@@ -152,7 +171,133 @@ export function buildHostileSnapshot(): HostileLayout {
     `---\nname: home\ndescription: ${CANARIES.homeAgentsSkill}\n---\n${CANARIES.homeAgentsSkill}\n`,
   );
 
-  return { work, outsideSecret, outsideDir, head, base, modcache, userAgentDir, home, plantedRanFile };
+  return { work, outsideSecret, outsideDir, head, base, modcache, userAgentDir, home, plantedRanFile, payloadRan };
+}
+
+/**
+ * What a PR can commit to take over a program that runs in its tree (C-3,
+ * D-19): a tool config with a command, and embedded bare repositories whose
+ * `core.fsmonitor` is a command, at the root and in a subdirectory. Each
+ * command only creates a marker file in `markerDir`.
+ */
+export function plantCwdPayloads(tree: string, markerDir: string): PayloadMarkers {
+  const ran: PayloadMarkers = {
+    toolConfig: join(markerDir, "TOOL-CONFIG-RAN"),
+    rootRepo: join(markerDir, "ROOT-REPO-RAN"),
+    nestedRepo: join(markerDir, "NESTED-REPO-RAN"),
+  };
+  write(join(tree, ".tool.json"), JSON.stringify({ command: `touch '${ran.toolConfig}'` }));
+  for (const [dir, marker] of [[tree, ran.rootRepo], [join(tree, NESTED_REPO), ran.nestedRepo]] as const) {
+    write(join(dir, "HEAD"), "ref: refs/heads/main\n");
+    write(
+      join(dir, "config"),
+      `[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tworktree = .\n\tfsmonitor = "touch '${marker}'; false"\n`,
+    );
+    // Placeholders, since git does not commit empty directories.
+    write(join(dir, "objects", ".keep"), "");
+    write(join(dir, "refs", ".keep"), "");
+  }
+  return ran;
+}
+
+/**
+ * Environment that leaves git with no configuration but the test's own, so
+ * neither the developer's git config nor an inherited
+ * `safe.bareRepository` decides the outcome.
+ */
+export const PLAIN_GIT_ENV = {
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_NOSYSTEM: "1",
+  GIT_CONFIG_COUNT: undefined,
+  GIT_CONFIG_PARAMETERS: undefined,
+} as const;
+
+/** Set (or, with undefined, unset) environment variables. Returns the undo. */
+export function setEnv(vars: Readonly<Record<string, string | undefined>>): () => void {
+  const apply = (values: Readonly<Record<string, string | undefined>>) => {
+    for (const [k, v] of Object.entries(values)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  };
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  apply(vars);
+  return () => apply(saved);
+}
+
+/** What `workingDirectoryModule` saw. */
+export interface ModuleSaw {
+  /** Every working directory pi showed or gave the module, by where it came from. */
+  cwds: Map<string, string>;
+  /** Entries of the working directory at session start. */
+  entries?: string[];
+  /** `git status` in the working directory and in the explicitly visited directory. */
+  git: Array<{ where: "cwd" | "visited"; status: number | null; stderr: string }>;
+}
+
+/**
+ * An ordinary, honest module (D-19): it takes a command from
+ * `<cwd>/.tool.json` and runs git, in its working directory and in `visit`
+ * (a directory it was told about). None of it is hostile by itself; what
+ * runs depends only on the working directory and git's environment.
+ */
+export function workingDirectoryModule(visit?: string): { factory: ExtensionFactory; saw: ModuleSaw } {
+  const saw: ModuleSaw = { cwds: new Map(), git: [] };
+  const factory: ExtensionFactory = (pi) => {
+    pi.on("resources_discover", (event) => {
+      saw.cwds.set("resources_discover", event.cwd);
+    });
+    pi.on("session_start", async (_event, ctx) => {
+      saw.cwds.set("ctx.cwd", ctx.cwd);
+      saw.cwds.set("sessionManager", ctx.sessionManager.getCwd());
+      saw.entries = readdirSync(ctx.cwd);
+      const config = join(ctx.cwd, ".tool.json");
+      if (existsSync(config)) execFileSync("/bin/sh", ["-c", JSON.parse(readFileSync(config, "utf8")).command], { cwd: ctx.cwd });
+      // pi.exec defaults to the resource loader's cwd.
+      saw.cwds.set("pi.exec", (await pi.exec("/bin/pwd", ["-P"])).stdout.trim());
+      const status = await pi.exec("git", ["status", "--porcelain"]);
+      saw.git.push({ where: "cwd", status: status.code, stderr: status.stderr });
+      if (visit !== undefined) {
+        const r = spawnSync("git", ["status", "--porcelain"], { cwd: visit, encoding: "utf8" });
+        if (r.error) throw r.error;
+        saw.git.push({ where: "visited", status: r.status, stderr: r.stderr });
+      }
+    });
+    pi.on("before_agent_start", (event) => {
+      saw.cwds.set("systemPromptOptions", event.systemPromptOptions.cwd);
+    });
+    pi.on("tool_call", (_event, ctx) => {
+      saw.cwds.set("tool_call", ctx.cwd);
+    });
+  };
+  return { factory, saw };
+}
+
+/**
+ * Run `body` with `extension` inside every pi session created meanwhile,
+ * appended to the extension the step passes in. The step loads no modules
+ * and fails on a second extension, so this is the only way to see what a
+ * module would see without a test hook in the step.
+ */
+export async function withTestExtension<T>(extension: ExtensionFactory, body: () => Promise<T>): Promise<T> {
+  const proto = DefaultResourceLoader.prototype;
+  const reload = proto.reload;
+  proto.reload = function (this: DefaultResourceLoader, ...args: Parameters<typeof reload>) {
+    const loader = this as unknown as { extensionFactories: Array<{ name: string; factory: ExtensionFactory }> };
+    loader.extensionFactories = loader.extensionFactories.map(({ name, factory }) => ({
+      name,
+      factory: async (pi) => {
+        await factory(pi);
+        await extension(pi);
+      },
+    }));
+    return reload.apply(this, args);
+  };
+  try {
+    return await body();
+  } finally {
+    proto.reload = reload;
+  }
 }
 
 /** A small output tool for tests, with a cross-field rule. */

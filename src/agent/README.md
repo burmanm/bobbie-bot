@@ -7,9 +7,9 @@ backed by the pi SDK; the guard and tools it loads live in
 | File | What |
 |---|---|
 | `types.ts` | `AgentStep`, request and result types |
-| `pi-sdk-step.ts` | The pi SDK implementation: isolation (C-3a), limits (F-3), usage (A-6) |
+| `pi-sdk-step.ts` | The pi SDK implementation: isolation and the neutral working directory (C-3a, D-15), limits (F-3), usage (A-6) |
 | `accounting.ts` | Usage sums and the turn and spend caps, pure |
-| `testing.ts` | Hostile snapshot fixture and scripted-model helpers, tests only |
+| `testing.ts` | Hostile snapshot fixture, working-directory payloads and a module that would trigger them, scripted-model helpers; tests only |
 | `acp/acp-step.ts` | `AgentStep` over the Agent Client Protocol: the step runs in an external agent |
 | `acp/connection.ts` | Minimal ACP client: JSON-RPC 2.0, one message per line, over the agent's stdio |
 | `acp/outputs.ts` | Output tools described in the prompt; the agent's JSON block checked like tool calls |
@@ -72,7 +72,46 @@ backed by the pi SDK; the guard and tools it loads live in
   not an evidence root.
 - The read roots are appended to the system prompt in a `<read_roots>`
   section with their absolute paths, since `base` and `modcache` are reached
-  by absolute path.
+  by absolute path. It says that relative and omitted paths resolve in head.
+- **`roots.head` is not the working directory** (R-1a step 1, D-15); see
+  "Working directory" below.
+
+## Working directory
+
+Nothing from a PR becomes configuration without a merge (D-19). Modules and
+the programs they start take configuration from their working directory, so
+that is never the snapshot (C-3a).
+
+- **cwd.** Each step creates an empty `review-bot-cwd-*` directory in the
+  temporary directory and gives it to the session, the resource loader
+  (hence `pi.exec`) and the session manager. The in-memory settings take no
+  directory. It is removed after the step. The process's own cwd is not
+  changed.
+- **The temporary directory** must be outside every read root and have no
+  `.git` entry or context file in it or above it. Otherwise the step is a
+  `config` error, before it creates anything there. Set `TMPDIR` to fix it.
+- **Paths resolve in head.** `read`, `ls`, `grep`, `find` and the guard all
+  resolve relative and omitted paths against head, never `ctx.cwd`
+  (`AllowedRoots.head`). pi's own tool definitions prefer `ctx.cwd` to the
+  directory they were created with, so `resolveInHead` shows head to those
+  tools, and only to them. What the model passes and gets back is as it was
+  when head was the cwd.
+- **A tool that replaces one of these names** would get the neutral
+  `ctx.cwd`, while the guard judges its relative path against head. Whoever
+  loads such tools (F-7, R-1a step 4) has to hand them the resolved path.
+- **The prompt.** pi adds a `<cwd>` section with the session's cwd. The
+  extension replaces it with head, so the model never sees the neutral
+  directory and the prompt does not change from step to step. Hooks still
+  see the real one in `systemPromptOptions.cwd`.
+- **git.** The step appends `safe.bareRepository=explicit` to the process's
+  `GIT_CONFIG_COUNT` entries and keeps the others, so git that something
+  runs inside an embedded bare repository of the PR refuses it. Limits:
+  - it needs git 2.38 or later;
+  - an operator's `GIT_CONFIG_PARAMETERS` takes precedence over it;
+  - it is set from the first pi step on, so a process that runs only ACP
+    steps does not have it;
+  - from then on `git -C <bare clone>` is refused in this process too:
+    name such a repository with `--git-dir`.
 
 ## Behaviour worth knowing
 
@@ -87,15 +126,17 @@ backed by the pi SDK; the guard and tools it loads live in
   missing `rg`, bad limits or tool names) return `outcome: "error"` with
   `error.kind: "config"` before any model call.
 - **Isolation is checked on the live session** before the first call: the
-  project must not be trusted, our extension must be the only one, and the
-  active tools must equal the allowlist. Otherwise the step fails with an
+  working directory (the session manager's and the extensions') must be the
+  step's own, outside every read root, which is checked before extensions
+  get `session_start`; the project must not be trusted, our extension must
+  be the only one, and the active tools must equal the allowlist. Otherwise the step fails with an
   `internal` error. Several isolation options overlap, so losing one would
   not always change what the model sees; this check catches it.
 - **Process environment.** Every step sets `PI_OFFLINE=1`,
   `PI_SKIP_VERSION_CHECK=1`, `PI_TELEMETRY=0` and points
   `PI_CODING_AGENT_DIR` at a private empty directory created once per
   process. Each step also gets its own empty agent directory, removed after
-  the step.
+  the step. git's environment is described under "Working directory".
 - **API key.** Read by pi from the provider's environment variable
   (`OPENROUTER_API_KEY`). The step only asks pi whether credentials are
   configured; it never reads or logs the key.

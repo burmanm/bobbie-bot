@@ -43,8 +43,8 @@ export function canonicalize(p: string): string {
 }
 
 /**
- * The read roots of one step: head (the session's cwd), base and module
- * cache. Each is canonicalized once; a root that does not exist is a
+ * The read roots of one step: head first, then base, module cache and
+ * inputs. Each is canonicalized once; a root that does not exist is a
  * configuration error and throws.
  */
 export class AllowedRoots {
@@ -62,6 +62,15 @@ export class AllowedRoots {
     });
   }
 
+  /**
+   * The first root. The read tools and the guard resolve relative and omitted
+   * paths here, and never against the session's cwd, which is an empty
+   * directory outside every root (C-3a, D-15).
+   */
+  get head(): string {
+    return this.roots[0]!;
+  }
+
   contains(canonical: string): boolean {
     return this.roots.some((root) => isWithin(root, canonical));
   }
@@ -69,9 +78,10 @@ export class AllowedRoots {
   /**
    * Check a path argument the way pi's tools will interpret it
    * (`resolveToCwd`: unicode spaces, `@` prefix, `~`, `file://`), relative to
-   * `cwd`. Used by the `tool_call` guard, so the model gets a clear reason.
+   * `baseDir`: head for the pi step, the workspace for ACP. Used by the
+   * `tool_call` guard, so the model gets a clear reason.
    */
-  check(raw: unknown, cwd: string): PathCheck {
+  check(raw: unknown, baseDir: string): PathCheck {
     if (typeof raw !== "string") return { ok: false, reason: "path must be a string" };
     let p = raw.replace(UNICODE_SPACES, " ");
     if (p.startsWith("@")) p = p.slice(1);
@@ -86,7 +96,7 @@ export class AllowedRoots {
         return { ok: false, reason: `Path "${raw}" is not a valid file URL.` };
       }
     }
-    const target = canonicalize(isAbsolute(p) ? resolve(p) : resolve(cwd, p));
+    const target = canonicalize(isAbsolute(p) ? resolve(p) : resolve(baseDir, p));
     if (!this.contains(target)) return { ok: false, reason: outside(raw) };
     return { ok: true, path: target };
   }
