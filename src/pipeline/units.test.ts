@@ -22,7 +22,7 @@ describe("configuration (P-4, C-2, A-5)", () => {
     assert.ok(c.limits.runCostUsd > 0, "a spend cap always exists");
   });
 
-  test(".review/review-bot.yaml from base overrides the inputs", () => {
+  test(".review/review-bot.yaml from base narrows the inputs; without settings it still picks models (F-7)", () => {
     const yaml = [
       "roles:",
       "  reviewer: openrouter/a/b",
@@ -77,7 +77,7 @@ describe("configuration (P-4, C-2, A-5)", () => {
 const patch = (path: string, lines: number): PatchFile => ({ path, status: "modified", added: 1, removed: 0, lines, patchPath: `patches/${path}` });
 
 describe("time limits (S-4 Limits)", () => {
-  test("defaults; inputs; .review/review-bot.yaml overrides both", () => {
+  test("defaults; inputs; .review/review-bot.yaml only lowers (F-7)", () => {
     const d = resolveConfig({});
     assert.equal(d.limits.runTimeoutMs, 45 * 60_000);
     assert.equal(d.limits.reviewer.timeoutMs, 20 * 60_000);
@@ -88,9 +88,10 @@ describe("time limits (S-4 Limits)", () => {
     assert.equal(i.limits.verifier.timeoutMs, 8 * 60_000);
     const y = resolveConfig(
       { runTimeoutMs: 600_000 },
-      "limits:\n  runTimeoutSeconds: 1200\n  reviewer:\n    timeoutSeconds: 300\n    idleTimeoutSeconds: 45\n",
+      "limits:\n  runTimeoutSeconds: 300\n  reviewer:\n    timeoutSeconds: 300\n    idleTimeoutSeconds: 45\n",
     );
-    assert.equal(y.limits.runTimeoutMs, 1_200_000);
+    assert.equal(y.limits.runTimeoutMs, 300_000);
+    assert.throws(() => resolveConfig({ runTimeoutMs: 600_000 }, "limits:\n  runTimeoutSeconds: 1200\n"), /runTimeoutSeconds 1200 \(at most 600\)/);
     assert.equal(y.limits.reviewer.timeoutMs, 300_000);
     assert.equal(y.limits.reviewer.idleTimeoutMs, 45_000);
     assert.throws(() => resolveConfig({}, "limits:\n  runTimeoutSeconds: 0\n"), /invalid/);
