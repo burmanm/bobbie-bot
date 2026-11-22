@@ -1,6 +1,7 @@
 /** Public surface of `pipeline` (A-2): the review run and its pure helpers. */
 export { runReview, dedupeAgainstComments, type ReviewRunOptions, type ReviewRunResult, type RecheckOutcome } from "./run.ts";
 export * from "./config.ts";
+export * from "./agent-settings.ts";
 export { loadKnowledge, knowledgeFileList, isKnowledgePath, type Knowledge, type KnowledgeOverride } from "./knowledge.ts";
 export { loadMethod, PI_REVIEW_DIR, type Method } from "./method.ts";
 export { buildContext, neutralizeDelimiters } from "./context.ts";
