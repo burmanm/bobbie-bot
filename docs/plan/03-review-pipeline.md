@@ -201,6 +201,24 @@ Performed by code with the write token; no model involved.
   The bot resolves only its own threads and only on "verified fixed"; a
   "still open" thread, a thread answered with `[wrong]` / `[intentional]` /
   `[not-worth-it]`, and anyone else's thread are left for people to resolve.
+- **Text from the model or the PR is inert** (C-3, H-51). One module,
+  `src/core/markdown.ts`, writes it into review bodies, comments, replies,
+  and check-run and job summaries:
+  - No images, raw HTML, links, tables or math. URLs, mentions,
+    `other/repo#1` and lines that read as another bot's command are shown as
+    inline code; mentions and commands also get a zero-width space.
+  - Code spans and fenced code keep their content. A fence always closes.
+    Only the typed `suggestion` field becomes a suggestion block; one with
+    a bot command or marker in it is shown, not offered.
+  - **Links to the same repository:** the only URL left live is
+    `https://github.com/<this repository>/issues/<number>` as the whole of
+    `proposedIssue`, printed from the trusted repository name. Other URLs of
+    the repository are inert too: a fork's commits resolve under it, and
+    code permalinks embed content. A plain `#123` or commit SHA is still
+    linked by GitHub and can point only into the repository.
+  - What remains: bots that search raw text for a word anywhere can still
+    find it inside code, and the command list for lines without a `/`, `!`
+    or `.` prefix is finite.
 - **Summary body** (I-2 #11), assembled by code from typed parts:
   1. Round and commit range covered.
   2. Count line: "N important, M nits, K pre-existing", or a plain statement

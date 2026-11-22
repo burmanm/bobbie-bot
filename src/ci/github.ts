@@ -12,6 +12,7 @@
  * The token is held by this object only. It is never logged and never
  * appears in an error message.
  */
+import { safeSummary } from "../core/index.ts";
 
 export type Fetch = (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<{
   status: number;
@@ -83,6 +84,11 @@ const MAX_PAGES = 30;
 export interface CheckRunOutput {
   title: string;
   summary: string;
+}
+
+/** GitHub renders the summary as Markdown, and check names in it come from the PR (H-51). */
+function safeOutput(o: CheckRunOutput): CheckRunOutput {
+  return { title: o.title, summary: safeSummary(o.summary) };
 }
 
 export class GithubError extends Error {
@@ -303,7 +309,7 @@ export class Github {
       status: "completed",
       conclusion,
       completed_at: new Date().toISOString(),
-      output,
+      output: safeOutput(output),
     });
     return r!.id;
   }
@@ -314,13 +320,13 @@ export class Github {
    * the wait from it.
    */
   async createQueuedCheck(name: string, headSha: string, output: CheckRunOutput, startedAt: string): Promise<number> {
-    const r = await this.json<{ id: number }>("POST", `${this.base()}/check-runs`, { name, head_sha: headSha, status: "queued", started_at: startedAt, output });
+    const r = await this.json<{ id: number }>("POST", `${this.base()}/check-runs`, { name, head_sha: headSha, status: "queued", started_at: startedAt, output: safeOutput(output) });
     return r!.id;
   }
 
   /** Changes an open check run's status and text (not its conclusion). */
   async updateCheck(id: number, status: "queued" | "in_progress", output: CheckRunOutput): Promise<void> {
-    await this.json("PATCH", `${this.base()}/check-runs/${id}`, { status, output });
+    await this.json("PATCH", `${this.base()}/check-runs/${id}`, { status, output: safeOutput(output) });
   }
 
   /** Check runs called `name` on `sha`, newest first. */
@@ -338,7 +344,7 @@ export class Github {
       status: "completed",
       conclusion,
       completed_at: new Date().toISOString(),
-      output,
+      output: safeOutput(output),
     });
   }
 
