@@ -22,39 +22,59 @@ checked before code depends on them.
 |---|---|
 | `pi.registerTool` | `report_finding`, `ask_question`, `note_needs_human`, `submit_verdict` — the typed output channel ([A-3](02-architecture.md#a-3--finding)); read-only snapshot, history and issue-search tools |
 | Built-in OpenRouter provider (`OPENROUTER_API_KEY`) | First model provider ([C-6](06-ci-and-security.md#c-6--model-provider)) |
-| `pi.on("tool_call", …)` | Reject any tool not on the stage's allowlist, **and confine every path argument** to the allowed roots after resolving symlinks. pi itself does not confine its read tools |
+| `pi.on("tool_call", …)` | Reject any tool not configured for the role, called by the model or by another tool, **and confine the path argument of `read`, `grep`, `find` and `ls`** to the allowed roots after resolving symlinks, whoever implements them. pi itself does not confine its read tools |
 | `pi.on("before_provider_request", …)` | Capture what was sent, for run records |
 | Scripted ("faux") model provider in `@earendil-works/pi-ai` | Tests run the real SDK step, extension and guard against scripted model output, with no network |
 | `pi.on("agent_settled", …)` | Know when a session has truly finished |
-| `pi.registerCommand` | `/review` for local, interactive use of the same pipeline |
+| `pi.registerCommand` | `/review-bot`: the pipeline's entry point, in CI and interactively |
 | `pi.registerFlag` | Headless options when run through the pi CLI |
 | Skills (`SKILL.md`) | Review method instructions, loaded on demand |
 | Package manifest (`pi.extensions`, `pi.skills`, `pi.prompts`) | Distribution: `pi install npm:…` or `git:…` |
-| `pi.registerMcpServer` / other pi packages | Later integrations (issue trackers, chat, docs) without changing our core |
-| `settings.json` `packages`, `models.json` in an operator agent directory | Providers, endpoints, model overrides and pi packages added by configuration ([F-7](#f-7--configuration-follows-pi)) |
+| `createCodemodeExtension`, `createToolSearchExtension`, `createMcpExtension` | pi's built-in extensions, which SDK sessions do not include. Registered inactive in every role session |
+| `pi.registerMcpServer` / other pi packages | Integrations (issue trackers, chat, docs) without changing our core |
+| `settings.json` `packages`, `models.json` in an operator agent directory | Providers, endpoints, model overrides, any pi module and the bot's settings, all by configuration ([F-7](#f-7--configuration-follows-pi)) |
 
 Extensions are TypeScript loaded through jiti, so no build step is required
 for the extension itself.
 
 ## F-3 — Integration shape
 
-Two artifacts, one codebase:
+The whole bot is a pi module, `pi-review`: extension + skill + prompts +
+the `/review-bot` command, installable into any pi setup.
 
-1. **A pi package** (`pi-review`): extension + skills + prompts. Installable
-   into any pi setup. Gives interactive users `/review`.
-2. **A runner** (`review-bot` CLI): our orchestrator. It embeds pi through the
-   SDK (`createAgentSession`) and creates one short-lived session per model
-   step, each with an explicit model, tool allowlist, and in-memory session
-   manager. The extension is loaded into those sessions to provide the typed
-   tools.
+Two separate choices ([D-2](README.md#key-decisions)):
 
-Why the runner owns orchestration rather than a single long pi session
-steering itself: [P-3](README.md#principles). Flow in code is testable,
-cheap, and cannot be talked out of a step by PR content.
+1. **How a model step runs: the SDK.** The orchestrator creates one
+   short-lived session per step (`createAgentSession`), each with an
+   explicit model, tool set and in-memory session manager. The extension is
+   loaded into those sessions to provide the typed tools, next to the
+   operator's modules ([F-7](#f-7--configuration-follows-pi)). Decided by
+   the R-0 spike. The SDK is unsafe by default with untrusted code and must
+   be isolated explicitly ([C-3a](06-ci-and-security.md#c-3a--pi-session-isolation)).
+2. **What starts the orchestrator: a pi command.** CI and developers both
+   run `/review-bot`. Jobs without a model (`gate`, `prepare`,
+   `complete-check`) and the offline jobs stay plain `review-bot` CLI
+   commands and do not start pi.
 
-**Decided by the R-0 spike: the SDK.** Everything needed works through it.
-The SDK is unsafe by default with untrusted code and must be isolated
-explicitly ([C-3a](06-ci-and-security.md#c-3a--pi-session-isolation)).
+Why code owns orchestration rather than a single long pi session steering
+itself: [P-3](README.md#principles). The command is ordinary TypeScript.
+Flow in code is testable, cheap, and cannot be talked out of a step by PR
+content.
+
+**Running as a command in CI.** pi's headless mode does not report failure
+by itself ([evidence](r1a-proposal.md#behaviour-as-a-module-without-a-host)),
+so every row is required and tested:
+
+| pi's behaviour | What we do |
+|---|---|
+| A command that throws exits 0 | The command sets the exit code. `complete-check` also ends an unfinished check as *neutral* after exit 0 |
+| An unknown or ambiguous command is sent to the model as a prompt | Start with `-ne -e <path to pi-review>`: a missing path exits 1 and nothing can shadow the command. Operator modules load in role sessions |
+| SIGTERM exits without waiting for the command | `session_shutdown` awaits the pipeline, which publishes what it has |
+| `console.log` from a module goes to stderr | The result is written with `--out` |
+| A malformed `settings.json` is a warning | The command validates it and stops with a configuration error |
+| A missing package is skipped when offline | The command checks every listed package and stops with a configuration error |
+| pi waits while stdin is open | Start it with stdin closed |
+| The project can be trusted by any module's handler | `--no-approve`, and an empty working directory |
 
 The subprocess form (`pi --mode json --no-session -e <extension> -t <tools>
 --model <id>`) stays possible behind the same `AgentStep` interface
@@ -146,10 +166,11 @@ change.
 
 ## F-7 — Configuration follows pi
 
-**Decision ([D-18](README.md#key-decisions)):** everything pi already has
-a configuration concept for is configured in pi's own files, in pi's own
-format. The bot invents configuration only for what pi does not have.
-Adding a provider, an endpoint or a pi package is a configuration change,
+**Decision ([D-18](README.md#key-decisions)):** the bot is configured as
+any pi module is. Everything pi has a configuration concept for uses pi's
+own files and format; the bot's options are one key in the same file.
+Adding a provider, an endpoint or **any pi module** — tools, hooks,
+orchestrators such as codemode, MCP servers — is a configuration change,
 never a code change or a bot release.
 
 **The operator's pi agent directory.** The runner is given an agent
@@ -158,31 +179,58 @@ package, "Agent directory"), the same one a developer can point `pi` at locally:
 
 | File | Holds | Replaces |
 |---|---|---|
-| `settings.json` | `packages` (pi packages to load), `enabledModels` (which models the repository may pick) | — |
+| `settings.json` | `packages` (pi modules to load), `enabledModels` (which models the repository may pick), settings of pi's built-ins such as `codemode`, and `reviewBot` (the bot's own settings) | Most workflow inputs |
 | `models.json` | Custom providers and endpoints, extra model ids, `modelOverrides` (prices, context, thinking maps), `compat.openRouterRouting` for upstream-provider restrictions | Our `providers` and `routing` role fields, and the "custom id" fallback for models missing from pi's catalog where an operator wants real prices |
 | `auth.json` | Not used in CI. Keys come from environment variables, or `"apiKey": "$NAME"` in `models.json` | — |
 
 Running `pi --list-models` with `PI_CODING_AGENT_DIR` set to that directory
-shows exactly what the bot can use, and `/review` inside pi uses the same
-providers.
+shows exactly what the bot can use, and `/review-bot` inside pi uses the
+same configuration.
 
-Where it comes from: a path in the consumer's default branch, or an
-organization configuration repository, named by a workflow input. **Never
-from the PR**, and never from `.review/review-bot.yaml`: pi packages
-execute code, and `models.json` can run a command (`"apiKey": "!cmd"`).
+Where it comes from: a path in the consumer's **default branch**, or an
+organization configuration repository pinned to a commit, named by a
+workflow input. **Never from the PR**, neither its head nor its base: pi
+packages execute code, and `models.json` can run a command
+(`"apiKey": "!cmd"`).
 
-**Role → model** uses pi's model syntax: `provider/id`, with an optional
-`:<thinking>` suffix, as pi's `--model` takes it. The bot-specific
-`thinking`, `providers` and `routing` fields are removed in favour of the
-suffix and `models.json`.
+**Bot settings** are the `reviewBot` key of `settings.json`. pi keeps
+unknown keys when it rewrites the file and extensions read them with
+`pi.getSettings()` ([Q-20](07-roadmap.md#open-questions)).
 
-**Bot settings** — what pi has no concept for — stay in the bot's own
-file: roles, step and run limits, skip rules, authorization label, CI wait
-([C-9](06-ci-and-security.md#c-9--waiting-for-ci)), metrics export
-([O-2](10-metrics.md#o-2--how-the-numbers-are-collected)). Workflow inputs
-first, then the base branch's `.review/review-bot.yaml`, which can choose
-only among `enabledModels` and lower limits, not raise them past the
-operator's.
+```json
+{
+  "packages": ["npm:@org/pi-x@1.2.3"],
+  "enabledModels": ["openrouter/vendor/*"],
+  "codemode": { "mode": "on" },
+  "reviewBot": {
+    "roles": {
+      "reviewer": { "model": "openrouter/vendor/model:high", "tools": ["+codemode"] },
+      "verifier": { "model": "openrouter/vendor/other" }
+    },
+    "limits": { "runCostUsd": 5 }
+  }
+}
+```
+
+- **Role → model** uses pi's model syntax: `provider/id`, with an optional
+  `:<thinking>` suffix, as pi's `--model` takes it. The bot-specific
+  `thinking`, `providers` and `routing` fields are removed in favour of the
+  suffix and `models.json`.
+- **Role → tools** uses pi's `defaultTools` syntax, relative to the role's
+  read-only default ([S-4](03-review-pipeline.md#s-4--review)). pi's own
+  default, which has `bash`, is never inherited.
+- The key also holds step and run limits, skip rules, the authorization
+  label, CI wait ([C-9](06-ci-and-security.md#c-9--waiting-for-ci)) and
+  metrics export ([O-2](10-metrics.md#o-2--how-the-numbers-are-collected)).
+  The gate reads it as plain JSON, without loading pi.
+
+**Precedence:** `settings.json`, overridden by workflow inputs (both are
+the maintainers'), narrowed by the base branch's `.review/review-bot.yaml`.
+The base branch need not be the default one, so that file can only narrow
+what the first two allow: choose among `enabledModels` (without that list it cannot
+change a model) and lower limits. It can never name tools, packages,
+providers or endpoints. Skip rules, CI wait and the authorization label
+are the repository's own policy and may be set there as before.
 
 ### Adding a pi package without code changes
 
@@ -198,49 +246,80 @@ Two equivalent ways, both pinned:
    only when listed; installing is not configuring, so a transitive
    dependency that happens to be a pi package never loads by itself.
 
+A local source must resolve outside every read root, so no path can point
+into the snapshot.
+
 **Installation happens before any secret is present.** The review job
 runs with `PI_OFFLINE=1` and downloads nothing
 ([C-3a](06-ci-and-security.md#c-3a--pi-session-isolation)). Packages are
 installed by `review-bot setup` (pi's package manager, or `npm ci` /
-`pnpm install --frozen-lockfile` with scripts disabled) in a step that has
-no provider key, or baked into the action image. The review step then
+`pnpm install --frozen-lockfile`, scripts disabled either way) in a step
+that has no secrets, or baked into the action image. The review step then
 finds them already installed and fails as a configuration error if one is
 missing.
 
-**What a package can do in a review.** Packages are operator-trusted code
-running in the job that holds the model key; review their source as for
-any dependency.
+**What a module can do in a review: anything pi allows.** Modules are
+trusted code running in the job that holds the model key and the GitHub
+token ([D-19](README.md#key-decisions)); review their source as for any
+dependency.
 
 | Contribution | Effect |
 |---|---|
-| Providers (`pi.registerProvider`), models | Available to roles, like built-in ones. The main use |
-| Tools | **Not** active in model steps unless the operator names them in a role's extra tool allowlist. Path confinement does not cover what they do |
-| Skills, prompt templates | Not loaded into model steps; the review method is the bot's ([A-5](02-architecture.md#a-5--knowledge-sources)) |
-| Event hooks (`before_provider_request` …) | Run, and see prompts and responses. Inherent to trusted code |
+| Providers (`pi.registerProvider`), models | Available to roles, like built-in ones |
+| Tools | Active when named in the role's `tools`, and then also callable from other tools such as codemode. A tool not in that set cannot be called either way |
+| A tool with the name of one of the bot's | Replaces it, and the run record says so. Path checks stay on the names `read`, `grep`, `find` and `ls`. Replacing an output tool gives up [D-4](README.md#key-decisions)'s guarantee |
+| Skills, prompt templates | Not discovered into model steps; the method is the bot's ([A-5](02-architecture.md#a-5--knowledge-sources)). A module can still change the prompt through hooks |
+| Event hooks (`before_provider_request` …) | Run in each role session, and can see and change prompts, calls and responses |
+
+A module that gives the model a shell, network access or an unconfined
+reader also gives it to whoever writes the PR, through prompt injection.
+That is the maintainers' decision: the defaults have none, the installing
+guide says so, and the review summary lists the extra tools that were
+active.
 
 Every loaded package and its resolved version goes in the run record, and
 adding or upgrading one is a change replayed under
 [E-5](05-evaluation.md#e-5--acceptance-procedure) like a model change.
 
+### Codemode
+
+pi's built-in `codemode` tool lets the model write a script that calls the
+role's other tools in a sandbox without file system, network or process
+access. It is enabled like any tool (`"+codemode"`). It needs:
+
+- the guard to allow configured tools when another tool calls them, with
+  the same path checks;
+- accounting to add the usage on tool results (`models.classify()` and
+  other nested calls), so it counts toward the spend cap;
+- step and idle timeouts as the bound on scripts, which have no deadline
+  of their own and whose nested calls are not turns;
+- the method prompt to work with `codemode.mode: only`, which hides the
+  other tools' declarations.
+
+The scripts are saved for later evaluation
+([A-6](02-architecture.md#a-6--run-record), [R-6](07-roadmap.md#r-6--promotion-to-checks)).
+
 ### What does not change
 
-Isolation from the **PR** is exactly as before: project trust stays off,
-the snapshot's `.pi/` and context files are never read, and the active
-tools must equal the allowlist. What changes is the source of trusted
-configuration: an operator directory instead of an empty one. The live
-isolation check becomes "the loaded extensions are ours plus exactly the
-listed packages".
+Nothing from the **PR** is executed or becomes configuration
+([C-3](06-ci-and-security.md#c-3--trust-model)): project trust stays off
+and the snapshot's `.pi/` and context files are never loaded. Because
+modules and the programs they start take configuration from the working
+directory, that directory is never the snapshot. The live isolation check
+becomes "the loaded extensions are ours, pi's built-ins and exactly the
+listed packages; the active tools equal the role's configured set; the
+project is untrusted; the working directory is outside every read root".
 
 ACP agents ([A-2](02-architecture.md#a-2--modules)) keep their own
-`--acp-agent` configuration for now. If ACP is later offered as a pi
-provider package, it moves into `settings.json` like any other.
+`--acp-agent` configuration and workspace for now. If ACP is later offered
+as a pi provider package, it moves into `settings.json` like any other.
 
 ### To verify before implementing (pi 1.5.2)
 
-| # | Question |
-|---|---|
-| 1 | Does the SDK's resource loader load `packages` from the agent directory's `settings.json` while project trust is off, and with `PI_OFFLINE=1` from an already-installed copy? |
-| 2 | Can package installation run with lifecycle scripts disabled (pi's package manager, or plain npm/pnpm into a local source)? |
-| 3 | Does pi tolerate unknown keys in `settings.json`, or must bot settings stay in a separate file? (Plan assumes separate.) |
-| 4 | With `PI_OFFLINE=1`, does OpenRouter's per-key model list (`/models/user`) still apply, and are `models.json` additions merged with the built-in catalog? |
-| 5 | Does a package's tool registration stay inactive when the session's tool list does not name it? |
+| # | Question | Status (probed 2026-11-22, macOS) |
+|---|---|---|
+| 1 | Does the SDK's resource loader load `packages` from the agent directory's `settings.json` while project trust is off, and with `PI_OFFLINE=1` from an already-installed copy? | Yes for a local path. npm and git sources not tested |
+| 2 | Can package installation run with lifecycle scripts disabled (pi's package manager, or plain npm/pnpm into a local source)? | **Open.** pi's npm arguments do not disable them, so setup has to |
+| 3 | Does pi tolerate unknown keys in `settings.json`, or must bot settings stay in a separate file? | Yes: kept on rewrite and readable by extensions |
+| 4 | With `PI_OFFLINE=1`, does OpenRouter's per-key model list (`/models/user`) still apply, and are `models.json` additions merged with the built-in catalog? | **Open** |
+| 5 | Does a package's tool registration stay inactive when the session's tool list does not name it? | Yes, and a codemode script cannot call it |

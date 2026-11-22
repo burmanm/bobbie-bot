@@ -136,6 +136,11 @@ does not configure one stops after step 3.
 Inputs: the `mechanizable` field every reviewer fills in
 ([A-3](02-architecture.md#a-3--finding)), plus outcomes.
 
+Codemode scripts saved with run records
+([A-6](02-architecture.md#a-6--run-record)) are a possible further input.
+Whether any are usable as detectors is evaluated in
+[R-6](07-roadmap.md#r-6--promotion-to-checks) before anything depends on it.
+
 A cluster is a **check candidate** when its findings are mostly marked
 mechanizable, it spans at least 3 PRs, and its outcomes are mostly `fixed`.
 

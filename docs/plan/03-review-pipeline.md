@@ -83,8 +83,9 @@ the reviewer has the source snapshot and search tools.
 
 ## S-4 — Review
 
-**Tools available to the reviewer:** read file, list, grep/find over the
-head snapshot, the base snapshot, and the Go module cache (read-only);
+**Tools available to the reviewer by default** (the operator can change a
+role's set, [F-7](01-foundation-pi.md#f-7--configuration-follows-pi)):
+read file, list, grep/find over the head snapshot, the base snapshot, and the Go module cache (read-only);
 read-only history queries served by the orchestrator through the GitHub API
 (log, blame, commit diff — there is no `.git` to run commands in); a
 read-only issue search scoped to the repository (for I-2 #4) — on private
@@ -98,17 +99,20 @@ and three typed output tools:
 - `note_needs_human` — `{what, locations[], explainedInDescription}`
   (I-2 #5).
 
-Path arguments of the read tools are confined to those roots by our guard,
-after symlink resolution; pi does not do this itself
+The session's working directory is an empty one the bot owns; the read
+tools resolve relative paths against head. Their path arguments are confined
+to those roots by our guard, after symlink resolution, also when another
+tool calls them; pi does not do this itself
 ([C-3](06-ci-and-security.md#c-3--trust-model)). The search tools ignore
 any `.gitignore`, `.ignore` or similar file in the snapshot: pi's own
 `find` and `grep` honour them, so the bot replaces or wraps those tools. A
 PR must not be able to hide a file from the reviewer, and a PR's change to
 such a file is itself reviewed.
 
-No write, no network, no shell, no execution of any code. Consequently the
-reviewer cannot run tests or probes; anything it would have needed to run
-is listed under "Not run" in the summary
+By default no write, no network, no shell, no execution of code from the PR
+(a codemode script, where enabled, runs sandboxed and reaches only the role's
+tools). Consequently the reviewer cannot run tests or probes; anything it
+would have needed to run is listed under "Not run" in the summary
 ([I-5](09-process-integration.md#i-5--gaps-this-exposes-in-review-process-to-raise-there)).
 
 **Method** (a skill shipped with the bot; it describes *how* to review, never
@@ -135,8 +139,8 @@ is listed under "Not run" in the summary
   with its own check run `ai-review/security`.
 
 **Limits** (safety, not optimization): per-step timeout and turn cap,
-per-run spend cap, inactivity timeout. A timed-out step is recorded and the
-run continues with what it has.
+per-run spend cap (nested tool usage included), inactivity timeout. A
+timed-out step is recorded and the run continues with what it has.
 
 ## S-5 — Verify
 
@@ -151,7 +155,8 @@ run continues with what it has.
   invalid call is returned to the model as an error and never reaches the
   orchestrator as a finding. Cross-field rules (for example `proposedIssue`
   only on Pre-existing) are checked in the tool itself. The orchestrator
-  re-validates only as defence in depth.
+  re-validates as defence in depth, which is also all that is left when a
+  module replaces an output tool ([D-4](README.md#key-decisions)).
 - Fingerprint not already posted on this PR.
 
 **Adversarial verification (model, `verifier` role):** a fresh session per
@@ -203,7 +208,7 @@ Performed by code with the write token; no model involved.
      link to the existing issue (I-2 #4).
   5. Questions.
   6. Checked, nothing found.
-  7. Not run / partial-run note.
+  7. Not run / partial-run note, and any tools active beyond the default.
   8. How to resolve: `[wrong]`, `[intentional]`, `[not-worth-it]`.
   9. `Needs human: <what> in <file:line>. Explained in the description: yes/no.`
 - Hidden HTML marker on every comment: bot ID, run ID, fingerprint,
@@ -219,8 +224,9 @@ Performed by code with the write token; no model involved.
 
 ## S-8 — Record
 
-Write the run record ([A-6](02-architecture.md#a-6--run-record)) and upload
-it as a workflow artifact. The review job writes nowhere else
+Write the run record ([A-6](02-architecture.md#a-6--run-record)), with
+`scripts.json` when codemode was used, and upload both as a workflow
+artifact. The review job writes nowhere else
 ([A-7](02-architecture.md#a-7--store)). Recording failures never affect the
 review.
 

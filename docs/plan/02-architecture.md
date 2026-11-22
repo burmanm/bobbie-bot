@@ -35,14 +35,15 @@ GitHub, which keeps most logic unit-testable without a model or network.
 | Module | Responsibility | May import |
 |---|---|---|
 | `core` | Types and schemas, diff parsing, skip-path handling, fingerprinting, dedupe, grounding checks, knowledge loading, summary assembly, run-record format | — |
-| `agent` | `AgentStep` interface: run one model step with a role, prompt, read roots, tool allowlist and limits; return typed tool outputs, rejected calls, usage and outcome. Signature proposed in [spike-r0-findings.md](spike-r0-findings.md#proposed-agentstep-interface). Implementation: pi SDK (subprocess possible later). Tests use the same implementation with pi's scripted model provider | `core` |
-| `pi-review` (pi package) | Extension: typed tools, tool-call guard, `/review` command. Method skill and prompt templates | `core` |
+| `agent` | `AgentStep` interface: run one model step with a role, prompt, read roots, tool set and limits; return typed tool outputs, rejected calls, usage and outcome. Signature proposed in [spike-r0-findings.md](spike-r0-findings.md#proposed-agentstep-interface). Implementation: pi SDK (subprocess possible later). Tests use the same implementation with pi's scripted model provider | `core` |
+| `pi-review/extension` | Typed tools, confined read tools, tool-call guard, loaded into each role session. Method skill and prompt templates beside it | `core` |
 | `platform` | `Platform` interface: fetch PR and comments, check runs, publish review and replies, read outcomes. Implementation: GitHub | `core` |
 | `store` | `Store` interface: append/read run records, outcomes and per-PR metrics records; `MetricsSink` for optional export ([O-2](10-metrics.md#o-2--how-the-numbers-are-collected)) | `core` |
 | `pipeline` | The stages in [03](03-review-pipeline.md) | all above |
 | `learn` | Harvest and learning jobs ([04](04-learning-loop.md)) | all above |
 | `eval` | Replay harness and mechanical diff ([05](05-evaluation.md)). No judging | all above |
-| `cli` | `review-bot review | harvest | learn | eval` | all above |
+| `pi-review` (pi package entry) | The `/review-bot` command: starts the pipeline ([F-3](01-foundation-pi.md#f-3--integration-shape)) | all above |
+| `cli` | The jobs that do not start pi: `review-bot` `gate`, `prepare`, `complete-check`, `setup`, `harvest`, `learn`, `eval` | all above |
 
 Interfaces that exist so they can be swapped later: `AgentStep` (pi SDK ↔
 subprocess ↔ Pi Durable), `Platform` (GitHub ↔ GitLab), `Store` (git
@@ -102,7 +103,7 @@ branch ([D-7](README.md#key-decisions)).
 | `AGENTS.md` (root) | repo owners | What the project is, conventions, how to verify, what counts as user-facing. Also checked for lines the PR makes stale |
 | `REVIEW.md` (root, optionally per area) | code owners | What failure looks like, focus, don't-flag, needs-human, skip paths, evidence rules, limits, summary format |
 | `.review/<family>-guidelines.md` | vendored from the source-of-truth repo | Rules shared by a family of repositories |
-| `.review/review-bot.yaml` (optional) | repo owners | Bot settings only: role→model map, limits, authorization label, CI wait. Overrides workflow inputs, but can only choose among models the operator's pi configuration provides, and can never add providers, endpoints or packages ([F-7](01-foundation-pi.md#f-7--configuration-follows-pi)) |
+| `.review/review-bot.yaml` (optional) | repo owners | Bot settings only: role→model map, limits, skip rules, authorization label, CI wait. Can only narrow the operator's models and limits (choose among `enabledModels`, lower limits), and can never add providers, endpoints, packages or tools ([F-7](01-foundation-pi.md#f-7--configuration-follows-pi)) |
 
 - **Per-area `REVIEW.md`:** a `REVIEW.md` in a subdirectory applies to
   changes under it, in addition to the root file.
@@ -136,7 +137,8 @@ review process's shared report envelope (`tool`, `toolVersion`, `repo`,
 - Versions: bot version, pi version, method-skill hash, knowledge base SHA,
   `fingerprintVersion`, role→model mapping as configured **and** the model
   ID the provider actually served for each step; every pi package loaded
-  from the operator configuration, with its resolved version, and a hash of
+  from the operator configuration, with its resolved version, each role's
+  active tools and any of the bot's tools a module replaced, and a hash of
   `models.json` ([F-7](01-foundation-pi.md#f-7--configuration-follows-pi)).
 - Inputs: file list with exclusions and reasons; which knowledge files were
   loaded.
@@ -156,6 +158,17 @@ review process's shared report envelope (`tool`, `toolVersion`, `repo`,
 
 The record does not hold file contents: repo + SHAs are enough to re-fetch
 them for replay.
+
+**Saved scripts** are the one exception, because a script can quote PR
+code. When a step used codemode, `scripts.json` is written next to the
+record and uploaded with it:
+
+- per script: step, tool call ID, source, outcome, and its nested calls as
+  tool name and error flag. A finding reported from inside a script keeps
+  that script's ID;
+- no script output and no tool results: the source and the record's SHAs
+  are enough to replay;
+- capped in size, with the source passed through `scrubSecrets`.
 
 ## A-7 — Store
 
@@ -193,7 +206,7 @@ retention.
 ```
 src/
   core/  agent/  platform/  store/  pipeline/  learn/  eval/  cli/
-pi-review/           # the pi package: package.json with "pi" manifest
+pi-review/           # the pi package: package.json with "pi" manifest, /review-bot
   extension/  skills/  prompts/
 action/              # GitHub Action wrapper (action.yml)
 workflows/           # reference workflow files for the sync tool to vendor

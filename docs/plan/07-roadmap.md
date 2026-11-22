@@ -46,26 +46,28 @@ it worth piloting.
 
 ## R-1a — pi-native configuration
 
-Before R-2 fixes the workflow inputs, so nothing has to be migrated later
-([F-7](01-foundation-pi.md#f-7--configuration-follows-pi)).
+The bot becomes a pi module that can load any pi module
+([F-7](01-foundation-pi.md#f-7--configuration-follows-pi),
+[D-19](README.md#key-decisions)). Best done before more repositories
+install the R-2 workflow, because it changes that workflow's inputs.
+Evidence: [r1a-proposal.md](r1a-proposal.md).
 
-- Answer F-7's five verification questions against pi 1.5.2.
-- The runner takes an operator pi agent directory (`settings.json`,
-  `models.json`); role models in pi's `provider/id[:thinking]` syntax;
-  remove the bot's own `thinking`, `providers` and `routing` fields in
-  favour of pi's.
-- Pi packages from `settings.json` `packages` or listed local
-  `node_modules` paths; `review-bot setup` installs them before secrets
-  exist. Loaded packages and versions in the run record.
-- Isolation regression test extended: an operator directory with a
-  package loads that package and nothing from the snapshot; an
-  `AGENTS.md` or `SYSTEM.md` in the operator directory is refused.
-- `.review/review-bot.yaml` limited to choosing among `enabledModels` and
-  lowering limits.
+In order, each step one change that passes typecheck and tests:
 
-Exit: a provider that pi does not ship (a pi provider package, or a
-`models.json` endpoint) is used for a dry run with no code change, and the
-same agent directory works for `/review` in pi.
+| # | Step | Done when |
+|---|---|---|
+| 1 | Neutral working directory for sessions, `safe.bareRepository=explicit` ([C-3a](06-ci-and-security.md#c-3a--pi-session-isolation)) | The isolation test plants a working-directory config and an embedded bare repository and neither takes effect. Relative paths still resolve in head |
+| 2 | Configuration: `reviewBot` in `settings.json`, `models.json`, model suffix, `.review/review-bot.yaml` narrowing only | A `models.json` endpoint works with no code change. The YAML cannot raise a limit or pick a model outside `enabledModels` |
+| 3 | `pi-review` becomes a package with `/review-bot` ([F-3](01-foundation-pi.md#f-3--integration-shape)) | Fixture output through pi equals the CLI's. Every row of F-3's command table has a test |
+| 4 | `review-bot setup`, module loading, per-role tools; the two open F-7 questions answered | Provider, tool, hook and tool-replacing fixture packages work. The hostile-PR test passes with them loaded. Setup runs no lifecycle scripts. An `AGENTS.md` or `SYSTEM.md` in the agent directory is refused. Loaded packages and versions are in the run record |
+| 5 | Codemode, nested accounting, saved scripts, wider `scrubSecrets` pattern | An injected script gets no canary. Nested cost hits the cap. An endless script is stopped. A script from `scripts.json` can be replayed |
+| 6 | Workflow, action, installing guide | One dry run on a cass-operator PR with codemode on and off, on Linux in the action image |
+
+Step 4 does not ship before step 1.
+
+Exit: a provider package, a tool-replacing package and codemode are each
+enabled by editing only the agent directory; the same directory works for
+`/review-bot` in pi; the hostile-PR test passes with all three enabled.
 
 ## R-2 — Live on the pilot
 
@@ -134,6 +136,9 @@ share does not fall.
 
 ## R-6 — Promotion to checks
 
+- Evaluate the saved codemode scripts ([A-6](02-architecture.md#a-6--run-record))
+  as check candidates: how many are detectors rather than one-off searches,
+  and do they hold on must-flag and must-not-flag fixtures.
 - Check-candidate detection, fixtures, PR adding the check and deleting the
   `REVIEW.md` line
   ([L-5](04-learning-loop.md#l-5--promotion-to-a-deterministic-check)).
@@ -149,6 +154,7 @@ Exit: at least one class of finding moved from model to CI.
   differ.
 - Cost work (below).
 - Integrations through pi packages / MCP: issue tracker context, chat.
+  R-1a makes them loadable; choosing and evaluating them is this item.
 - Import and diff of independently produced reviews
   ([L-7](04-learning-loop.md#l-7--teaching-and-interviewing-outside-the-bot)).
 - Metrics export to an external backend through `MetricsSink` (OTLP
@@ -195,8 +201,9 @@ started before R-3 data shows the need ([P-9](README.md#principles)).
 | Q-12 | Learn job and agent-context tuner | Build the learn job; expose the harvested data so the tuner can be added later |
 | Q-13 | Acceptable models and upstream providers | Owners decide per organization, and enforce it on the provider side (an OpenRouter key can be restricted to specific models). The role→model map is plain configuration because it will change often ([C-6](06-ci-and-security.md#c-6--model-provider)) |
 | Q-14 | A PR's `.gitignore` hiding files from the reviewer's search | Never allowed. No file in the PR changes what the reviewer can see or how the bot behaves; the search tools ignore the snapshot's ignore files, and a PR's changes to such files are reviewed like any other change ([C-3](06-ci-and-security.md#c-3--trust-model)) |
-| Q-15 | How the extension is loaded | Both: the runner passes it in-process; the package also exposes it by path for interactive `/review` |
+| Q-15 | How the extension is loaded | Both: the package is loaded by path for `/review-bot`, in CI and interactively, and the command passes the extension to each role session in-process |
 | Q-16 | Cost of timed-out steps | Mark the step `usageComplete: false` and report how many there were; no estimate. Totals can be reported with and without such steps if needed ([A-6](02-architecture.md#a-6--run-record)) |
+| Q-20 | Where the bot's settings live (decided 2026-11-22) | The `reviewBot` key of the agent directory's `settings.json`: pi keeps and exposes unknown keys ([F-7](01-foundation-pi.md#f-7--configuration-follows-pi)) |
 | — | Built-in review guidance | None; knowledge comes from the repository ([A-5](02-architecture.md#a-5--knowledge-sources)) |
 | — | Approval flow (state labels, human review requests) | Lives in review-process, not in the bot ([I-1](09-process-integration.md#i-1--what-lives-where)) |
 
@@ -207,4 +214,3 @@ started before R-3 data shows the need ([P-9](README.md#principles)).
 | Q-17 | When CI fails and the bot's check completes *skipped*, how does the review-process state workflow keep the PR away from people? | Raise in review-process ([I-5](09-process-integration.md#i-5--gaps-this-exposes-in-review-process-to-raise-there)); `ci.onFailure: skip` by default until it is settled |
 | Q-18 | Which event is the "human-approval request" for timings? | First `review/human` label, falling back to the first review request to a person; configurable until review-process defines it ([O-1](10-metrics.md#o-1--what-is-measured)) |
 | Q-19 | Should pure process timings be computed by the harvest job or read from `review-metrics`? | Harvest computes them with `review-metrics`'s definitions; switch to reading them if `review-metrics` publishes per-PR records ([O-3](10-metrics.md#o-3--relation-to-review-metrics)) |
-| Q-20 | Do pi's settings tolerate bot keys, so the bot's settings could live in `settings.json` too? | Keep a separate bot file unless F-7 verification shows a supported place for extension settings |

@@ -30,6 +30,7 @@ PRs.
 | [08-research-notes.md](08-research-notes.md) | Digest of the sources this plan draws on, with what is unverified | — |
 | [09-process-integration.md](09-process-integration.md) | What lives in the bot versus the review process; the contract the bot must honour | `I-*` |
 | [10-metrics.md](10-metrics.md) | Production metrics (cost, findings, rounds, human comments, missed findings, timings) and how they are collected | `O-*` |
+| [r1a-proposal.md](r1a-proposal.md) | The accepted R-1a proposal, with the evidence behind F-7 and D-19 | — |
 | [spike-r0-findings.md](spike-r0-findings.md) | Verified answers to the pi questions, with evidence; proposed `AgentStep` interface | — |
 
 ## Principles
@@ -45,8 +46,9 @@ mechanizable findings are promoted to deterministic checks, after which the
 model stops reporting that class. See [L-5](04-learning-loop.md#l-5--promotion-to-a-deterministic-check).
 
 **P-3 — Code controls flow.** The orchestrator is ordinary TypeScript. Models
-never decide which stage runs next, never post to GitHub, and never see write
-credentials.
+never decide which stage runs next and, with the default tools, never post to
+GitHub or see write credentials. Modules the maintainers configure are trusted
+code and are not held to this ([D-19](#key-decisions)).
 
 **P-4 — Model-agnostic.** No stage depends on a specific model. Stages name a
 *role* (`reviewer`, `verifier`, optionally `learner`); configuration maps roles
@@ -92,9 +94,9 @@ start.
 | ID | Decision | Detail |
 |---|---|---|
 | D-1 | Build on `@earendil-works/pi-coding-agent` (MIT), shipped as a pi package | [F-1](01-foundation-pi.md#f-1--what-pi-is) |
-| D-2 | Headless runs drive pi through its SDK from our own orchestrator (confirmed by the R-0 spike, pi pinned to 1.5.2); pi's `--mode json` remains possible behind the same interface | [F-3](01-foundation-pi.md#f-3--integration-shape) |
+| D-2 | Each model step is a pi SDK session created by our own orchestrator (confirmed by the R-0 spike, pi pinned to 1.5.2). The orchestrator is started as a pi command, so the whole bot is a pi module. Jobs without a model stay plain CLI | [F-3](01-foundation-pi.md#f-3--integration-shape) |
 | D-3 | Do **not** build on Pi Durable now; keep stage boundaries so it can be adopted later | [F-4](01-foundation-pi.md#f-4--pi-durable-decision) |
-| D-4 | Findings are emitted through a typed tool call, never parsed from prose | [A-3](02-architecture.md#a-3--finding) |
+| D-4 | Findings are emitted through a typed tool call, never parsed from prose. Guaranteed unless an operator's module replaces the output tools | [A-3](02-architecture.md#a-3--finding) |
 | D-5 | Review state lives in GitHub (hidden markers in the bot's own comments); the review job itself needs no database | [S-7](03-review-pipeline.md#s-7--publish) |
 | D-6 | Knowledge is the repository's own `AGENTS.md`, `REVIEW.md` and vendored guidelines; no built-in guidance, no bot-private format | [A-5](02-architecture.md#a-5--knowledge-sources) |
 | D-7 | Knowledge is always read from the base branch, never from the PR head | [C-3](06-ci-and-security.md#c-3--trust-model) |
@@ -105,10 +107,11 @@ start.
 | D-12 | The job that holds secrets never checks out or executes PR code; fork PRs are the main path | [C-4](06-ci-and-security.md#c-4--fork-pull-requests-and-authorization) |
 | D-13 | The review job writes only a workflow artifact; durable records are written by the scheduled harvest job | [A-7](02-architecture.md#a-7--store) |
 | D-14 | Every run completes its `ai-review/<name>` check run, whatever happens | [S-9](03-review-pipeline.md#s-9--failure-behaviour) |
-| D-15 | Every pi session is created with explicit isolation, and the tool guard confines paths; a regression test guards both | [C-3a](06-ci-and-security.md#c-3a--pi-session-isolation) |
+| D-15 | Every pi session is created with explicit isolation in a working directory outside the PR's tree, and the tool guard confines the read tools' paths; a regression test guards both, with modules loaded | [C-3a](06-ci-and-security.md#c-3a--pi-session-isolation) |
 | D-16 | Optionally, no review until the repository's CI has passed on the head SHA; the check waits as *queued* | [C-9](06-ci-and-security.md#c-9--waiting-for-ci) |
 | D-17 | Metrics are pulled by the harvest job from run records and the GitHub API, stored with the run records, and optionally exported from there; the review job pushes nothing | [O-2](10-metrics.md#o-2--how-the-numbers-are-collected) |
-| D-18 | Configuration follows pi: providers, models and pi packages live in an operator pi agent directory in pi's format; the bot's own file holds only what pi has no concept for | [F-7](01-foundation-pi.md#f-7--configuration-follows-pi) |
+| D-18 | Configuration follows pi: any pi module can be loaded; providers, models, packages and the bot's own settings (`reviewBot` in `settings.json`) live in an operator pi agent directory | [F-7](01-foundation-pi.md#f-7--configuration-follows-pi) |
+| D-19 | The trust line is a merge: nothing from a PR is executed or becomes configuration without one. What maintainers merged, modules included, is trusted and shares the process with the job's credentials | [C-3](06-ci-and-security.md#c-3--trust-model) |
 
 ## Glossary
 
@@ -117,6 +120,9 @@ start.
 - **Check** — a deterministic detector (lint rule, script) in the repository's CI.
 - **Outcome** — what happened to a published finding: `fixed`, `wrong`, `intentional`, `not-worth-it`.
 - **Knowledge** — a repository's `AGENTS.md`, `REVIEW.md` and vendored shared guidelines.
+- **Agent directory** — the operator's pi configuration directory: `settings.json`,
+  `models.json`, and what they list.
+- **Module** — a pi package or extension listed in the agent directory.
 - **Method** — the bot's own instructions on how to review; contains nothing repository-specific.
 - **Role** — a named model slot in configuration.
 - **RP** — the `review-process` repository.

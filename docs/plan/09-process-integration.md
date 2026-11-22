@@ -22,7 +22,7 @@ References below of the form *RP §n* point at `review-process/00-plan.md`;
 | Waiting for CI before reviewing | **review bot** gate job ([C-9](06-ci-and-security.md#c-9--waiting-for-ci)) | Saves model cost on red builds; no state labels involved |
 | Reading the change, producing verified findings, posting one review | **review bot** | Judgement |
 | Recording finding outcomes; proposing changes to `REVIEW.md`, lint config or CI checks | **review bot** (harvest and learn jobs) | Needs the bot's run records and fingerprints |
-| Local pre-PR review (RP layer 1, step 3.3) | **review bot** pi package, `/review` | Same pipeline on a working tree |
+| Local pre-PR review (RP layer 1, step 3.3) | **review bot** pi package, `/review-bot` | Same pipeline on a working tree |
 
 **Recommendation on the approval flow (tests → LLM review → human review):
 keep it outside the bot.** It is a state machine over GitHub events with no
