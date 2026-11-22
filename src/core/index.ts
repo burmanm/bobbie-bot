@@ -15,6 +15,6 @@ export * from "./markdown.ts";
 export * from "./grounding.ts";
 export * from "./reconcile.ts";
 export * from "./summary.ts";
-export { BOT_VERSION } from "./version.ts";
+export { BOT_VERSION, PI_PINNED_VERSION } from "./version.ts";
 export * from "./history.ts";
 export * from "./review-areas.ts";

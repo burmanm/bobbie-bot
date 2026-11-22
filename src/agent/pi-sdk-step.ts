@@ -17,7 +17,7 @@ import {
   type AgentSessionEvent,
   createAgentSession,
   DefaultResourceLoader,
-  ModelRuntime,
+  type ModelRuntime,
   SessionManager,
   SettingsManager,
   VERSION as PI_VERSION,
@@ -35,6 +35,7 @@ import {
   type QueryTool,
 } from "../../pi-review/extension/index.ts";
 import { StepAccounting } from "./accounting.ts";
+import { createModelRuntime, ModelsFileError } from "./model-runtime.ts";
 import { stopReasonOf } from "./limits.ts";
 import { summarizeProviderRequest } from "./request-summary.ts";
 import type {
@@ -62,6 +63,12 @@ export interface PiSdkAgentStepOptions {
   retry?: { enabled: boolean; maxRetries?: number; baseDelayMs?: number };
   /** How long to wait for pi to settle after an abort before giving up on it. */
   abortGraceMs?: number;
+  /**
+   * The operator's agent directory (F-7): its `models.json` adds providers,
+   * endpoints and model overrides. Nothing else in it is read here; modules
+   * are R-1a step 4b. Absent: pi's built-in catalog only.
+   */
+  agentDir?: string;
 }
 
 const DEFAULT_RETRY = { enabled: true, maxRetries: 2, baseDelayMs: 1000 };
@@ -240,14 +247,14 @@ async function runStep<T extends OutputTool>(
     // it starts finds configuration from the PR in its working directory.
     cwd = mkdtempSync(join(temp, "review-bot-cwd-"));
 
-    // Model runtime: credentials file in the private, empty agent dir;
-    // models.json not read; the API key comes from the environment.
-    const modelRuntime = await ModelRuntime.create({ authPath: join(agentDir, "auth.json"), modelsPath: null });
-    const ownProviders = new Set<string>();
-    for (const provider of options.providers ?? []) {
-      modelRuntime.registerNativeProvider(provider);
-      ownProviders.add(provider.id);
-    }
+    // Model runtime (F-7, C-3a): pi's catalog and the operator's models.json;
+    // credentials and catalog cache in memory; the API key comes from the
+    // environment or models.json.
+    const modelRuntime = await createModelRuntime({
+      ...(options.agentDir === undefined ? {} : { agentDir: options.agentDir }),
+      ...(options.providers === undefined ? {} : { providers: options.providers }),
+    });
+    const ownProviders = new Set<string>((options.providers ?? []).map((p) => p.id));
     let model = modelRuntime.getModel(request.model.provider, request.model.id);
     if (model === undefined) {
       // C-6: models change faster than pi's offline catalog. Like pi's own CLI
@@ -366,7 +373,7 @@ async function runStep<T extends OutputTool>(
     return finish();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return fail(error instanceof ConfigError || /^read root/.test(message) ? "config" : "internal", message);
+    return fail(error instanceof ConfigError || error instanceof ModelsFileError || /^read root/.test(message) ? "config" : "internal", message);
   } finally {
     session?.dispose();
     for (const dir of [agentDir, cwd]) {

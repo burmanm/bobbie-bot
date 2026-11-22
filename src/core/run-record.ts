@@ -19,6 +19,10 @@ export const StepRecord = Type.Object({
   name: Type.String({ description: 'e.g. "review", "verify:<finding id>"' }),
   role: Type.Enum(["reviewer", "verifier", "learner"] as const),
   configuredModel: Type.String({ description: "provider/id as configured for the role" }),
+  /** pi's thinking level for the step; absent is "off" (F-7, A-6). */
+  thinkingLevel: Type.Optional(Type.String()),
+  /** Tools declared to the model in this step (A-6, F-7). */
+  tools: Type.Optional(Type.Array(Type.String())),
   servedModels: Type.Array(Type.String(), { description: "responseModel ?? model, distinct" }),
   outcome: Type.Enum(STEP_OUTCOMES),
   error: Type.Optional(Type.String()),
@@ -129,6 +133,12 @@ export const RunInfo = Type.Object({
     knowledgeBaseSha: Type.String(),
     fingerprintVersion: Type.Integer({ minimum: 1 }),
     roles: Type.Record(Type.String(), Type.String(), { description: "role -> model, as configured" }),
+    /** role -> pi thinking level, as configured (F-7). */
+    thinking: Type.Optional(Type.Record(Type.String(), Type.String())),
+    /** role -> configured tools before output tools, as resolved from settings.json (F-7). */
+    tools: Type.Optional(Type.Record(Type.String(), Type.Array(Type.String()))),
+    /** SHA-256 of the agent directory's models.json, when there is one (F-7). */
+    modelsJsonSha256: Type.Optional(Type.String()),
   }),
   // Inputs
   files: Type.Array(FileRecord),

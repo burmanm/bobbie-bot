@@ -8,13 +8,18 @@
  * treats a malformed file as a warning; for the bot it is a configuration
  * error (F-3).
  */
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { type Static, type TSchema, Type } from "typebox";
 import { Value } from "typebox/value";
 import type { ModelRef, StepLimits, ThinkingLevel } from "../agent/index.ts";
+// types.ts directly: agent/index.ts loads pi.
+import { THINKING_LEVELS } from "../agent/types.ts";
 
 export const SETTINGS_FILE = "settings.json";
+/** pi's; read by pi (src/agent/model-runtime.ts), only hashed here. */
+export const MODELS_FILE = "models.json";
 
 export const PIPELINE_ROLES = ["reviewer", "verifier"] as const;
 export type PipelineRole = (typeof PIPELINE_ROLES)[number];
@@ -34,8 +39,7 @@ export function quoteValue(value: string): string {
 
 // ---- model syntax ---------------------------------------------------------
 
-/** pi's thinking levels (`--thinking`, the `--model` suffix). */
-const PI_THINKING_LEVELS: readonly string[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const isThinkingLevel = (s: string): s is ThinkingLevel => (THINKING_LEVELS as readonly string[]).includes(s);
 
 /**
  * `provider/id[:thinking]`, as pi's `--model` takes it (F-7). Only a
@@ -51,12 +55,12 @@ export function parseModelSpec(spec: string): ModelRef {
   const slash = s.indexOf("/");
   const rest = s.slice(slash + 1);
   const colon = rest.lastIndexOf(":");
-  const level = colon !== -1 && PI_THINKING_LEVELS.includes(rest.slice(colon + 1)) ? rest.slice(colon + 1) : undefined;
+  const suffix = colon === -1 ? undefined : rest.slice(colon + 1);
+  const level = suffix !== undefined && isThinkingLevel(suffix) ? suffix : undefined;
   const id = level === undefined ? rest : rest.slice(0, colon);
   if (slash <= 0 || id === "") throw new ConfigError(`model ${quoteValue(spec)} must be "<provider>/<model id>[:<thinking>]"`);
   const ref: ModelRef = { provider: s.slice(0, slash), id };
-  // src/agent's ThinkingLevel lacks pi's xhigh and max until R-1a step 2b widens it.
-  if (level !== undefined) ref.thinkingLevel = level as ThinkingLevel;
+  if (level !== undefined) ref.thinkingLevel = level;
   return ref;
 }
 
@@ -215,6 +219,17 @@ export interface AgentSettings {
   packages: PackageSource[];
 }
 
+/**
+ * No agent directory (a local dry run without `--agent-dir`): no bot
+ * settings and no `enabledModels`, so the models are what the inputs name
+ * and the YAML cannot change them (F-7). Frozen: shared by every caller.
+ */
+export const NO_AGENT_SETTINGS: AgentSettings = Object.freeze({
+  reviewBot: Object.freeze({}),
+  enabledModels: Object.freeze([]) as unknown as string[],
+  packages: Object.freeze([]) as unknown as PackageSource[],
+});
+
 /** Paths and messages only: the file may hold credentials, so never its values. */
 function schemaErrors(schema: TSchema, data: unknown): string {
   return [...Value.Errors(schema, data)]
@@ -271,6 +286,21 @@ export function readAgentSettings(agentDir: string): AgentSettings {
     throw new ConfigError(`cannot read ${file}: ${(e as NodeJS.ErrnoException).code ?? "unknown error"}`);
   }
   return parseAgentSettings(text, file);
+}
+
+/**
+ * SHA-256 of `<agentDir>/models.json` for the run record (A-6), or undefined
+ * when there is none. The bytes are hashed, never kept: the file may hold keys.
+ */
+export function modelsJsonSha256(agentDir: string): string | undefined {
+  let bytes: Buffer;
+  try {
+    if (!readdirSync(agentDir).includes(MODELS_FILE)) return undefined;
+    bytes = readFileSync(join(agentDir, MODELS_FILE));
+  } catch (e) {
+    throw new ConfigError(`cannot read ${join(agentDir, MODELS_FILE)}: ${(e as NodeJS.ErrnoException).code ?? "unknown error"}`);
+  }
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 /**

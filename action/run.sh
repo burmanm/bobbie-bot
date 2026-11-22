@@ -10,7 +10,13 @@
 # script by the workflow), are validated here, and become argv. The
 # container gets only the environment it needs: GH_TOKEN for the GitHub
 # commands, and the provider key only for `review`. Mounts are explicit;
-# the prepared snapshot is mounted read-only.
+# the prepared snapshot and the agent directory are mounted read-only.
+#
+# The operator's agent directory (F-7, RB_AGENT_DIR: a path in the
+# repository) comes from the default branch, or from RB_AGENT_DIR_REPO
+# (owner/name@<commit SHA>), never from the PR (D-19). The gate fetches it
+# through the API into $work/agent/dir; the workflow hands that directory to
+# the review job as an artifact, and `review` expects it there.
 set -euo pipefail
 set -f
 
@@ -68,6 +74,19 @@ docker_args=(
 args=()
 
 need_sha() { [[ "$2" =~ ^[0-9a-f]{40}$ ]] || fail "$1 must be a 40-hex SHA"; }
+
+agent_dir="$work/agent/dir"
+agent_path="${RB_AGENT_DIR:-}"
+if [[ -n "$agent_path" ]]; then
+  [[ "$agent_path" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && ! "/$agent_path/" =~ /\.\.?/ ]] || fail "invalid agent-dir (a relative directory in the repository): $agent_path"
+fi
+# Mount the agent directory read-only and name it to the CLI.
+use_agent_dir() {
+  [[ -n "$agent_path" ]] || return 0
+  [[ -d "$agent_dir" && ! -L "$agent_dir" ]] || fail "agent-dir is set but $agent_dir is missing (the gate job fetches it; the review job downloads it)"
+  docker_args+=(-v "$agent_dir:/agent:ro")
+  args+=(--agent-dir /agent)
+}
 need_pr() { [[ "$1" =~ ^[1-9][0-9]*$ ]] || fail "pr must be a PR number"; }
 # Multi-line `role=value` inputs, one flag per non-empty line.
 role_lines() {
@@ -92,9 +111,32 @@ case "$cmd" in
     # Run records for checks the gate completes itself (R-2 exit, A-6); the
     # workflow uploads them like the review job's.
     mkdir -p "$out/records"
-    args=(gate --repo "$repo" --name "$name" --label "${RB_AUTH_LABEL:-ai-review/approved}" --lifetime "${RB_AUTH_LIFETIME:-per-push}" --records-dir /github/out/records)
+    # The agent directory first (F-7): from the default branch or a pinned
+    # commit, never the PR. GH_TOKEN reads it; no other secret is present.
+    if [[ -n "$agent_path" ]]; then
+      fetch=(fetch-agent-dir --path "$agent_path" --dest /agent-out/dir)
+      agent_repo="${RB_AGENT_DIR_REPO:-}"
+      if [[ -z "$agent_repo" ]]; then
+        fetch+=(--repo "$repo")
+      else
+        [[ "$agent_repo" =~ ^([A-Za-z0-9-]+/[A-Za-z0-9._-]+)@([0-9a-f]{40})$ ]] || fail "agent-dir-repo must be owner/name@<40-hex commit SHA>: $agent_repo"
+        fetch+=(--repo "${BASH_REMATCH[1]}" --ref "${BASH_REMATCH[2]}")
+      fi
+      rm -rf "$work/agent" && mkdir -p "$work/agent"
+      docker run --rm --init --cap-drop ALL --security-opt no-new-privileges --read-only \
+        --tmpfs /tmp:rw,nosuid,nodev,size=64m --user "$(id -u):$(id -g)" -e HOME=/tmp -e GH_TOKEN -e GITHUB_API_URL \
+        -v "$work/agent:/agent-out" "$image" "${fetch[@]}"
+    fi
+    # Label and lifetime only when given: unset inputs leave settings.json's (F-7).
+    args=(gate --repo "$repo" --name "$name" --records-dir /github/out/records)
+    if [[ -n "${RB_AUTH_LABEL:-}" ]]; then args+=(--label "$RB_AUTH_LABEL"); fi
+    if [[ -n "${RB_AUTH_LIFETIME:-}" ]]; then
+      [[ "$RB_AUTH_LIFETIME" =~ ^(per-push|per-pr)$ ]] || fail "invalid auth-label-lifetime: $RB_AUTH_LIFETIME"
+      args+=(--lifetime "$RB_AUTH_LIFETIME")
+    fi
+    use_agent_dir
     if [[ -n "${RB_PR:-}" ]]; then need_pr "$RB_PR"; args+=(--pr "$RB_PR"); fi
-    # Waiting for CI (C-9); .review/review-bot.yaml on the base branch overrides these.
+    # Waiting for CI (C-9): over settings.json; ci in .review/review-bot.yaml on the base branch replaces these.
     if [[ -n "${RB_CI_REQUIRE:-}" ]]; then
       (( ${#RB_CI_REQUIRE} <= 4000 )) || fail "ci-require is too long"
       [[ "$RB_CI_REQUIRE" != *[$'\x01'-$'\x09'$'\x0b'-$'\x1f'$'\x7f']* ]] || fail "ci-require has control characters"
@@ -145,7 +187,7 @@ case "$cmd" in
     # 2. Review. The snapshot is mounted read-only; nothing in it is executed.
     args=(review --pr "$repo#$RB_PR" --snapshot-dir /snapshot --runs-dir /runs --name "$name")
     role_lines --model '^(reviewer|verifier)=[^[:space:]]+$' "${RB_MODELS:-}"
-    role_lines --thinking '^(reviewer|verifier)=(off|minimal|low|medium|high)$' "${RB_THINKING:-}"
+    role_lines --thinking '^(reviewer|verifier)=(off|minimal|low|medium|high|xhigh|max)$' "${RB_THINKING:-}"
     role_lines --providers '^(reviewer|verifier)=[A-Za-z0-9._,-]+$' "${RB_PROVIDERS:-}"
     # What the gate knew about the wait for CI (A-6, C-9): one JSON line, checked again by the CLI.
     if [[ -n "${RB_WAITING:-}" ]]; then
@@ -160,6 +202,7 @@ case "$cmd" in
       args+=(--max-cost "$RB_MAX_COST")
     fi
     docker_args+=(-e GH_TOKEN -v "$work/snapshot:/snapshot:ro" -v "$work/runs:/runs")
+    use_agent_dir
     # Provider keys by name, from this step's environment (C-6). Never a GitHub token.
     provider_env="${RB_PROVIDER_ENV:-OPENROUTER_API_KEY}"
     for var in ${provider_env//,/ }; do
@@ -173,12 +216,14 @@ case "$cmd" in
     minutes="${RB_TIMEOUT_MINUTES:-40}"
     [[ "$minutes" =~ ^[1-9][0-9]*$ ]] || fail "invalid timeout-minutes: $minutes"
     seconds=$(( minutes * 60 > 120 ? minutes * 60 - 60 : minutes * 60 ))
-    # The pipeline's own run deadline sits a further two minutes inside that
+    # The pipeline's run deadline sits a further two minutes inside that
     # (S-4 Limits, S-9): it aborts the running step, publishes what it has
     # labelled partial and completes the check as neutral before SIGTERM.
-    # A runTimeout in the base branch's .review/review-bot.yaml still wins.
+    # A ceiling, not a value: a lower runTimeoutSeconds in settings.json or
+    # the base branch's .review/review-bot.yaml takes effect, a higher one
+    # is cut to it (F-7).
     run_deadline=$(( seconds > 300 ? seconds - 120 : seconds * 3 / 4 ))
-    args+=(--run-timeout "${run_deadline}s")
+    args+=(--max-run-timeout "${run_deadline}s")
     container="review-bot-$$-${GITHUB_RUN_ID:-local}"
     docker_args+=(--name "$container")
     set +e

@@ -26,6 +26,8 @@ for a in "$@"; do
     printf 'review=true\\nhead-sha=%s\\n' "$(printf 'a%.0s' {1..40})" > "$d/output"
     echo "gate summary" > "$d/summary.md"
   fi
+  # fetch-agent-dir writes the directory (F-7).
+  if [[ "$prev" == -v && "$a" == *:/agent-out ]]; then mkdir -p "\${a%:/agent-out}/dir"; fi
   prev="$a"
 done
 [[ " $* " == *" review --pr "* ]] && exit "\${FAKE_EXIT:-0}"
@@ -96,7 +98,7 @@ test("gate: token passed by name, event read-only, well-formed outputs forwarded
   assert.ok(flagValues(argv, "-e").includes("GH_TOKEN"));
   assert.ok(!argv.join(" ").includes("ghs_secret_github_token"));
   assert.ok(flagValues(argv, "-v").includes(`${join(s.dir, "event.json")}:/github/event.json:ro`));
-  assert.deepEqual(argv.slice(argv.indexOf("review-bot-action:local") + 1), ["gate", "--repo", "k8ssandra/cass-operator", "--name", "main", "--label", "ai-review/approved", "--lifetime", "per-pr", "--records-dir", "/github/out/records"]);
+  assert.deepEqual(argv.slice(argv.indexOf("review-bot-action:local") + 1), ["gate", "--repo", "k8ssandra/cass-operator", "--name", "main", "--records-dir", "/github/out/records", "--label", "ai-review/approved", "--lifetime", "per-pr"]);
   assert.match(readFileSync(join(s.dir, "output"), "utf8"), /^review=true\nhead-sha=a{40}\n$/);
   assert.match(readFileSync(join(s.dir, "summary"), "utf8"), /gate summary/);
 });
@@ -134,8 +136,8 @@ test("review: extraction offline and keyless; the review gets the snapshot read-
   assert.deepEqual(cli, [
     "review", "--pr", "k8ssandra/cass-operator#1021", "--snapshot-dir", "/snapshot", "--runs-dir", "/runs", "--name", "main",
     "--model", "reviewer=openrouter/vendor/model-a", "--model", "verifier=openrouter/vendor/model-b", "--thinking", "verifier=low", "--max-cost", "3",
-    // 30 min step: container stopped at 29 min, run deadline 2 min inside that (S-9).
-    "--run-timeout", "1620s",
+    // 30 min step: container stopped at 29 min, run deadline at most 2 min inside that (S-9).
+    "--max-run-timeout", "1620s",
   ]);
   assert.ok(!cli.includes("--dry-run"));
 });
@@ -232,4 +234,52 @@ test("image (C-4): a digest in image.lock is pulled, never built; no digest buil
   // The repository's own lock names no image or exactly one digest.
   const lock = readFileSync(join(ACTION, "image.lock"), "utf8").split("\n").filter((l) => l.trim() !== "" && !l.trim().startsWith("#"));
   assert.ok(lock.length === 0 || (lock.length === 1 && /@sha256:[0-9a-f]{64}$/.test(lock[0]!.trim())), lock.join("|"));
+});
+
+test("agent directory (F-7): the gate fetches it from the default branch or a pinned commit and mounts it read-only", async () => {
+  const s = setup();
+  const r = await run(s, { RB_COMMAND: "gate", RB_AGENT_DIR: ".github/review-bot" });
+  assert.equal(r.code, 0, r.stderr);
+  const [fetch, gate] = r.calls.filter((c) => c[0] === "run") as [string[], string[]];
+  assert.deepEqual(fetch.slice(fetch.indexOf("review-bot-action:local") + 1), ["fetch-agent-dir", "--path", ".github/review-bot", "--dest", "/agent-out/dir", "--repo", "k8ssandra/cass-operator"]);
+  assert.ok(flagValues(fetch, "-e").includes("GH_TOKEN") && !flagValues(fetch, "-e").some((e) => e.startsWith("OPENROUTER")));
+  assert.ok(flagValues(gate, "-v").includes(`${join(s.dir, "review-bot", "agent", "dir")}:/agent:ro`));
+  assert.deepEqual(flagValues(gate, "--agent-dir"), ["/agent"]);
+  assert.ok(!gate.includes("--label") && !gate.includes("--lifetime"), "unset inputs leave settings.json's values");
+
+  const pinned = await run(setup(), { RB_COMMAND: "gate", RB_AGENT_DIR: "agent", RB_AGENT_DIR_REPO: `org/config@${"e".repeat(40)}` });
+  assert.equal(pinned.code, 0, pinned.stderr);
+  const f = pinned.calls.find((c) => c.includes("fetch-agent-dir"))!;
+  assert.deepEqual(f.slice(f.indexOf("fetch-agent-dir")), ["fetch-agent-dir", "--path", "agent", "--dest", "/agent-out/dir", "--repo", "org/config", "--ref", "e".repeat(40)]);
+
+  for (const bad of [{ RB_AGENT_DIR: "../etc" }, { RB_AGENT_DIR: "/abs" }, { RB_AGENT_DIR: "a/./b" }, { RB_AGENT_DIR: "a b" }, { RB_AGENT_DIR: "a", RB_AGENT_DIR_REPO: "org/config@main" }, { RB_AGENT_DIR: "a", RB_AGENT_DIR_REPO: "org/config" }]) {
+    const res = await run(setup(), { RB_COMMAND: "gate", ...bad });
+    assert.equal(res.code, 2, JSON.stringify(bad));
+    assert.ok(!res.calls.some((c) => c.includes("fetch-agent-dir")), JSON.stringify(bad));
+  }
+});
+
+test("agent directory (F-7): the review mounts the gate's copy read-only and never fetches; without it the step fails", async () => {
+  const mk = () => {
+    const s = setup();
+    mkdirSync(join(s.dir, "review-bot", "in"), { recursive: true });
+    writeFileSync(join(s.dir, "review-bot", "in", "snapshot.tar.gz"), "");
+    return s;
+  };
+  const s = mk();
+  mkdirSync(join(s.dir, "review-bot", "agent", "dir"), { recursive: true });
+  const r = await run(s, { RB_COMMAND: "review", RB_PR: "5", RB_AGENT_DIR: ".github/review-bot" });
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(!r.calls.some((c) => c.includes("fetch-agent-dir")));
+  const review = r.calls.filter((c) => c[0] === "run")[1]!;
+  assert.ok(flagValues(review, "-v").includes(`${join(s.dir, "review-bot", "agent", "dir")}:/agent:ro`));
+  assert.deepEqual(flagValues(review, "--agent-dir"), ["/agent"]);
+  assert.deepEqual(flagValues(review, "--max-run-timeout"), ["2220s"], "a ceiling, so lower configured values apply");
+  assert.ok(!review.includes("--run-timeout"));
+
+  const missing = await run(mk(), { RB_COMMAND: "review", RB_PR: "5", RB_AGENT_DIR: ".github/review-bot" });
+  assert.equal(missing.code, 2);
+  assert.match(missing.stderr, /agent-dir is set but .* is missing/);
+  const thinking = await run(mk(), { RB_COMMAND: "review", RB_PR: "5", RB_THINKING: "reviewer=xhigh\nverifier=max" });
+  assert.equal(thinking.code, 0, thinking.stderr);
 });

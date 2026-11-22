@@ -10,7 +10,7 @@ import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import { createPiSdkAgentStep, createScriptedProvider } from "../agent/index.ts";
 import { DryRunPlatform, FixturePrReader } from "../platform/index.ts";
 import { type AgentSettings, parseAgentSettings, parseModelSpec, readAgentSettings, resolveRoleTools } from "./agent-settings.ts";
-import { ConfigError, type ConfigInputs, DEFAULT_LIMITS, resolveConfig, resolveEnabledModels } from "./config.ts";
+import { ConfigError, type ConfigInputs, DEFAULT_LIMITS, NO_AGENT_SETTINGS, resolveConfig, resolveEnabledModels } from "./config.ts";
 import { runReview } from "./run.ts";
 import { DEFAULT_SKIP } from "./skip.ts";
 
@@ -258,7 +258,7 @@ describe("precedence (F-7, C-2)", () => {
   });
 });
 
-describe("the base branch's limits only narrow, with or without settings (F-7)", () => {
+describe("the base branch's limits only narrow, with or without an agent directory (F-7)", () => {
   const fields: Array<[key: string, base: number]> = [
     ["reviewer.timeoutSeconds", 1200],
     ["reviewer.idleTimeoutSeconds", 180],
@@ -281,7 +281,7 @@ describe("the base branch's limits only narrow, with or without settings (F-7)",
   };
   for (const [key, base] of fields) {
     test(key, () => {
-      for (const settings of [undefined, settingsOf({})]) {
+      for (const settings of [NO_AGENT_SETTINGS, settingsOf({})]) {
         assert.equal(effective(resolveConfig({}, yaml(key, base - 1), settings), key), base - 1, "lower");
         assert.equal(effective(resolveConfig({}, yaml(key, base), settings), key), base, "equal");
         assert.throws(() => resolveConfig({}, yaml(key, base + 1), settings), new RegExp(`${key} ${base + 1} \\(at most ${base}\\)`));
@@ -291,17 +291,17 @@ describe("the base branch's limits only narrow, with or without settings (F-7)",
 
   test("maxCostUsd can be set where there is none, and then only lowered", () => {
     for (const role of ["reviewer", "verifier"] as const) {
-      assert.equal(resolveConfig({}, `limits: { ${role}: { maxCostUsd: 2 } }`).limits[role].maxCostUsd, 2);
+      assert.equal(resolveConfig({}, `limits: { ${role}: { maxCostUsd: 2 } }`, NO_AGENT_SETTINGS).limits[role].maxCostUsd, 2);
       const inputs: ConfigInputs = { limits: { [role]: { maxCostUsd: 1 } } };
-      assert.equal(resolveConfig(inputs, `limits: { ${role}: { maxCostUsd: 0.5 } }`).limits[role].maxCostUsd, 0.5);
-      assert.throws(() => resolveConfig(inputs, `limits: { ${role}: { maxCostUsd: 2 } }`), new RegExp(`${role}\\.maxCostUsd 2 \\(at most 1\\)`));
+      assert.equal(resolveConfig(inputs, `limits: { ${role}: { maxCostUsd: 0.5 } }`, NO_AGENT_SETTINGS).limits[role].maxCostUsd, 0.5);
+      assert.throws(() => resolveConfig(inputs, `limits: { ${role}: { maxCostUsd: 2 } }`, NO_AGENT_SETTINGS), new RegExp(`${role}\\.maxCostUsd 2 \\(at most 1\\)`));
     }
   });
 
   test("chunkPatchLines is fixed: neither direction narrows", () => {
-    assert.equal(resolveConfig({}, "limits: { chunkPatchLines: 4000 }").limits.chunkPatchLines, 4000);
-    for (const value of [1, 3999, 4001]) assert.throws(() => resolveConfig({}, `limits: { chunkPatchLines: ${value} }`), /chunkPatchLines \d+ \(fixed at 4000\)/);
-    assert.equal(resolveConfig({ chunkPatchLines: 800 }, "limits: { chunkPatchLines: 800 }").limits.chunkPatchLines, 800);
+    assert.equal(resolveConfig({}, "limits: { chunkPatchLines: 4000 }", NO_AGENT_SETTINGS).limits.chunkPatchLines, 4000);
+    for (const value of [1, 3999, 4001]) assert.throws(() => resolveConfig({}, `limits: { chunkPatchLines: ${value} }`, NO_AGENT_SETTINGS), /chunkPatchLines \d+ \(fixed at 4000\)/);
+    assert.equal(resolveConfig({ chunkPatchLines: 800 }, "limits: { chunkPatchLines: 800 }", NO_AGENT_SETTINGS).limits.chunkPatchLines, 800);
   });
 });
 
@@ -393,7 +393,7 @@ describe("a hostile base branch (C-3, D-19)", () => {
   test("every escalation in one file is refused at once and named", async () => {
     const yaml = [
       "roles:",
-      "  reviewer: { model: openrouter/elsewhere/thing, thinking: high, providers: [evil], routing: { order: [evil] } }",
+      "  reviewer: { model: openrouter/elsewhere/thing }",
       "  verifier: evil/anthropic/claude-x",
       "limits:",
       "  reviewer: { timeoutSeconds: 99999, idleTimeoutSeconds: 99999, maxTurns: 100000 }",
@@ -406,9 +406,6 @@ describe("a hostile base branch (C-3, D-19)", () => {
       assert.ok(e instanceof ConfigError);
       for (const key of [
         "roles.reviewer ",
-        "roles.reviewer.thinking",
-        "roles.reviewer.providers",
-        "roles.reviewer.routing",
         "roles.verifier ",
         "limits.reviewer.timeoutSeconds",
         "limits.reviewer.idleTimeoutSeconds",
@@ -426,9 +423,9 @@ describe("a hostile base branch (C-3, D-19)", () => {
     });
   });
 
-  test("thinking, providers and routing are refused even on an allowed model", async () => {
+  test("thinking, providers and routing do not exist, even on an allowed model (H-45)", async () => {
     for (const field of ["thinking: low", "providers: [one]", "routing: { sort: price }"]) {
-      await assert.rejects(configure(OPERATOR, `roles: { reviewer: { model: openrouter/vendor/other, ${field} } }`), /refused: roles\.reviewer\./, field);
+      await assert.rejects(configure(OPERATOR, `roles: { reviewer: { model: openrouter/vendor/other, ${field} } }`), /review-bot\.yaml is invalid: \/roles\/reviewer/, field);
     }
   });
 

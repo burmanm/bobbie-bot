@@ -8,7 +8,8 @@
  * runs that are not required are ignored, and every `ai-review/*` check is
  * left out, so two reviewers never wait for each other.
  */
-import { formatDuration, parseDuration } from "../pipeline/index.ts";
+// Directly, not through pipeline/index.ts, which loads pi (F-7).
+import { formatDuration, parseDuration } from "../pipeline/config.ts";
 import type { Github } from "./github.ts";
 
 export const CI_ON_FAILURE = ["skip", "review"] as const;

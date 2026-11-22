@@ -27,7 +27,9 @@
  * report within `ci.timeout`, or when a newer push supersedes it. A queued
  * check therefore always ends as success, skipped or neutral (I-2 #1).
  */
-import { parseBotConfigYaml } from "../pipeline/index.ts";
+// Directly, not through pipeline/index.ts, which loads pi (F-7: the gate reads its configuration without pi).
+import type { AgentSettings } from "../pipeline/agent-settings.ts";
+import { formatDuration, parseBotConfigYaml } from "../pipeline/config.ts";
 import {
   type CiState,
   type CiWaitConfig,
@@ -39,7 +41,6 @@ import {
   parseCiTimeout,
   resolveRequired,
 } from "./ci-wait.ts";
-import { formatDuration } from "../pipeline/index.ts";
 import type { CheckRunOutput, CheckRunSummary, Github, PullSummary } from "./github.ts";
 import type { GateEndKind } from "../core/index.ts";
 
@@ -180,6 +181,37 @@ export function decide(event: GateEvent, config: GateConfig, facts: GateFacts): 
   return { kind: "review", via: "label", reason: `"${label}" applied by ${applier.login}` };
 }
 
+/** Workflow inputs as given: undefined when not given, so settings below them show through (F-7). */
+export interface GateInputs {
+  name: string;
+  label?: string;
+  lifetime?: LabelLifetime;
+  ci?: Partial<CiWaitConfig>;
+}
+
+/**
+ * The gate's configuration before the YAML (F-7, C-2): built-in defaults,
+ * then `reviewBot.authorization` and `reviewBot.ci` from the agent
+ * directory's settings.json, then the workflow inputs that were given.
+ * `resolveGateConfig` puts the base branch's YAML on top.
+ */
+export function layerGateInputs(given: GateInputs, settings: AgentSettings | undefined): GateConfig {
+  const a = settings?.reviewBot.authorization;
+  const c = settings?.reviewBot.ci;
+  const ci: CiWaitConfig = { ...DEFAULT_CI_WAIT };
+  if (c?.require !== undefined) ci.require = Array.isArray(c.require) ? parseCiRequire(c.require.join("\n")) : c.require;
+  if (c?.onFailure !== undefined) ci.onFailure = c.onFailure;
+  if (c?.timeout !== undefined) ci.timeoutMs = parseCiTimeout(c.timeout);
+  for (const [k, v] of Object.entries(given.ci ?? {})) if (v !== undefined) Object.assign(ci, { [k]: v });
+  const settingsLabel = a?.label !== undefined && a.label.trim() !== "" ? a.label.trim() : undefined;
+  return {
+    name: given.name,
+    label: given.label ?? settingsLabel ?? DEFAULT_AUTH_LABEL,
+    lifetime: given.lifetime ?? a?.lifetime ?? "per-push",
+    ci,
+  };
+}
+
 const NOT_AUTHORIZED = "Skipped: not authorized for automatic review";
 
 function short(sha: string): string {
@@ -191,8 +223,9 @@ function capitalize(s: string): string {
 }
 
 /**
- * Inputs first, then `authorization` and `ci` from `.review/review-bot.yaml`
- * on the base SHA (A-5, C-2). The check name is never taken from the YAML:
+ * The layered inputs (`layerGateInputs`: defaults, settings.json, workflow
+ * inputs), then `authorization` and `ci` from `.review/review-bot.yaml` on
+ * the base SHA, which are the repository's own policy (A-5, C-2, F-7). The check name is never taken from the YAML:
  * the pipeline does not either (the check opens before the YAML is read).
  * An invalid YAML file keeps the input label but forces `per-push`, the
  * stricter lifetime, and keeps the input CI settings; the review itself

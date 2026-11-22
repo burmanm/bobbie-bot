@@ -7,6 +7,8 @@
  *   review-bot complete-check   always-run: complete ai-review/<name> if unfinished
  *   review-bot remove-label     remove the authorization label (per-push lifetime)
  *   review-bot unpack-snapshot  extract the prepared snapshot artifact safely
+ *   review-bot fetch-agent-dir  copy the operator's agent directory from the
+ *                               default branch or a pinned commit (F-7)
  *
  * The GitHub token comes from GH_TOKEN (or GITHUB_TOKEN) and is never
  * printed. Exit codes: 0 done, 1 failed, 2 usage error.
@@ -15,32 +17,42 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { completeIfUnfinished } from "../ci/check.ts";
-import { CI_ON_FAILURE, type CiOnFailure, DEFAULT_CI_WAIT, parseCiRequire, parseCiTimeout } from "../ci/ci-wait.ts";
-import { DEFAULT_AUTH_LABEL, type GateResult, gateEventFrom, type WaitingInfo, LIFETIMES, type LabelLifetime, runGate } from "../ci/gate.ts";
-import { BOT_VERSION, FINGERPRINT_VERSION, gateRunRecord, safeSummary, type RunRecord, type WaitingInput } from "../core/index.ts";
-import { PI_VERSION } from "../agent/index.ts";
+import { CI_ON_FAILURE, type CiOnFailure, parseCiRequire, parseCiTimeout } from "../ci/ci-wait.ts";
+import { DEFAULT_AUTH_LABEL, type GateInputs, type GateResult, gateEventFrom, layerGateInputs, type WaitingInfo, LIFETIMES, type LabelLifetime, runGate } from "../ci/gate.ts";
+import { BOT_VERSION, FINGERPRINT_VERSION, gateRunRecord, PI_PINNED_VERSION, safeSummary, type RunRecord, type WaitingInput } from "../core/index.ts";
+// Directly, not through pipeline/index.ts: the gate does not load pi (F-7).
+import { type AgentSettings, ConfigError, readAgentSettings } from "../pipeline/agent-settings.ts";
 import { Github, type Fetch } from "../ci/github.ts";
 import { unpackSnapshot } from "../ci/snapshot.ts";
+import { fetchAgentDir } from "../ci/agent-dir.ts";
 import type { Io } from "./main.ts";
 
-export const CI_COMMANDS = ["gate", "complete-check", "remove-label", "unpack-snapshot"] as const;
+export const CI_COMMANDS = ["gate", "complete-check", "remove-label", "unpack-snapshot", "fetch-agent-dir"] as const;
 export type CiCommand = (typeof CI_COMMANDS)[number];
 
 export const CI_USAGE = `CI commands (used by the action; see docs/installing.md):
   review-bot gate [--repo o/r] [--event-name N] [--event-path F] [--pr N]
-                  [--name main] [--label ai-review/approved] [--lifetime per-push|per-pr]
-                  [--ci-require off|required|NAMES] [--ci-on-failure skip|review]
-                  [--ci-timeout 6h] [--ignore-ci] [--output F] [--records-dir D]
+                  [--name main] [--agent-dir D] [--label ai-review/approved]
+                  [--lifetime per-push|per-pr] [--ci-require off|required|NAMES]
+                  [--ci-on-failure skip|review] [--ci-timeout 6h] [--ignore-ci]
+                  [--output F] [--records-dir D]
   review-bot complete-check --head-sha SHA [--repo o/r] [--name main] [--outcome O]
   review-bot remove-label --pr N [--repo o/r] [--label L]
   review-bot unpack-snapshot --archive F --dest D [--max-gb N]
+  review-bot fetch-agent-dir --path P --dest D [--repo o/r] [--ref SHA]
+                  The agent directory P of o/r at the default branch's head,
+                  or at the pinned commit SHA; never from a PR (F-7, D-19)
 
 Defaults come from the Actions environment (GITHUB_REPOSITORY,
 GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_OUTPUT, GITHUB_API_URL). The
 token is read from GH_TOKEN or GITHUB_TOKEN. The gate handles
 pull_request_target and workflow_dispatch for one PR, and workflow_run,
-status and schedule to resume or time out PRs waiting for CI (C-9);
-.review/review-bot.yaml on the base branch overrides the --ci-* inputs.
+status and schedule to resume or time out PRs waiting for CI (C-9).
+Label, lifetime and CI wait: reviewBot.authorization and reviewBot.ci in
+the --agent-dir settings.json, then the flags given here, then
+.review/review-bot.yaml on the base branch, which is the repository's own
+policy for these keys (F-7). Unset everywhere: ai-review/approved,
+per-push, no CI wait. The gate reads settings.json as JSON, without pi.
 `;
 
 class UsageError extends Error {}
@@ -106,7 +118,7 @@ export function gateRecords(result: GateResult, o: { repo: string; trigger: stri
       conclusion: e.conclusion,
       summary: `${e.output.title}: ${e.output.summary}`,
       kind: e.kind,
-      piVersion: PI_VERSION,
+      piVersion: PI_PINNED_VERSION,
       botVersion: BOT_VERSION,
       fingerprintVersion: FINGERPRINT_VERSION,
       ...(e.waiting === undefined ? {} : { waiting: waitingInput(e.waiting) }),
@@ -148,6 +160,7 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
             "event-path": { type: "string" },
             pr: { type: "string" },
             name: { type: "string" },
+            "agent-dir": { type: "string" },
             label: { type: "string" },
             lifetime: { type: "string" },
             "ci-require": { type: "string" },
@@ -164,9 +177,10 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
         const eventPath = a["event-path"] ?? env.GITHUB_EVENT_PATH;
         if (!eventName) throw new UsageError("no event: give --event-name or set GITHUB_EVENT_NAME");
         const payload = eventPath ? (JSON.parse(readFileSync(resolve(eventPath), "utf8")) as unknown) : {};
-        const lifetime = (a.lifetime === undefined || a.lifetime === "" ? "per-push" : a.lifetime) as LabelLifetime;
-        if (!LIFETIMES.includes(lifetime)) throw new UsageError(`--lifetime must be ${LIFETIMES.join(" or ")}`);
-        const label = a.label === undefined || a.label.trim() === "" ? DEFAULT_AUTH_LABEL : a.label.trim();
+        // Not given (or empty, as an unset workflow input arrives) is not a default: settings show through (F-7).
+        const lifetime = a.lifetime === undefined || a.lifetime === "" ? undefined : (a.lifetime as LabelLifetime);
+        if (lifetime !== undefined && !LIFETIMES.includes(lifetime)) throw new UsageError(`--lifetime must be ${LIFETIMES.join(" or ")}`);
+        const label = a.label === undefined || a.label.trim() === "" ? undefined : a.label.trim();
         const pr = prNumber(a.pr, false);
         let event;
         try {
@@ -174,9 +188,9 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
         } catch (e) {
           throw new UsageError(e instanceof Error ? e.message : String(e));
         }
-        const ci = { ...DEFAULT_CI_WAIT };
+        const ci: GateInputs["ci"] = {};
         try {
-          if (a["ci-require"] !== undefined) ci.require = parseCiRequire(a["ci-require"]);
+          if (a["ci-require"] !== undefined && a["ci-require"].trim() !== "") ci.require = parseCiRequire(a["ci-require"]);
           if (a["ci-timeout"] !== undefined && a["ci-timeout"].trim() !== "") ci.timeoutMs = parseCiTimeout(a["ci-timeout"].trim());
         } catch (e) {
           throw new UsageError(e instanceof Error ? e.message : String(e));
@@ -190,8 +204,19 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
           if (event.name !== "workflow_dispatch") throw new UsageError("--ignore-ci is for a manual dispatch only");
           event.ignoreCi = true;
         }
+        let settings: AgentSettings | undefined;
+        if (a["agent-dir"] !== undefined && a["agent-dir"] !== "") {
+          try {
+            settings = readAgentSettings(resolve(a["agent-dir"]));
+          } catch (e) {
+            // A broken operator configuration fails the gate loudly; the workflow then completes the check (S-9).
+            if (e instanceof ConfigError) throw new Error(`agent directory: ${e.message}`);
+            throw e;
+          }
+        }
+        const inputs: GateInputs = { name: checkName(a.name), ci, ...(label === undefined ? {} : { label }), ...(lifetime === undefined ? {} : { lifetime }) };
         const gh = github(env, a.repo, deps.fetch);
-        const result = await runGate(gh, event, { name: checkName(a.name), label, lifetime, ci }, log);
+        const result = await runGate(gh, event, layerGateInputs(inputs, settings), log);
         const d = result.decision;
         log(`${d.kind}${d.kind === "review" ? ` (${d.via})` : ""}${result.pr ? ` #${result.pr.number}` : ""}: ${d.reason}`);
         const review = d.kind === "review" && result.pr !== undefined;
@@ -241,6 +266,16 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
         const gh = github(env, a.repo, deps.fetch);
         const removed = await gh.removeLabel(pr, label);
         log(removed ? `removed "${label}" from #${pr}` : `"${label}" was not on #${pr}`);
+        return 0;
+      }
+      case "fetch-agent-dir": {
+        const a = parseArgs({ args: argv, options: { repo: { type: "string" }, path: { type: "string" }, ref: { type: "string" }, dest: { type: "string" } }, strict: true }).values;
+        if (a.path === undefined || a.dest === undefined) throw new UsageError("--path and --dest are required");
+        const ref = a.ref === undefined || a.ref === "" ? undefined : a.ref;
+        if (ref !== undefined && !SHA.test(ref)) throw new UsageError("--ref must be a 40-character commit SHA");
+        const gh = github(env, a.repo, deps.fetch);
+        const got = await fetchAgentDir(gh, { path: a.path, dest: resolve(a.dest), ...(ref === undefined ? {} : { ref }) });
+        log(`agent directory ${a.path} from ${got.repo}@${got.sha}${got.branch === undefined ? " (pinned)" : ` (default branch ${got.branch})`}: ${got.files} files, ${got.bytes} bytes`);
         return 0;
       }
       case "unpack-snapshot": {

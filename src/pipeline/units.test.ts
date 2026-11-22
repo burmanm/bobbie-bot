@@ -4,7 +4,7 @@ import { describe, test } from "node:test";
 import { encodeMarker } from "../core/index.ts";
 import { finding } from "../core/test-fixtures.ts";
 import type { PrComment } from "../platform/index.ts";
-import { ConfigError, formatDuration, parseDuration, parseModelSpec, resolveConfig } from "./config.ts";
+import { ConfigError, formatDuration, NO_AGENT_SETTINGS, parseDuration, parseModelSpec, resolveConfig } from "./config.ts";
 import { buildContext, neutralizeDelimiters } from "./context.ts";
 import { chunkByDirectory, type PatchFile, patchFileName } from "./deterministic.ts";
 import { derivePriorState, openPriorFindings, parseCommentHead } from "./prior.ts";
@@ -17,60 +17,68 @@ describe("configuration (P-4, C-2, A-5)", () => {
   });
 
   test("no model is configured unless given", () => {
-    const c = resolveConfig({});
+    const c = resolveConfig({}, undefined, NO_AGENT_SETTINGS);
     assert.deepEqual(c.roles, {});
     assert.ok(c.limits.runCostUsd > 0, "a spend cap always exists");
   });
 
-  test(".review/review-bot.yaml from base narrows the inputs; without settings it still picks models (F-7)", () => {
+  test(".review/review-bot.yaml from base narrows the inputs; without an agent directory it cannot change a model (F-7, H-42)", () => {
     const yaml = [
       "roles:",
-      "  reviewer: openrouter/a/b",
-      "  verifier:",
-      "    model: openrouter/c/d",
-      "    thinking: low",
-      "    routing: { sort: price }",
+      "  reviewer: openrouter/x/y",
       "limits:",
       "  reviewer: { timeoutSeconds: 60, maxTurns: 7 }",
       "  runCostUsd: 1.5",
       "skip: { draft: false }",
     ].join("\n");
-    const c = resolveConfig({ models: { reviewer: "openrouter/x/y" }, runCostUsd: 9 }, yaml);
-    assert.deepEqual(c.roles.reviewer, { provider: "openrouter", id: "a/b" });
-    assert.deepEqual(c.roles.verifier, { provider: "openrouter", id: "c/d", thinkingLevel: "low", routing: { sort: "price" } });
+    const c = resolveConfig({ models: { reviewer: "openrouter/x/y" }, runCostUsd: 9 }, yaml, NO_AGENT_SETTINGS);
+    assert.deepEqual(c.roles.reviewer, { provider: "openrouter", id: "x/y" }, "restating the input model is no change");
     assert.equal(c.limits.reviewer.timeoutMs, 60_000);
     assert.equal(c.limits.reviewer.maxTurns, 7);
     assert.equal(c.limits.runCostUsd, 1.5);
     assert.equal(c.skip.draft, false);
+    assert.throws(
+      () => resolveConfig({ models: { reviewer: "openrouter/x/y" } }, "roles: { reviewer: openrouter/a/b }", NO_AGENT_SETTINGS),
+      /refused: roles\.reviewer "openrouter\/a\/b" \(no enabledModels, so the model is fixed\)/,
+    );
+    assert.throws(() => resolveConfig({}, "roles: { verifier: openrouter/c/d }", NO_AGENT_SETTINGS), /the model is fixed/, "nor add one");
+  });
+
+  test("the YAML has no thinking, providers or routing fields any more (F-7, H-45)", () => {
+    for (const field of ["thinking: low", "providers: [google-vertex]", "routing: { sort: price }"]) {
+      assert.throws(() => resolveConfig({ models: { verifier: "openrouter/c/d" } }, `roles: { verifier: { model: openrouter/c/d, ${field} } }`, NO_AGENT_SETTINGS), /is invalid/, field);
+    }
+    const c = resolveConfig({ models: { verifier: "openrouter/c/d" } }, "roles: { verifier: { model: openrouter/c/d } }", NO_AGENT_SETTINGS);
+    assert.deepEqual(c.roles.verifier, { provider: "openrouter", id: "c/d" });
   });
 
   test("a provider list restricts an OpenRouter model to those providers (C-6)", () => {
-    const c = resolveConfig({ models: { reviewer: "openrouter/a/b" }, providers: { reviewer: ["anthropic", " amazon-bedrock ", "anthropic"] } });
+    const c = resolveConfig({ models: { reviewer: "openrouter/a/b" }, providers: { reviewer: ["anthropic", " amazon-bedrock ", "anthropic"] } }, undefined, NO_AGENT_SETTINGS);
     assert.deepEqual(c.roles.reviewer?.routing, { only: ["anthropic", "amazon-bedrock"], allow_fallbacks: false });
-
-    const y = resolveConfig({}, "roles:\n  verifier:\n    model: openrouter/c/d\n    providers: [google-vertex]\n    routing: { sort: price }\n");
-    assert.deepEqual(y.roles.verifier?.routing, { sort: "price", only: ["google-vertex"], allow_fallbacks: false });
   });
 
-  test("a provider list or routing needs an OpenRouter model", () => {
-    assert.throws(() => resolveConfig({ models: { reviewer: "acp/claude" }, providers: { reviewer: ["anthropic"] } }), /needs an openrouter model/);
-    assert.throws(() => resolveConfig({ providers: { reviewer: ["anthropic"] } }), /no model is given/);
-    assert.throws(() => resolveConfig({ models: { reviewer: "openrouter/a/b" }, providers: { reviewer: [] } }), /empty/);
-    assert.throws(() => resolveConfig({}, "roles:\n  reviewer:\n    model: acp/claude\n    routing: { sort: price }\n"), /routing preferences need an openrouter model/);
-    assert.throws(
-      () => resolveConfig({}, "roles:\n  reviewer:\n    model: openrouter/a/b\n    providers: [x]\n    routing: { only: [y] }\n"),
-      /either providers or routing.only/,
-    );
+  test("a provider list needs an OpenRouter model", () => {
+    assert.throws(() => resolveConfig({ models: { reviewer: "acp/claude" }, providers: { reviewer: ["anthropic"] } }, undefined, NO_AGENT_SETTINGS), /needs an openrouter model/);
+    assert.throws(() => resolveConfig({ providers: { reviewer: ["anthropic"] } }, undefined, NO_AGENT_SETTINGS), /no model is given/);
+    assert.throws(() => resolveConfig({ models: { reviewer: "openrouter/a/b" }, providers: { reviewer: [] } }, undefined, NO_AGENT_SETTINGS), /empty/);
+  });
+
+  test("the run timeout input can be a ceiling: it lowers any value and refuses none (S-9, F-7)", () => {
+    const ceiling = { runTimeoutCeilingMs: 2_220_000 };
+    assert.equal(resolveConfig(ceiling, undefined, NO_AGENT_SETTINGS).limits.runTimeoutMs, 2_220_000, "the 45 min default is cut");
+    assert.equal(resolveConfig(ceiling, "limits: { runTimeoutSeconds: 2700 }", NO_AGENT_SETTINGS).limits.runTimeoutMs, 2_220_000, "the documented YAML example is no longer refused");
+    assert.equal(resolveConfig(ceiling, "limits: { runTimeoutSeconds: 600 }", NO_AGENT_SETTINGS).limits.runTimeoutMs, 600_000, "a lower YAML value takes effect");
+    assert.throws(() => resolveConfig(ceiling, "limits: { runTimeoutSeconds: 2701 }", NO_AGENT_SETTINGS), /at most 2700/, "still no raise above the configured value");
   });
 
   test("an ACP agent is selected as model acp/<agent>", () => {
-    const c = resolveConfig({ models: { reviewer: "acp/claude-code" } });
+    const c = resolveConfig({ models: { reviewer: "acp/claude-code" } }, undefined, NO_AGENT_SETTINGS);
     assert.deepEqual(c.roles.reviewer, { provider: "acp", id: "claude-code" });
   });
 
   test("invalid YAML or unknown keys are configuration errors", () => {
-    assert.throws(() => resolveConfig({}, "roles: [unclosed"), /not valid YAML/);
-    assert.throws(() => resolveConfig({}, "focus: everything\n"), /is invalid/);
+    assert.throws(() => resolveConfig({}, "roles: [unclosed", NO_AGENT_SETTINGS), /not valid YAML/);
+    assert.throws(() => resolveConfig({}, "focus: everything\n", NO_AGENT_SETTINGS), /is invalid/);
   });
 });
 
@@ -78,23 +86,24 @@ const patch = (path: string, lines: number): PatchFile => ({ path, status: "modi
 
 describe("time limits (S-4 Limits)", () => {
   test("defaults; inputs; .review/review-bot.yaml only lowers (F-7)", () => {
-    const d = resolveConfig({});
+    const d = resolveConfig({}, undefined, NO_AGENT_SETTINGS);
     assert.equal(d.limits.runTimeoutMs, 45 * 60_000);
     assert.equal(d.limits.reviewer.timeoutMs, 20 * 60_000);
     assert.equal(d.limits.reviewer.idleTimeoutMs, 3 * 60_000);
-    const i = resolveConfig({ runTimeoutMs: 600_000, limits: { verifier: { idleTimeoutMs: 60_000 } } });
+    const i = resolveConfig({ runTimeoutMs: 600_000, limits: { verifier: { idleTimeoutMs: 60_000 } } }, undefined, NO_AGENT_SETTINGS);
     assert.equal(i.limits.runTimeoutMs, 600_000);
     assert.equal(i.limits.verifier.idleTimeoutMs, 60_000);
     assert.equal(i.limits.verifier.timeoutMs, 8 * 60_000);
     const y = resolveConfig(
       { runTimeoutMs: 600_000 },
       "limits:\n  runTimeoutSeconds: 300\n  reviewer:\n    timeoutSeconds: 300\n    idleTimeoutSeconds: 45\n",
+      NO_AGENT_SETTINGS,
     );
     assert.equal(y.limits.runTimeoutMs, 300_000);
-    assert.throws(() => resolveConfig({ runTimeoutMs: 600_000 }, "limits:\n  runTimeoutSeconds: 1200\n"), /runTimeoutSeconds 1200 \(at most 600\)/);
+    assert.throws(() => resolveConfig({ runTimeoutMs: 600_000 }, "limits:\n  runTimeoutSeconds: 1200\n", NO_AGENT_SETTINGS), /runTimeoutSeconds 1200 \(at most 600\)/);
     assert.equal(y.limits.reviewer.timeoutMs, 300_000);
     assert.equal(y.limits.reviewer.idleTimeoutMs, 45_000);
-    assert.throws(() => resolveConfig({}, "limits:\n  runTimeoutSeconds: 0\n"), /invalid/);
+    assert.throws(() => resolveConfig({}, "limits:\n  runTimeoutSeconds: 0\n", NO_AGENT_SETTINGS), /invalid/);
   });
 
   test("durations", () => {

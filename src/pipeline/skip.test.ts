@@ -14,7 +14,7 @@ import { Value } from "typebox/value";
 import { createPiSdkAgentStep, createScriptedProvider, type Script } from "../agent/index.ts";
 import { parseDiff, RunRecord } from "../core/index.ts";
 import { DryRunPlatform, FixturePrReader, type PrReader, type PullRequestInfo } from "../platform/index.ts";
-import { type ConfigInputs, resolveConfig } from "./config.ts";
+import { type ConfigInputs, NO_AGENT_SETTINGS, resolveConfig } from "./config.ts";
 import { runReview } from "./run.ts";
 import { DEFAULT_SKIP, dependencyLabelNote, dependencyOnlySkip, skipBeforeDiff } from "./skip.ts";
 
@@ -66,16 +66,16 @@ describe("skip conditions (S-1)", () => {
 
   test("configurable from inputs, and the base yaml overrides them", () => {
     const inputs: ConfigInputs = { skip: { optOutLabels: ["no-bot"], dependencyLabels: ["dependencies"], dependencyPaths: ["*.lock"] } };
-    const c = resolveConfig(inputs);
+    const c = resolveConfig(inputs, undefined, NO_AGENT_SETTINGS);
     assert.deepEqual(c.skip.optOutLabels, ["no-bot"]);
     assert.deepEqual(c.skip.dependencies, { labels: ["dependencies"], paths: ["*.lock"] });
     assert.deepEqual(c.skip.roundCapLabels, ["round-cap"]);
-    const y = resolveConfig(inputs, "skip:\n  optOutLabels: [skip-ai]\n  roundCapLabels: [review/round-cap]\n  dependencies:\n    paths: [go.mod, go.sum]\n");
+    const y = resolveConfig(inputs, "skip:\n  optOutLabels: [skip-ai]\n  roundCapLabels: [review/round-cap]\n  dependencies:\n    paths: [go.mod, go.sum]\n", NO_AGENT_SETTINGS);
     assert.deepEqual(y.skip.optOutLabels, ["skip-ai"]);
     assert.deepEqual(y.skip.roundCapLabels, ["review/round-cap"]);
     assert.deepEqual(y.skip.dependencies, { labels: ["dependencies"], paths: ["go.mod", "go.sum"] });
-    assert.throws(() => resolveConfig({}, "skip:\n  dependencies: { files: [x] }\n"), /invalid/);
-    assert.notEqual(resolveConfig({}).skip.dependencies.paths, DEFAULT_SKIP.dependencies.paths, "defaults are copied, not shared");
+    assert.throws(() => resolveConfig({}, "skip:\n  dependencies: { files: [x] }\n", NO_AGENT_SETTINGS), /invalid/);
+    assert.notEqual(resolveConfig({}, undefined, NO_AGENT_SETTINGS).skip.dependencies.paths, DEFAULT_SKIP.dependencies.paths, "defaults are copied, not shared");
   });
 });
 

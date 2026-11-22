@@ -22,16 +22,10 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { PreparedSnapshots, preparedModcache } from "../ci/snapshot.ts";
 import { CI_COMMANDS, CI_USAGE, type CiCommand, runCi } from "./ci.ts";
-import {
-  type AcpAgentConfig,
-  type AgentStep,
-  createAcpAgentStep,
-  createPiSdkAgentStep,
-  createRoutedAgentStep,
-  createScriptedProvider,
-  type Script,
-  type ThinkingLevel,
-} from "../agent/index.ts";
+// Types only from agent/ and pipeline/index.ts: both load pi, which the CI
+// commands never need (F-7). `review` imports them when it runs.
+import type { AcpAgentConfig, AgentStep, Script, ThinkingLevel } from "../agent/index.ts";
+import { THINKING_LEVELS } from "../agent/types.ts";
 import {
   defaultModcache,
   DryRunPlatform,
@@ -46,7 +40,8 @@ import {
   type PrReader,
   type SnapshotSource,
 } from "../platform/index.ts";
-import { type ConfigInputs, parseDuration, PIPELINE_ROLES, type PipelineRole, runReview } from "../pipeline/index.ts";
+import type { ConfigInputs } from "../pipeline/config.ts";
+import { type AgentSettings, ConfigError, parseDuration, PIPELINE_ROLES, type PipelineRole, readAgentSettings } from "../pipeline/agent-settings.ts";
 import { GhHistory } from "../platform/history-github.ts";
 import { Value } from "typebox/value";
 import { WaitingInput } from "../core/index.ts";
@@ -81,11 +76,25 @@ Knowledge (default: AGENTS.md, REVIEW.md, .review/*-guidelines.md from the base 
   --knowledge-dir <dir>    Read AGENTS.md, REVIEW.md, .review/ from here instead
   --guidelines <file>      Add a guidelines file (repeatable)
 
-Models (no defaults; .review/review-bot.yaml on the base branch overrides):
-  --model <role>=<provider>/<id>   role is reviewer or verifier (repeatable).
-                                   provider "openrouter" runs in pi;
-                                   "acp/<agent>" runs an ACP agent (below)
-  --thinking <role>=<level>        off, minimal, low, medium, high
+Configuration (F-7): the agent directory's settings.json, then the flags
+below, then .review/review-bot.yaml on the base branch, which can only
+narrow: lower limits, and pick a model among enabledModels. It cannot raise
+a limit or name another model.
+  --agent-dir <dir>        The operator's pi agent directory: settings.json
+                           (reviewBot, enabledModels) and models.json
+                           (providers, endpoints, model overrides). Without
+                           it: no settings and no enabledModels, so the
+                           models are the --model flags and the YAML cannot
+                           change them
+
+Models (no defaults):
+  --model <role>=<provider>/<id>[:<thinking>]
+                                   role is reviewer or verifier (repeatable);
+                                   replaces the role's model in settings.json.
+                                   A pi provider runs in pi; "acp/<agent>"
+                                   runs an ACP agent (below)
+  --thinking <role>=<level>        off, minimal, low, medium, high, xhigh, max
+                                   (as pi's --thinking: over a :suffix)
   --providers <role>=<a,b,...>     OpenRouter only: serve the role's model only
                                    from these providers (routing "only", no
                                    fallbacks), e.g. reviewer=anthropic,amazon-bedrock
@@ -105,12 +114,16 @@ Run:
   --max-cost <usd>         Run spend cap
   --run-timeout <duration> Whole-run deadline (default 45m): the running step
                            is stopped and what exists is published as partial
+  --max-run-timeout <duration>  Ceiling on the run deadline, whatever settings,
+                           flags or the YAML say (the CI job's own limit);
+                           a lower configured value still takes effect
   --step-timeout [<role>=]<duration>  Per-step wall-clock limit (default
                            reviewer 20m, verifier 8m); no role = both roles
   --idle-timeout [<role>=]<duration>  Stop a step after this long with no
                            model output or tool activity (default 3m)
                            Durations: 90s, 20m, 1.5h; a bare number is seconds.
-                           .review/review-bot.yaml on the base branch overrides
+                           .review/review-bot.yaml on the base branch can
+                           only lower these
   --waiting <json>         What the CI gate knew about the wait (C-9), as its
                            "waiting" output: recorded in the run record
                            (A-6) and a failed CI reviewed anyway is said in
@@ -188,14 +201,15 @@ function readAcpAgents(configFile: string | undefined, defs: string[] | undefine
   return agents;
 }
 
-/** --run-timeout, --step-timeout and --idle-timeout into the config inputs (S-4 Limits). */
-function applyTimeoutFlags(inputs: ConfigInputs, run: string | undefined, step: string[] | undefined, idle: string[] | undefined): void {
+/** --run-timeout, --max-run-timeout, --step-timeout and --idle-timeout into the config inputs (S-4 Limits). */
+function applyTimeoutFlags(inputs: ConfigInputs, run: string | undefined, ceiling: string | undefined, step: string[] | undefined, idle: string[] | undefined): void {
   const duration = (flag: string, text: string): number => {
     const ms = parseDuration(text);
     if (ms === undefined) throw new UsageError(`invalid ${flag}: ${text} (use for example 90s, 20m or 1.5h)`);
     return ms;
   };
   if (run !== undefined) inputs.runTimeoutMs = duration("--run-timeout", run);
+  if (ceiling !== undefined) inputs.runTimeoutCeilingMs = duration("--max-run-timeout", ceiling);
   const perRole = (flag: string, values: string[] | undefined, key: "timeoutMs" | "idleTimeoutMs") => {
     for (const v of values ?? []) {
       const eq = v.indexOf("=");
@@ -252,6 +266,7 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
         "as-of": { type: "string" },
         "no-history": { type: "boolean" },
         "knowledge-dir": { type: "string" },
+        "agent-dir": { type: "string" },
         guidelines: { type: "string", multiple: true },
         model: { type: "string", multiple: true },
         thinking: { type: "string", multiple: true },
@@ -265,6 +280,7 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
         "runs-dir": { type: "string" },
         "max-cost": { type: "string" },
         "run-timeout": { type: "string" },
+        "max-run-timeout": { type: "string" },
         waiting: { type: "string" },
         "step-timeout": { type: "string", multiple: true },
         "idle-timeout": { type: "string", multiple: true },
@@ -337,6 +353,23 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
       if (preparedCache === undefined && !args.quiet) io.stderr(`[review-bot] no module cache from the prepare job: ${m.status}${m.detail ? ` (${m.detail})` : ""}\n`);
     }
 
+    // The operator's agent directory (F-7). Read before anything runs: a
+    // broken one is a configuration error, never "no configuration".
+    let agentDir: string | undefined;
+    let settings: AgentSettings | undefined;
+    if (args["agent-dir"] !== undefined) {
+      agentDir = resolve(args["agent-dir"]);
+      try {
+        settings = readAgentSettings(agentDir);
+      } catch (e) {
+        if (!(e instanceof ConfigError)) throw e;
+        io.stderr(`review-bot: configuration error: ${e.message}\n`);
+        return 1;
+      }
+    }
+    const { createAcpAgentStep, createModelRuntime, createPiSdkAgentStep, createRoutedAgentStep, createScriptedProvider } = await import("../agent/index.ts");
+    const { runReview } = await import("../pipeline/run.ts");
+
     // Models: plain configuration, never a default (P-4).
     const models = pairs(args.model, "--model");
     const thinking = pairs(args.thinking, "--thinking");
@@ -345,13 +378,16 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
     for (const [role, list] of providers) inputs.providers![role] = list.split(",").map((p) => p.trim()).filter((p) => p !== "");
     const acpAgents = readAcpAgents(args["acp-config"], args["acp-agent"]);
     let agentStep: AgentStep;
+    let extraProviders: Parameters<typeof createModelRuntime>[0] = {};
+    const withAgentDir = agentDir === undefined ? {} : { agentDir };
     if (args.script !== undefined) {
       const script = JSON.parse(readFileSync(resolve(args.script), "utf8")) as Script;
       const scripted = createScriptedProvider(script);
       for (const role of PIPELINE_ROLES) if (script[role] !== undefined && !models.has(role)) models.set(role, `scripted/${role}`);
-      agentStep = createPiSdkAgentStep({ providers: [scripted.provider], retry: { enabled: false } });
+      extraProviders = { providers: [scripted.provider] };
+      agentStep = createPiSdkAgentStep({ ...extraProviders, ...withAgentDir, retry: { enabled: false } });
     } else {
-      agentStep = createPiSdkAgentStep();
+      agentStep = createPiSdkAgentStep(withAgentDir);
     }
     if (Object.keys(acpAgents).length > 0) {
       agentStep = createRoutedAgentStep({ pi: agentStep, acp: createAcpAgentStep({ agents: acpAgents }) });
@@ -360,7 +396,7 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
     }
     for (const [role, spec] of models) inputs.models![role] = spec;
     for (const [role, level] of thinking) {
-      if (!["off", "minimal", "low", "medium", "high"].includes(level)) throw new UsageError(`invalid thinking level: ${level}`);
+      if (!(THINKING_LEVELS as readonly string[]).includes(level)) throw new UsageError(`invalid thinking level: ${level} (use ${THINKING_LEVELS.join(", ")})`);
       inputs.thinking![role] = level as ThinkingLevel;
     }
     if (args["max-cost"] !== undefined) {
@@ -369,7 +405,7 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
       inputs.runCostUsd = usd;
     }
     if (args["include-drafts"]) inputs.skipDraft = false;
-    applyTimeoutFlags(inputs, args["run-timeout"], args["step-timeout"], args["idle-timeout"]);
+    applyTimeoutFlags(inputs, args["run-timeout"], args["max-run-timeout"], args["step-timeout"], args["idle-timeout"]);
     const waiting = args.waiting === undefined || args.waiting.trim() === "" ? undefined : parseWaiting(args.waiting);
 
     const modcache = args["no-modcache"]
@@ -417,6 +453,9 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
       snapshots,
       agentStep,
       inputs,
+      ...(agentDir === undefined || settings === undefined
+        ? {}
+        : { agent: { dir: agentDir, settings, models: () => createModelRuntime({ ...extraProviders, agentDir }) } }),
       ...(args.name === undefined ? {} : { name: args.name }),
       knowledgeOverride,
       ...(modcache === undefined ? {} : { modcache }),
