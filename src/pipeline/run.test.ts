@@ -439,12 +439,13 @@ describe("incremental re-run (S-1 scope, S-6, I-2 #9)", () => {
     const fpC = "c".repeat(64);
     const bot = { login: "github-actions[bot]", type: "Bot" };
     const human = { login: "dev", type: "User" };
+    const own = { author: bot, recordedBy: "ai-review/main" };
     const fmark = (fp: string) => encodeMarker({ kind: "finding", bot: "ai-review/main", run: "r1", fingerprint: fp, fingerprintVersion: 1 });
     const comments: PrComment[] = [
       {
         id: "900",
         kind: "review",
-        author: bot,
+        ...own,
         body: `Automated review, round 1.\n\n${encodeMarker({ kind: "summary", bot: "ai-review/main", run: "r1", sha: PRIOR_SHA, fingerprintVersion: 1 })}\n`,
         createdAt: "2026-11-17T09:00:00Z",
       },
@@ -456,9 +457,9 @@ describe("incremental re-run (S-1 scope, S-6, I-2 #9)", () => {
         body: encodeMarker({ kind: "summary", bot: "ai-review/main", run: "x", sha: HEAD, fingerprintVersion: 1 }),
         createdAt: "2026-11-18T09:00:00Z",
       },
-      { id: "1001", kind: "review-comment", author: bot, path: STORE, line: 31, body: `**Important.** Put after Reset panics on a nil map.\n\n${fmark(fpA)}\n` },
-      { id: "1002", kind: "review-comment", author: bot, path: STORE, line: 18, body: `**Important.** Get no longer checks for a missing key.\n\n${fmark(fpB)}\n` },
-      { id: "1003", kind: "review-comment", author: bot, path: STORE, line: 12, body: `**Nit.** New could pre-size the map.\n\n${fmark(fpC)}\n` },
+      { id: "1001", kind: "review-comment", ...own, path: STORE, line: 31, body: `**Important.** Put after Reset panics on a nil map.\n\n${fmark(fpA)}\n` },
+      { id: "1002", kind: "review-comment", ...own, path: STORE, line: 18, body: `**Important.** Get no longer checks for a missing key.\n\n${fmark(fpB)}\n` },
+      { id: "1003", kind: "review-comment", ...own, path: STORE, line: 12, body: `**Nit.** New could pre-size the map.\n\n${fmark(fpC)}\n` },
       { id: "1004", kind: "review-comment", author: human, path: STORE, line: 12, inReplyTo: "1003", body: "[not-worth-it] tiny map" },
     ];
 
@@ -519,6 +520,7 @@ describe("incremental re-run (S-1 scope, S-6, I-2 #9)", () => {
         id: "900",
         kind: "review",
         author: { login: "github-actions[bot]", type: "Bot" },
+        recordedBy: "ai-review/main",
         body: encodeMarker({ kind: "summary", bot: "ai-review/main", run: "r1", sha: HEAD, fingerprintVersion: 1 }),
       },
     ];

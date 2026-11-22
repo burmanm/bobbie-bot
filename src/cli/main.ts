@@ -312,7 +312,7 @@ export async function main(argv: string[], io: Io = processIo, deps: LiveDeps = 
       const ref = parsePrRef(args.pr!);
       if (ref === undefined) throw new UsageError(`cannot parse --pr ${args.pr}; use owner/repo#123 or a PR URL`);
       prRef = ref;
-      reader = new GhPrReader(ref.repo, ref.number);
+      reader = new GhPrReader(ref.repo, ref.number, undefined, `ai-review/${args.name ?? "main"}`);
       if (!args["no-history"] || args.head !== undefined) history = new GhHistory(ref.repo);
       if (args.head !== undefined) {
         if (!/^[0-9a-f]{7,40}$/.test(args.head)) throw new UsageError(`invalid --head ${args.head}: give a commit SHA`);

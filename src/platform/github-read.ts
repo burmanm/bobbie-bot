@@ -4,6 +4,7 @@
  * own authentication; this module never sees the token.
  */
 import type { PrReader } from "./dry-run.ts";
+import { attributeComments, type RecordingRun } from "./github-markers.ts";
 import { defaultExec, type Exec } from "./snapshot.ts";
 import type { Author, PrComment, PullRequestInfo } from "./types.ts";
 
@@ -32,8 +33,11 @@ export class GhPrReader implements PrReader {
   readonly repo: string;
   readonly number: number;
   private readonly exec: Exec;
+  private readonly botId: string;
 
-  constructor(repo: string, number: number, exec: Exec = defaultExec) {
+  /** `botId`: whose check runs say which comments are the bot's own (D-5, H-50). */
+  constructor(repo: string, number: number, exec: Exec = defaultExec, botId = "ai-review/main") {
+    this.botId = botId;
     this.repo = repo;
     this.number = number;
     this.exec = exec;
@@ -47,8 +51,8 @@ export class GhPrReader implements PrReader {
   }
 
   /** A paginated list endpoint, one JSON object per line. */
-  private async list<T>(path: string): Promise<T[]> {
-    const text = await this.api(["--paginate", "--jq", ".[]", path]);
+  private async list<T>(path: string, jq = ".[]"): Promise<T[]> {
+    const text = await this.api(["--paginate", "--jq", jq, path]);
     return text
       .split("\n")
       .filter((l) => l.trim() !== "")
@@ -105,10 +109,11 @@ export class GhPrReader implements PrReader {
       line?: number | null;
       start_line?: number | null;
       in_reply_to_id?: number;
+      pull_request_review_id?: number | null;
       created_at?: string;
     };
     type IssueComment = { id: number; user?: GhUser; body?: string; created_at?: string };
-    type Review = { id: number; user?: GhUser; body?: string | null; submitted_at?: string };
+    type Review = { id: number; user?: GhUser; body?: string | null; commit_id?: string | null; submitted_at?: string };
 
     const [reviewComments, issueComments, reviews, resolved] = await Promise.all([
       this.list<ReviewComment>(`repos/${this.repo}/pulls/${this.number}/comments`),
@@ -125,6 +130,7 @@ export class GhPrReader implements PrReader {
       if (typeof c.start_line === "number") pc.startLine = c.start_line;
       if (c.in_reply_to_id !== undefined) pc.inReplyTo = String(c.in_reply_to_id);
       else if (resolved.has(String(c.id))) pc.threadResolved = resolved.get(String(c.id))!;
+      if (typeof c.pull_request_review_id === "number") pc.reviewId = String(c.pull_request_review_id);
       if (c.created_at !== undefined) pc.createdAt = c.created_at;
       out.push(pc);
     }
@@ -136,10 +142,24 @@ export class GhPrReader implements PrReader {
     for (const r of reviews) {
       if (!r.body) continue;
       const pc: PrComment = { id: String(r.id), kind: "review", author: author(r.user), body: r.body };
+      if (r.commit_id) pc.commitId = r.commit_id;
       if (r.submitted_at !== undefined) pc.createdAt = r.submitted_at;
       out.push(pc);
     }
-    return out;
+    return attributeComments(out, this.botId, (sha) => this.checkRuns(sha));
+  }
+
+  /**
+   * This bot's check runs on a commit. Unreadable means no record: a dry run
+   * posts nothing, so a full review is the safe answer (H-50).
+   */
+  private async checkRuns(sha: string): Promise<RecordingRun[]> {
+    const query = `check_name=${encodeURIComponent(this.botId)}&filter=all&per_page=100`;
+    try {
+      return await this.list<RecordingRun>(`repos/${this.repo}/commits/${sha}/check-runs?${query}`, ".check_runs[]");
+    } catch {
+      return [];
+    }
   }
 
   /** Thread root comment id → resolved. First 100 threads; the rest are treated as unknown. */

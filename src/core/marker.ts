@@ -10,8 +10,9 @@
  * Decoding treats the comment body as untrusted: anyone can paste a marker
  * into a comment. The parser is strict (own line, not in a blockquote or code
  * block, bounded length, known keys, each key once, validated values) and
- * never throws. It only proves the text is well formed — the caller must
- * still check that the comment was written by a Bot-type identity before
+ * never throws. It only proves the text is well formed. Another bot can echo
+ * a marker (H-50), so the author proves nothing either: the caller must check
+ * that the platform found this bot's check-run record for the comment before
  * trusting it as the bot's own state.
  */
 
@@ -140,6 +141,17 @@ export function decodeMarkers(body: unknown): Marker[] {
 export function decodeMarker<K extends MarkerKind>(body: unknown, kind: K, bot: string): Extract<Marker, { kind: K }> | undefined {
   const found = decodeMarkers(body).filter((m): m is Extract<Marker, { kind: K }> => m.kind === kind && m.bot === bot);
   return found.length === 1 ? found[0] : undefined;
+}
+
+/**
+ * The marker of a comment already known to be the bot's, or to be checked
+ * against its record: the last line, where the bot always puts it, read on
+ * its own so that a code fence left open in the text above cannot hide it.
+ * Otherwise as `decodeMarker`. Lenient, so never proof of authorship.
+ */
+export function decodeOwnMarker<K extends MarkerKind>(body: string, kind: K, bot: string): Extract<Marker, { kind: K }> | undefined {
+  const last = body.trimEnd().split("\n").pop();
+  return decodeMarker(last, kind, bot) ?? decodeMarker(body, kind, bot);
 }
 
 /**

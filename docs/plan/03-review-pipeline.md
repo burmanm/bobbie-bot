@@ -44,7 +44,9 @@ with tools.
   by an unprivileged job. Knowledge is read from the base
   ([C-3](06-ci-and-security.md#c-3--trust-model)).
 - Load prior bot state from GitHub: this bot's earlier comments, their
-  fingerprints, and the last-reviewed SHA from hidden markers.
+  fingerprints, and the last-reviewed SHA from hidden markers. A marker
+  without a check-run record ([S-7](#s-7--publish)) is not state: it cannot
+  skip or narrow a review.
 - Scope: **full** (first run or base changed) or **incremental** (only
   `lastReviewedSha..head`, plus re-checking earlier open findings; I-2 #9).
 - Skip conditions (configurable): draft, `deps`-labelled dependency-only
@@ -213,9 +215,20 @@ Performed by code with the write token; no model involved.
   9. `Needs human: <what> in <file:line>. Explained in the description: yes/no.`
 - Hidden HTML marker on every comment: bot ID, run ID, fingerprint,
   `fingerprintVersion`. The summary carries the last reviewed SHA. This is
-  the bot's whole per-PR state ([D-5](README.md#key-decisions)). The bot
-  recognises its own comments by marker, not by author login, because under
-  the Actions token the login is shared with other workflows.
+  the bot's whole per-PR state ([D-5](README.md#key-decisions)), together
+  with the record that says which comments are the bot's:
+- **Review record.** Right after posting, the bot writes the review's ID to
+  `external_id` of its check run on the reviewed SHA. Neither login nor
+  marker proves authorship: under the Actions token the login is shared
+  with other workflows, and any bot that repeats PR text can repeat a
+  marker (H-50). A summary counts only in a review made on the SHA it
+  names, with a check run on that SHA, created by the bot's App, recording
+  that review's ID; a finding only if it was posted with such a review. Any
+  other marker is plain text, also one from before records existed or whose
+  check run GitHub has deleted: the next run reviews in full and leaves
+  those threads to people. The "could not complete" comment (S-9) has no
+  record and is found by Bot author and marker alone; it carries no review
+  state.
 - **Complete the check run** `ai-review/<name>` with a conclusion and a
   one-line summary. The conclusion reports whether the *review ran*, not
   whether findings exist: `success` (reviewed), `skipped`, or `neutral`

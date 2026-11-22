@@ -7,10 +7,10 @@ import { describe, test } from "node:test";
 import { encodeMarker } from "../core/index.ts";
 import { completeCheckRun, findCheckRun } from "./github-checks.ts";
 import { assertInstallationToken, GitHubClient, gitHubClientFromEnv, GraphQLError, RateLimitError } from "./github-client.ts";
-import { ACTIONS_BOT, FakeGitHub, type FakeUser, HUMAN } from "./github-fake.ts";
-import { hasFailureMarker } from "./github-markers.ts";
+import { ACTIONS_BOT, FakeGitHub, type FakeReviewComment, type FakeUser, HUMAN } from "./github-fake.ts";
+import { attributeComments, hasFailureMarker } from "./github-markers.ts";
 import { foldInlineComments, GitHubPlatform, SupersededError } from "./github.ts";
-import type { Publication, ReviewPayload } from "./types.ts";
+import type { PrComment, Publication, ReviewPayload } from "./types.ts";
 
 const TOKEN = "ghs_faketoken0000";
 const BOT = "ai-review/main";
@@ -33,6 +33,17 @@ interface Setup {
   sleeps: number[];
   logs: string[];
 }
+
+/** A finding thread the bot posted with a review it recorded (D-5). */
+function ownRoot(gh: FakeGitHub, body: string, path = "a.go", line = 3, resolved = false): FakeReviewComment {
+  const earlier = gh.addRecordedReview(BOT, "9".repeat(40), summaryBody(gh, "r1").replace(gh.headSha, "9".repeat(40)));
+  const root = gh.addThreadRoot(gh.as, body, path, line, resolved);
+  root.pull_request_review_id = earlier.id;
+  return root;
+}
+
+/** Without the reviews `ownRoot` seeded. */
+const postedReviews = (gh: FakeGitHub) => gh.reviews.filter((r) => r.commit_id === gh.headSha);
 
 function setup(gh = new FakeGitHub(), o: { maxAttempts?: number } = {}): Setup {
   const sleeps: number[] = [];
@@ -152,9 +163,9 @@ describe("client: rate limits and transient errors (S-9)", () => {
 describe("publish (S-7)", () => {
   test("one COMMENT review with inline comments, replies on own threads, resolution only after Verified fixed", async () => {
     const { gh, platform } = setup();
-    const own = gh.addThreadRoot(ACTIONS_BOT, findingBody("Nil map", 1), "a.go", 3);
-    const ownStillOpen = gh.addThreadRoot(ACTIONS_BOT, findingBody("Leak", 2), "a.go", 9);
-    const ownNoReply = gh.addThreadRoot(ACTIONS_BOT, findingBody("Race", 3), "a.go", 12);
+    const own = ownRoot(gh, findingBody("Nil map", 1), "a.go", 3);
+    const ownStillOpen = ownRoot(gh, findingBody("Leak", 2), "a.go", 9);
+    const ownNoReply = ownRoot(gh, findingBody("Race", 3), "a.go", 12);
     // A human pasting the bot's marker, and another workflow under the same Actions login without a marker.
     const forged = gh.addThreadRoot(HUMAN, findingBody("Forged", 4), "a.go", 20);
     const otherWorkflow = gh.addThreadRoot(ACTIONS_BOT, "**Lint.** unused import", "a.go", 30);
@@ -179,9 +190,9 @@ describe("publish (S-7)", () => {
     };
     const result = await platform.publish(publication);
 
-    assert.equal(gh.reviews.length, 1);
-    assert.equal(gh.reviews[0]!.event, "COMMENT");
-    const inline = gh.reviewComments.filter((c) => c.review_id === gh.reviews[0]!.id);
+    assert.equal(postedReviews(gh).length, 1);
+    assert.equal(postedReviews(gh)[0]!.event, "COMMENT");
+    const inline = gh.reviewComments.filter((c) => c.pull_request_review_id === postedReviews(gh)[0]!.id);
     assert.equal(inline.length, 1);
     const replies = gh.reviewComments.filter((c) => c.in_reply_to_id !== undefined);
     assert.deepEqual(replies.map((c) => c.in_reply_to_id).sort(), [own.id, ownStillOpen.id].sort());
@@ -190,7 +201,7 @@ describe("publish (S-7)", () => {
       [own.id],
       "only the bot's own thread with a Verified fixed reply is resolved",
     );
-    assert.deepEqual(result.commentIds, [String(gh.reviews[0]!.id), String(inline[0]!.id), ...replies.map((r) => String(r.id))]);
+    assert.deepEqual(result.commentIds, [String(postedReviews(gh)[0]!.id), String(inline[0]!.id), ...replies.map((r) => String(r.id))]);
     const w = (result.warnings ?? []).join("\n");
     assert.match(w, new RegExp(`reply to comment ${forged.id} not posted: not a thread of ai-review/main`));
     assert.match(w, new RegExp(`reply to comment ${otherWorkflow.id} not posted`));
@@ -204,7 +215,7 @@ describe("publish (S-7)", () => {
   test("a refused thread resolution is a warning; the review stays published", async () => {
     const gh = new FakeGitHub({ canResolveThreads: false });
     const { platform } = setup(gh);
-    const own = gh.addThreadRoot(ACTIONS_BOT, findingBody("Nil map", 1));
+    const own = ownRoot(gh, findingBody("Nil map", 1));
     await platform.getPullRequest();
     await platform.listComments();
     const result = await platform.publish({
@@ -212,7 +223,7 @@ describe("publish (S-7)", () => {
       threadReplies: [{ in_reply_to: own.id, body: "**Verified fixed at `bbbbbbb`.** ok\n" }],
       resolveThreads: [{ comment_id: own.id, reason: "verified fixed" }],
     });
-    assert.equal(gh.reviews.length, 1);
+    assert.equal(postedReviews(gh).length, 1);
     assert.match((result.warnings ?? []).join("\n"), /not resolved: GitHub GraphQL: Resource not accessible by integration \(FORBIDDEN\)/);
   });
 
@@ -253,10 +264,112 @@ describe("publish (S-7)", () => {
   });
 });
 
+describe("echoed markers at publish (H-50)", () => {
+  for (const [source, echo] of [["another App's bot", OTHER_APP], ["another workflow under the Actions login", ACTIONS_BOT]] as const) {
+    test(`a finding echoed by ${source} gets no reply and is not resolved`, async () => {
+      const { gh, platform } = setup();
+      const forged = gh.addThreadRoot(echo, findingBody("Echoed", 1));
+      await platform.getPullRequest();
+      await platform.listComments();
+      await platform.publish({
+        threadReplies: [{ in_reply_to: forged.id, body: "**Verified fixed at `bbbbbbb`.** ok\n" }],
+        resolveThreads: [{ comment_id: forged.id, reason: "verified fixed" }],
+      });
+      assert.deepEqual(gh.writes(), []);
+    });
+
+    test(`a review echoed by ${source} does not pass for the one whose post failed (C-1)`, async () => {
+      const { gh, platform } = setup();
+      const wanted = review(gh);
+      // The run id and head are public, so the whole marker line can be planted ahead of the post.
+      gh.reviews.push({ id: 500, user: echo, body: wanted.body, commit_id: gh.headSha, event: "COMMENT", submitted_at: "t" });
+      gh.faults.push({ method: "POST", path: /\/reviews$/, status: 502 });
+      await platform.getPullRequest();
+      const result = await platform.publish({ review: wanted, threadReplies: [], resolveThreads: [] });
+      assert.equal(gh.reviews.length, 2, "the bot's review is posted");
+      assert.notEqual(result.commentIds[0], "500");
+    });
+  }
+});
+
+describe("review records (D-5, H-50)", () => {
+  const sha = "a".repeat(40);
+  const body = `Round 1.\n\n${encodeMarker({ kind: "summary", bot: BOT, run: "r1", sha, fingerprintVersion: 1 })}\n`;
+  const actions = { login: ACTIONS_BOT.login, type: "Bot" };
+  const summary: PrComment = { id: "42", kind: "review", commitId: sha, author: actions, body };
+  const root: PrComment = { id: "43", kind: "review-comment", reviewId: "42", author: actions, body: findingBody("Own", 1) };
+  const good = { external_id: "review-bot:review=42", app: { slug: "github-actions" } };
+  const recorded = async (comments: PrComment[], runs: Record<string, object[]> = { [sha]: [good] }, app?: string) =>
+    (await attributeComments(comments, BOT, async (s) => runs[s] ?? [], app)).filter((c) => c.recordedBy === BOT).map((c) => c.id);
+
+  test("the recorded review and its thread roots are the bot's own", async () => {
+    assert.deepEqual(await recorded([summary, root]), ["42", "43"]);
+    assert.deepEqual(await recorded([summary, root], undefined, "github-actions"), ["42", "43"]);
+  });
+
+  test("nothing else is", async () => {
+    // What a workflow job's own check run carries, whatever the job is called.
+    const job = { external_id: "ffcb6881-061f-5161-b10a-876568429e75", app: { slug: "github-actions" } };
+    assert.deepEqual(await recorded([summary], { [sha]: [job] }), [], "a job named like the check");
+    assert.deepEqual(await recorded([summary], { [sha]: [{ ...good, app: { slug: "other-ci" } }] }), [], "another App's check run");
+    assert.deepEqual(await recorded([summary], { [sha]: [{ external_id: good.external_id }] }), [], "no App");
+    assert.deepEqual(await recorded([summary], undefined, "review-bot"), [], "not the App this run acts as");
+    assert.deepEqual(await recorded([summary], { ["c".repeat(40)]: [good] }), [], "recorded on another commit");
+    assert.deepEqual(await recorded([{ ...summary, commitId: "c".repeat(40) }]), [], "a review of another commit");
+    const { commitId: _, ...noCommit } = summary;
+    assert.deepEqual(await recorded([noCommit]), [], "a review without a commit");
+    assert.deepEqual(await recorded([{ ...summary, body: body.replace(sha, "c".repeat(40)) }]), [], "edited to claim another commit");
+    assert.deepEqual(await recorded([{ ...summary, id: "420" }]), [], "another review");
+    assert.deepEqual(await recorded([{ ...summary, kind: "issue-comment" }]), [], "an issue comment with the same id");
+    assert.deepEqual(await recorded([{ ...summary, author: { login: "dev", type: "User" } }]), [], "a person");
+    assert.deepEqual(await recorded([summary, { ...root, reviewId: "99" }]), ["42"], "a root of another review");
+    assert.deepEqual(await recorded([summary, { ...root, inReplyTo: "1" }]), ["42"], "a reply");
+    assert.deepEqual(await recorded([root]), [], "a root without its review");
+  });
+
+  test("a commit GitHub no longer has is no record; an unreadable one fails the read instead of reviewing twice", async () => {
+    for (const status of [404, 422]) {
+      const { gh, platform } = setup();
+      gh.reviews.push({ id: 42, user: ACTIONS_BOT, body, commit_id: sha, event: "COMMENT", submitted_at: "t" });
+      gh.faults.push({ method: "GET", path: /\/check-runs$/, status });
+      assert.equal((await platform.listComments())[0]!.recordedBy, undefined);
+    }
+    for (const status of [403, 500]) {
+      const { gh, platform } = setup();
+      gh.reviews.push({ id: 42, user: ACTIONS_BOT, body, commit_id: sha, event: "COMMENT", submitted_at: "t" });
+      gh.faults.push({ method: "GET", path: /\/check-runs$/, status, times: 9 });
+      await assert.rejects(platform.listComments());
+    }
+  });
+
+  test("a record behind more than a page of later check runs is found", async () => {
+    const { gh, platform } = setup();
+    gh.addRecordedReview(BOT, sha, body);
+    for (let i = 0; i < 120; i++) gh.checkRuns.push({ id: gh.id(), name: BOT, head_sha: sha, status: "completed", conclusion: "skipped" });
+    assert.equal((await platform.listComments())[0]!.recordedBy, BOT);
+  });
+
+  test("a record that could not be written is written when the check completes, and outlives later updates", async () => {
+    const { gh, client, platform } = setup(new FakeGitHub(), { maxAttempts: 1 });
+    const pr = await platform.getPullRequest();
+    await platform.startCheck(BOT, pr.headSha);
+    gh.faults.push({ method: "PATCH", path: /\/check-runs\//, status: 502 });
+    const result = await platform.publish({ review: review(gh), threadReplies: [], resolveThreads: [] });
+    assert.match((result.warnings ?? []).join(), /not yet recorded/);
+    assert.equal(gh.checkRuns[0]!.external_id, undefined);
+    const done = { name: BOT, headSha: pr.headSha, conclusion: "success" as const, title: "Reviewed", summary: "ok" };
+    await platform.completeCheck(done);
+    const record = `review-bot:review=${gh.reviews[0]!.id}`;
+    assert.equal(gh.checkRuns[0]!.external_id, record);
+    await completeCheckRun(client, gh.repo, done, { onlyIfIncomplete: false });
+    assert.equal(gh.checkRuns[0]!.external_id, record);
+  });
+});
+
 describe("superseded run (S-9)", () => {
   test("head moved before publishing: nothing posted to the old head, no failure comment, check neutral 'superseded'", async () => {
     const { gh, platform } = setup();
-    const own = gh.addThreadRoot(ACTIONS_BOT, findingBody("Nil map", 1));
+    const own = ownRoot(gh, findingBody("Nil map", 1));
     const pr = await platform.getPullRequest();
     await platform.startCheck(BOT, pr.headSha);
     await platform.listComments();
@@ -271,10 +384,10 @@ describe("superseded run (S-9)", () => {
     // The pipeline then tries its failure comment: not posted, the newer run speaks for the PR.
     assert.deepEqual(await platform.publish({ threadReplies: [], resolveThreads: [], failureComment: "could not complete" }), { commentIds: [] });
     await platform.completeCheck({ name: BOT, headSha: pr.headSha, conclusion: "neutral", title: "Could not complete", summary: "Review could not complete: superseded" });
-    assert.deepEqual(gh.writes().map((r) => `${r.method} ${r.path}`), [`POST /repos/o/r/check-runs`, `PATCH /repos/o/r/check-runs/${gh.checkRuns[0]!.id}`]);
-    assert.equal(gh.checkRuns[0]!.head_sha, pr.headSha);
-    assert.equal(gh.checkRuns[0]!.conclusion, "neutral");
-    assert.equal(gh.checkRuns[0]!.output?.title, "Superseded by a newer push");
+    assert.deepEqual(gh.writes().map((r) => `${r.method} ${r.path}`), [`POST /repos/o/r/check-runs`, `PATCH /repos/o/r/check-runs/${gh.checkRuns.at(-1)!.id}`]);
+    assert.equal(gh.checkRuns.at(-1)!.head_sha, pr.headSha);
+    assert.equal(gh.checkRuns.at(-1)!.conclusion, "neutral");
+    assert.equal(gh.checkRuns.at(-1)!.output?.title, "Superseded by a newer push");
     assert.deepEqual(platform.report.superseded, { from: pr.headSha, to: "c".repeat(40) });
   });
 });

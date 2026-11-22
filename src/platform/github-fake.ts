@@ -21,7 +21,7 @@ export interface FakeReviewComment {
   line: number | null;
   start_line?: number | null;
   in_reply_to_id?: number;
-  review_id?: number;
+  pull_request_review_id?: number;
   created_at: string;
 }
 export interface FakeIssueComment {
@@ -51,6 +51,8 @@ export interface FakeCheckRun {
   conclusion: string | null;
   output?: { title: string; summary: string };
   details_url?: string;
+  external_id?: string;
+  app?: { slug: string };
 }
 
 export interface RecordedRequest {
@@ -137,6 +139,14 @@ export class FakeGitHub {
   }
   private time(): string {
     return new Date(Date.UTC(2026, 10, 20, 0, 0, this.clock++)).toISOString();
+  }
+
+  /** Seed what a run of `as` leaves when it has posted a review: the review and its record (D-5). */
+  addRecordedReview(name: string, sha: string, body: string, as: FakeUser = this.as): FakeReview {
+    const review: FakeReview = { id: this.id(), user: as, body, commit_id: sha, event: "COMMENT", submitted_at: this.time() };
+    this.reviews.push(review);
+    this.checkRuns.push({ id: this.id(), name, head_sha: sha, status: "completed", conclusion: "success", external_id: `review-bot:review=${review.id}`, app: { slug: slugOf(as) } });
+    return review;
   }
 
   /** Seed a thread root review comment (and its thread). */
@@ -229,7 +239,7 @@ export class FakeGitHub {
       return c ? json(200, c) : json(404, { message: "Not Found" });
     }
     if (r.method === "GET" && (x = m(new RegExp(`^${base}/pulls/${this.number}/reviews/(\\d+)/comments$`)))) {
-      return this.list(this.reviewComments.filter((c) => c.review_id === Number(x![1])), u);
+      return this.list(this.reviewComments.filter((c) => c.pull_request_review_id === Number(x![1])), u);
     }
     if (r.method === "POST" && p === `${base}/pulls/${this.number}/reviews`) {
       const comments = (body.comments ?? []) as Array<{ path: string; line: number; start_line?: number; body: string }>;
@@ -243,7 +253,7 @@ export class FakeGitHub {
       this.reviews.push(review);
       for (const c of comments) {
         const rc = this.addThreadRoot(this.as, c.body, c.path, c.line);
-        rc.review_id = review.id;
+        rc.pull_request_review_id = review.id;
         if (c.start_line !== undefined) rc.start_line = c.start_line;
       }
       return json(200, review);
@@ -268,12 +278,16 @@ export class FakeGitHub {
     if (r.method === "GET" && (x = m(new RegExp(`^${base}/commits/([0-9a-f]+)/check-runs$`)))) {
       const name = u.searchParams.get("check_name");
       const runs = this.checkRuns.filter((c) => c.head_sha === x![1] && (name === null || c.name === name));
-      return json(200, { total_count: runs.length, check_runs: [...runs].reverse() });
+      const per = Number(u.searchParams.get("per_page") ?? 30);
+      const page = Number(u.searchParams.get("page") ?? 1);
+      return json(200, { total_count: runs.length, check_runs: [...runs].reverse().slice((page - 1) * per, page * per) });
     }
     if (r.method === "POST" && p === `${base}/check-runs`) {
       const c: FakeCheckRun = { id: this.id(), name: String(body.name), head_sha: String(body.head_sha), status: String(body.status ?? "queued"), conclusion: (body.conclusion as string | undefined) ?? null };
       if (body.output) c.output = body.output as FakeCheckRun["output"] & object;
       if (body.details_url) c.details_url = String(body.details_url);
+      if (body.external_id) c.external_id = String(body.external_id);
+      c.app = { slug: slugOf(this.as) };
       this.checkRuns.push(c);
       return json(201, c);
     }
@@ -284,6 +298,7 @@ export class FakeGitHub {
       if (body.conclusion !== undefined) c.conclusion = String(body.conclusion);
       if (body.output) c.output = body.output as FakeCheckRun["output"] & object;
       if (body.details_url) c.details_url = String(body.details_url);
+      if (body.external_id) c.external_id = String(body.external_id);
       return json(200, c);
     }
     return json(404, { message: `fake GitHub: no route for ${r.method} ${p}` });
@@ -333,6 +348,10 @@ export class FakeGitHub {
   writes(): RecordedRequest[] {
     return this.requests.filter((r) => r.method !== "GET" && !(r.path === "/graphql" && !String((r.body as { query?: string }).query).startsWith("mutation")));
   }
+}
+
+function slugOf(u: FakeUser): string {
+  return u.login.replace(/\[bot\]$/, "");
 }
 
 function json(status: number, data: unknown, headers: Record<string, string> = {}): Response {

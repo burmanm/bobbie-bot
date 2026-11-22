@@ -97,7 +97,7 @@ start.
 | D-2 | Each model step is a pi SDK session created by our own orchestrator (confirmed by the R-0 spike, pi pinned to 1.5.2). The orchestrator is started as a pi command, so the whole bot is a pi module. Jobs without a model stay plain CLI | [F-3](01-foundation-pi.md#f-3--integration-shape) |
 | D-3 | Do **not** build on Pi Durable now; keep stage boundaries so it can be adopted later | [F-4](01-foundation-pi.md#f-4--pi-durable-decision) |
 | D-4 | Findings are emitted through a typed tool call, never parsed from prose. Guaranteed unless an operator's module replaces the output tools | [A-3](02-architecture.md#a-3--finding) |
-| D-5 | Review state lives in GitHub (hidden markers in the bot's own comments); the review job itself needs no database | [S-7](03-review-pipeline.md#s-7--publish) |
+| D-5 | Review state lives in GitHub (hidden markers in the bot's own comments, which its check runs record); the review job itself needs no database | [S-7](03-review-pipeline.md#s-7--publish) |
 | D-6 | Knowledge is the repository's own `AGENTS.md`, `REVIEW.md` and vendored guidelines; no built-in guidance, no bot-private format | [A-5](02-architecture.md#a-5--knowledge-sources) |
 | D-7 | Knowledge is always read from the base branch, never from the PR head | [C-3](06-ci-and-security.md#c-3--trust-model) |
 | D-8 | Start with one reviewer plus a verifier; add reviewer fan-out only when the eval harness shows it pays | [S-4](03-review-pipeline.md#s-4--review) |
