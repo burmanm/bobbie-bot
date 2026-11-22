@@ -22,7 +22,7 @@ something, they win over any habit of yours.
   the repository's knowledge files, and the comments already on the PR.
 - **Patches**, one file per changed file, under `patches/` in the inputs
   root. The change map gives each file's patch path.
-- **Snapshots**: the PR head (your working directory), the base branch, and,
+- **Snapshots**: the PR head (the `head` read root), the base branch, and,
   when present, the dependency source cache (`modcache`), all read-only.
 - **Read tools**: `read`, `ls`, `grep`, `find`. Search does not honour
   ignore files, so nothing in the snapshot is hidden from you.

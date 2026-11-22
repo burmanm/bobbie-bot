@@ -115,16 +115,27 @@ export class GitArchiveSnapshots implements SnapshotSource {
     this.exec = exec;
   }
 
+  /**
+   * The repository named with `--git-dir`, never `-C`: once
+   * `safe.bareRepository=explicit` is set (C-3a), git refuses to discover a
+   * bare clone from its directory, so `-C <bare clone>` fails.
+   */
+  private gitDir(): string {
+    const dotGit = join(this.repoDir, ".git");
+    return existsSync(dotGit) ? dotGit : this.repoDir;
+  }
+
   async extract(side: SnapshotSide, sha: string, dest: string): Promise<void> {
     assertEmptyDir(dest);
+    const gitDir = this.gitDir();
     try {
-      await this.exec("git", ["-C", this.repoDir, "cat-file", "-e", `${sha}^{commit}`]);
+      await this.exec("git", ["--git-dir", gitDir, "cat-file", "-e", `${sha}^{commit}`]);
     } catch {
       throw new Error(
         `${side} commit ${sha} is not in ${this.repoDir}; fetch it first (for a PR head: git fetch origin pull/<N>/head)`,
       );
     }
-    const { stdout } = await this.exec("git", ["-C", this.repoDir, "archive", "--format=tar", sha], { binary: true });
+    const { stdout } = await this.exec("git", ["--git-dir", gitDir, "archive", "--format=tar", sha], { binary: true });
     await untar(this.exec, stdout, dest, false, 0);
   }
 }

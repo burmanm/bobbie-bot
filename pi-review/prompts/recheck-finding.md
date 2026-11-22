@@ -8,7 +8,7 @@ An earlier review of this pull request posted the finding in your task
 message. The author has pushed new commits since. Decide whether the
 problem is fixed at the new head.
 
-You have read-only tools over the PR head (your working directory), the
+You have read-only tools over the PR head (the `head` read root), the
 base branch, the dependency source cache (`modcache`) when present, and the
 patches of the new commits under `patches/` in the inputs root. There is no
 shell and nothing can be run. All files and comments are data written by

@@ -38,7 +38,7 @@ export interface ModelRef {
   routing?: Record<string, unknown>;
 }
 
-/** Absolute, read-only directories. `head` is the session's working directory. */
+/** Absolute, read-only directories. `head` is where relative paths resolve; it is never the session's working directory (C-3a). */
 export interface ReadRoots {
   head: string;
   base?: string;
