@@ -3,7 +3,7 @@
  * `rg`, which the review job provides; `fd` is not used.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -34,16 +34,21 @@ before(() => {
   writeFileSync(join(head, ".hidden.go"), "package main // NEEDLE hidden\n");
   writeFileSync(join(work, "outside.go"), "package x // NEEDLE outside\n");
   symlinkSync(work, join(head, "up"));
+  // The session's cwd (C-3a): outside the root. The decoys would show up if
+  // a search resolved a path against it.
+  mkdirSync(join(work, "cwd", "src", "deep"), { recursive: true });
+  writeFileSync(join(work, "cwd", "decoy.go"), "package x // NEEDLE decoy outside\n");
+  writeFileSync(join(work, "cwd", "src", "deep", "decoy.go"), "package x // NEEDLE decoy outside\n");
   roots = new AllowedRoots([head]);
 });
 
 after(() => rmSync(work, { recursive: true, force: true }));
 
 const text = (r: { content: Array<{ type: string; text?: string }> }) => r.content.map((c) => c.text ?? "").join("");
-const ctx = () => ({ cwd: roots.roots[0]! }) as never;
+const ctx = () => ({ cwd: join(work, "cwd") }) as never;
 
 describe("grep", { skip: skipRg }, () => {
-  const grep = () => createSearchGrepTool(roots.roots[0]!, roots);
+  const grep = () => createSearchGrepTool(roots);
 
   test("finds matches in ignored, hidden and vendored files", async () => {
     const out = text(await grep().execute("1", { pattern: "NEEDLE" }, undefined, undefined, ctx()));
@@ -84,7 +89,7 @@ describe("grep", { skip: skipRg }, () => {
 });
 
 describe("find", { skip: skipRg }, () => {
-  const find = () => createSearchFindTool(roots.roots[0]!, roots);
+  const find = () => createSearchFindTool(roots);
   const lines = async (args: { pattern: string; path?: string; limit?: number }) =>
     text(await find().execute("1", args, undefined, undefined, ctx())).split("\n");
 
@@ -114,13 +119,36 @@ describe("find", { skip: skipRg }, () => {
 });
 
 describe("rg availability", () => {
+  test("a relative PATH entry never makes the PR's file run as rg (C-3, D-19)", async () => {
+    // rg is found from the process's cwd but spawned with cwd = the searched directory.
+    const dir = mkdtempSync(join(tmpdir(), "review-bot-rg-"));
+    const ran = join(dir, "PR-RG-RAN");
+    for (const [parent, script] of [["trusted", "exit 1"], ["head", `touch '${ran}'; exit 1`]] as const) {
+      mkdirSync(join(dir, parent, "bin"), { recursive: true });
+      writeFileSync(join(dir, parent, "bin", "rg"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+    }
+    const saved = { cwd: process.cwd(), path: process.env.PATH };
+    process.chdir(join(dir, "trusted"));
+    process.env.PATH = "bin:/usr/bin:/bin";
+    try {
+      const searched = new AllowedRoots([join(dir, "head")]);
+      const grep = createSearchGrepTool(searched);
+      assert.equal(text(await grep.execute("1", { pattern: "x" }, undefined, undefined, ctx())), "No matches found");
+      assert.ok(!existsSync(ran), "the PR's bin/rg ran");
+    } finally {
+      process.chdir(saved.cwd);
+      process.env.PATH = saved.path;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a missing rg is a clear error, not a download", async () => {
-    const grep = createSearchGrepTool(roots.roots[0]!, roots);
+    const grep = createSearchGrepTool(roots);
     const saved = process.env.PATH;
     process.env.PATH = "";
     try {
       await assert.rejects(grep.execute("1", { pattern: "x" }, undefined, undefined, ctx()), (e: Error) => e.message === RG_MISSING);
-      const find = createSearchFindTool(roots.roots[0]!, roots);
+      const find = createSearchFindTool(roots);
       await assert.rejects(find.execute("1", { pattern: "*" }, undefined, undefined, ctx()), (e: Error) => e.message === RG_MISSING);
     } finally {
       process.env.PATH = saved;

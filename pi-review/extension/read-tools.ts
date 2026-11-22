@@ -4,6 +4,10 @@
  * The `tool_call` guard (guard.ts) already rejects out-of-root path
  * arguments. These operations are the second barrier: they check the exact
  * path pi is about to open, after pi's own path handling (C-3, C-3a).
+ *
+ * pi's tool definitions resolve paths against `ctx.cwd` whenever there is a
+ * context, whatever directory they were created with, so `resolveInHead`
+ * wraps them.
  */
 import { createReadStream } from "node:fs";
 import { access, readFile, readdir, stat } from "node:fs/promises";
@@ -14,7 +18,9 @@ import {
   detectSupportedImageMimeTypeFromFile,
   type LsOperations,
   type ReadOperations,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
+import type { TSchema } from "typebox";
 import type { AllowedRoots } from "./paths.ts";
 
 export function confinedReadOperations(roots: AllowedRoots): ReadOperations {
@@ -53,10 +59,27 @@ export function confinedLsOperations(roots: AllowedRoots): LsOperations {
   };
 }
 
-export function createConfinedReadTool(cwd: string, roots: AllowedRoots) {
-  return createReadToolDefinition(cwd, { operations: confinedReadOperations(roots) });
+/**
+ * One of pi's tools, run as if the session's cwd were head (C-3a). Only the
+ * tool sees this: the session, modules and what they spawn keep the neutral
+ * cwd. The context is inherited rather than copied, because pi's getters
+ * must be read when used.
+ */
+export function resolveInHead<P extends TSchema, D, S>(
+  definition: ToolDefinition<P, D, S>,
+  head: string,
+): ToolDefinition<P, D, S> {
+  return {
+    ...definition,
+    execute: (toolCallId, params, signal, onUpdate, ctx) =>
+      definition.execute(toolCallId, params, signal, onUpdate, Object.create(ctx ?? null, { cwd: { value: head } })),
+  };
 }
 
-export function createConfinedLsTool(cwd: string, roots: AllowedRoots) {
-  return createLsToolDefinition(cwd, { operations: confinedLsOperations(roots) });
+export function createConfinedReadTool(roots: AllowedRoots) {
+  return resolveInHead(createReadToolDefinition(roots.head, { operations: confinedReadOperations(roots) }), roots.head);
+}
+
+export function createConfinedLsTool(roots: AllowedRoots) {
+  return resolveInHead(createLsToolDefinition(roots.head, { operations: confinedLsOperations(roots) }), roots.head);
 }

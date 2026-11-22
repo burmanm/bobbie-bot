@@ -8,13 +8,16 @@
  * is not needed. Neither downloads anything: a missing `rg` is an error
  * (C-3a "no downloads in the job that holds secrets").
  *
+ * Relative and omitted paths resolve in head, not in the session's cwd
+ * (C-3a).
+ *
  * Ripgrep does not follow symlinks while walking a directory, so a symlink
  * pointing out of a root is not searched through.
  */
 import { spawn } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
 import { stat } from "node:fs/promises";
-import { delimiter, join } from "node:path";
+import { delimiter, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import {
   createFindToolDefinition,
@@ -27,6 +30,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { AllowedRoots } from "./paths.ts";
+import { resolveInHead } from "./read-tools.ts";
 
 /** Flags shared by every ripgrep call. */
 const RG_BASE_ARGS = [
@@ -39,11 +43,15 @@ const RG_BASE_ARGS = [
 export const RG_MISSING =
   "ripgrep (rg) is not installed on PATH. The review job must provide it; it is never downloaded (C-3a).";
 
-/** Locate an executable on PATH without running or downloading anything. */
+/**
+ * Locate an executable on PATH without running or downloading anything. The
+ * result is absolute: ripgrep is spawned with the searched directory as cwd,
+ * where a relative path would name a file of the PR (C-3, D-19).
+ */
 export function findExecutable(name: string, pathEnv: string = process.env.PATH ?? ""): string | undefined {
   for (const dir of pathEnv.split(delimiter)) {
     if (!dir) continue;
-    const candidate = join(dir, name);
+    const candidate = resolve(dir, name);
     try {
       accessSync(candidate, constants.X_OK);
       if (statSync(candidate).isFile()) return candidate;
@@ -90,7 +98,6 @@ function requireRg(options: SearchToolOptions): string {
 }
 
 export function createSearchGrepTool(
-  cwd: string,
   roots: AllowedRoots,
   options: SearchToolOptions = {},
 ): ToolDefinition<typeof grepSchema, undefined> {
@@ -100,9 +107,9 @@ export function createSearchGrepTool(
     description: `Search file contents for a pattern. Returns matching lines with file paths (relative to the searched directory) and line numbers. Searches every file, including hidden files and files listed in .gitignore or .ignore. Output is limited to ${DEFAULT_GREP_LIMIT} matches by default or ${DEFAULT_MAX_BYTES / 1024}KB; long lines are truncated.`,
     promptSnippet: "Search file contents for patterns (every file, ignore files are not honoured)",
     parameters: grepSchema,
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal) {
       const rg = requireRg(options);
-      const checked = roots.check(params.path ?? ".", ctx?.cwd ?? cwd);
+      const checked = roots.check(params.path ?? ".", roots.head);
       if (!checked.ok) throw new Error(checked.reason);
       const searchPath = roots.resolveForAccess(checked.path);
       const isDirectory = (await stat(searchPath)).isDirectory();
@@ -140,7 +147,7 @@ export function createSearchGrepTool(
 }
 
 /** pi's `find`, with the file listing done by `rg --files` instead of `fd`. */
-export function createSearchFindTool(cwd: string, roots: AllowedRoots, options: SearchToolOptions = {}) {
+export function createSearchFindTool(roots: AllowedRoots, options: SearchToolOptions = {}) {
   const operations: FindOperations = {
     exists: (p) => {
       try {
@@ -164,7 +171,7 @@ export function createSearchFindTool(cwd: string, roots: AllowedRoots, options: 
       return result.output;
     },
   };
-  const definition = createFindToolDefinition(cwd, { operations });
+  const definition = resolveInHead(createFindToolDefinition(roots.head, { operations }), roots.head);
   return {
     ...definition,
     description:

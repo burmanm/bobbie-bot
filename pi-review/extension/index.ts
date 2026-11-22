@@ -10,7 +10,12 @@
  * - the step's typed output tools,
  * - the step's query tools (history, issue search), answered by the
  *   orchestrator (S-4),
- * - the `tool_call` guard.
+ * - the `tool_call` guard,
+ * - the system prompt's `cwd` section.
+ *
+ * The session's cwd is an empty directory outside every root (C-3a, D-15),
+ * so nothing here uses `ctx.cwd`: the tools and the guard resolve relative
+ * and omitted paths in head.
  */
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { createToolCallGuard, type GuardRejection, type ReadToolName } from "./guard.ts";
@@ -37,7 +42,7 @@ export { findExecutable, RG_MISSING } from "./search-tools.ts";
 export const EXTENSION_NAME = "review-bot";
 
 export interface ReviewExtensionOptions {
-  /** Absolute read roots. The first is the session's working directory (head). */
+  /** Absolute read roots. The first is head, where relative paths resolve; it is never the session's cwd. */
   roots: readonly string[];
   readTools: readonly ReadToolName[];
   outputTools: readonly OutputTool[];
@@ -56,7 +61,6 @@ export interface ReviewExtensionOptions {
 
 export function createReviewExtension(options: ReviewExtensionOptions): ExtensionFactory {
   const roots = new AllowedRoots(options.roots);
-  const cwd = roots.roots[0]!;
   const search = options.rgPath === undefined ? {} : { rgPath: options.rgPath };
   const queryTools = options.queryTools ?? [];
   const allowedTools = new Set<string>([
@@ -68,10 +72,10 @@ export function createReviewExtension(options: ReviewExtensionOptions): Extensio
   return (pi) => {
     // Registered under the built-in names, so they replace pi's own tools.
     for (const name of new Set(options.readTools)) {
-      if (name === "read") pi.registerTool(createConfinedReadTool(cwd, roots));
-      else if (name === "ls") pi.registerTool(createConfinedLsTool(cwd, roots));
-      else if (name === "grep") pi.registerTool(createSearchGrepTool(cwd, roots, search));
-      else if (name === "find") pi.registerTool(createSearchFindTool(cwd, roots, search));
+      if (name === "read") pi.registerTool(createConfinedReadTool(roots));
+      else if (name === "ls") pi.registerTool(createConfinedLsTool(roots));
+      else if (name === "grep") pi.registerTool(createSearchGrepTool(roots, search));
+      else if (name === "find") pi.registerTool(createSearchFindTool(roots, search));
     }
     for (const tool of options.outputTools) registerOutputTool(pi, tool);
     for (const tool of queryTools) registerQueryTool(pi, tool);
@@ -79,10 +83,15 @@ export function createReviewExtension(options: ReviewExtensionOptions): Extensio
     const guard = createToolCallGuard({
       allowedTools,
       roots,
-      cwd,
       ...(options.onReject === undefined ? {} : { onReject: options.onReject }),
     });
-    pi.on("tool_call", (event, ctx) => guard(event, ctx));
+    pi.on("tool_call", (event) => guard(event));
+    // pi shows the model the session's cwd. That directory is no use to it
+    // (empty, outside the roots, new in every step), and head is what
+    // relative paths mean to it (C-3a).
+    pi.on("before_agent_start", (event) => {
+      event.systemPromptOptions.sections.cwd = `${roots.head} (head: read, ls, grep and find resolve relative and omitted paths here)`;
+    });
     const onRequest = options.onProviderRequest;
     if (onRequest !== undefined) {
       pi.on("before_provider_request", (event) => {
