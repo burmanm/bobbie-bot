@@ -34,6 +34,7 @@ import {
   RG_MISSING,
   type QueryTool,
 } from "../../pi-review/extension/index.ts";
+import { requireExplicitBareRepository } from "../core/git-env.ts";
 import { StepAccounting } from "./accounting.ts";
 import { createModelRuntime, ModelsFileError } from "./model-runtime.ts";
 import { stopReasonOf } from "./limits.ts";
@@ -99,22 +100,16 @@ function safeTempDir(roots: AllowedRoots): string {
   }
 }
 
-/**
- * Append `safe.bareRepository=explicit` to git's environment configuration
- * (C-3a), so git started inside an embedded bare repository of the PR refuses
- * it instead of running its `core.fsmonitor`. The last entry wins in git, so
- * it is appended unless it already is last; existing entries are kept.
- */
-export function requireExplicitBareRepository(env: NodeJS.ProcessEnv): void {
-  const raw = env.GIT_CONFIG_COUNT || "0";
-  if (!/^\d+$/.test(raw)) throw new ConfigError(`GIT_CONFIG_COUNT is not a number: ${raw}`);
-  const count = Number(raw);
-  const key = "safe.bareRepository";
-  const value = "explicit";
-  if (count > 0 && env[`GIT_CONFIG_KEY_${count - 1}`] === key && env[`GIT_CONFIG_VALUE_${count - 1}`] === value) return;
-  env[`GIT_CONFIG_KEY_${count}`] = key;
-  env[`GIT_CONFIG_VALUE_${count}`] = value;
-  env.GIT_CONFIG_COUNT = String(count + 1);
+/** Re-exported: the entry points set it too, before any step (R-1a step 3). */
+export { requireExplicitBareRepository };
+
+/** git's `safe.bareRepository=explicit` (C-3a), a bad `GIT_CONFIG_COUNT` being a configuration error. */
+function requireExplicitBareRepositoryOrConfigError(env: NodeJS.ProcessEnv): void {
+  try {
+    requireExplicitBareRepository(env);
+  } catch (e) {
+    throw new ConfigError(e instanceof Error ? e.message : String(e));
+  }
 }
 
 let processAgentDir: string | undefined;
@@ -130,7 +125,7 @@ let processAgentDir: string | undefined;
  * - git's `safe.bareRepository=explicit`.
  */
 function preparePiEnvironment(temp: string): void {
-  requireExplicitBareRepository(process.env);
+  requireExplicitBareRepositoryOrConfigError(process.env);
   if (processAgentDir === undefined) {
     processAgentDir = mkdtempSync(join(temp, "review-bot-pi-"));
   }

@@ -104,15 +104,16 @@ that is never the snapshot (C-3a).
   extension replaces it with head, so the model never sees the neutral
   directory and the prompt does not change from step to step. Hooks still
   see the real one in `systemPromptOptions.cwd`.
-- **git.** The step appends `safe.bareRepository=explicit` to the process's
-  `GIT_CONFIG_COUNT` entries and keeps the others, so git that something
-  runs inside an embedded bare repository of the PR refuses it. Limits:
+- **git.** `safe.bareRepository=explicit` is appended to the process's
+  `GIT_CONFIG_COUNT` entries, keeping the others, so git that something
+  runs inside an embedded bare repository of the PR refuses it. The entry
+  points set it before anything runs (`review-bot review` and `launch`,
+  and `/review-bot`; R-1a step 3), so runs with only ACP steps have it too;
+  each pi step sets it again. The helper is in `core/git-env.ts`. Limits:
   - it needs git 2.38 or later;
   - an operator's `GIT_CONFIG_PARAMETERS` takes precedence over it;
-  - it is set from the first pi step on, so a process that runs only ACP
-    steps does not have it;
-  - from then on `git -C <bare clone>` is refused in this process too:
-    name such a repository with `--git-dir`.
+  - `git -C <bare clone>` is refused in the process too: name such a
+    repository with `--git-dir`, as `GitArchiveSnapshots` does.
 
 ## Behaviour worth knowing
 

@@ -1,0 +1,19 @@
+{
+  "name": "review-bot-pi-command",
+  "private": true,
+  "version": "0.0.0",
+  "description": "review-bot as a pi package: the /review-bot command, the review-method skill and the step prompts. Not the official pi-review package. Design: docs/plan (F-3, A-8).",
+  "type": "module",
+  "keywords": [],
+  "pi": {
+    "extensions": ["./command/index.ts"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts/*.md"],
+    "changelogPath": ""
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

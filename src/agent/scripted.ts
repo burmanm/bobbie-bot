@@ -19,10 +19,29 @@ import type { ModelRef } from "./types.ts";
 
 export const SCRIPTED_PROVIDER = "scripted";
 
-/** One assistant turn: text, tool calls, or (in code only) a factory. */
+/**
+ * One assistant turn: text, tool calls, or (in code only) a factory.
+ * `delayMs` holds the answer back that long, as a slow model would; an abort
+ * ends the wait (used to stop a run mid-step, F-3).
+ */
 export type ScriptTurn =
-  | { text?: string; toolCalls?: Array<{ name: string; arguments: Record<string, unknown> }> }
+  | { text?: string; toolCalls?: Array<{ name: string; arguments: Record<string, unknown> }>; delayMs?: number }
   | FauxResponseFactory;
+
+function wait(ms: number, signal: AbortSignal | undefined): Promise<boolean> {
+  return new Promise((done) => {
+    if (signal?.aborted) return done(false);
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      done(true);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      done(false);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 /** Model id (usually the role name) → its turns. */
 export type Script = Record<string, ScriptTurn[]>;
@@ -50,6 +69,15 @@ export function createScriptedProvider(script: Script): ScriptedProvider {
     const turn = queues.get(model.id)?.shift();
     if (turn === undefined) return fauxAssistantMessage(fauxText("Done."));
     if (typeof turn === "function") return turn(context, options, state, model);
+    if (turn.delayMs !== undefined && turn.delayMs > 0) {
+      const { delayMs, ...rest } = turn;
+      return wait(delayMs, options?.signal).then((done) =>
+        done ? answer(rest) : fauxAssistantMessage([], { stopReason: "aborted", errorMessage: "Request was aborted" }),
+      );
+    }
+    return answer(turn);
+  };
+  const answer = (turn: Exclude<ScriptTurn, FauxResponseFactory>) => {
     const blocks: FauxContentBlock[] = [];
     if (turn.text !== undefined) blocks.push(fauxText(turn.text));
     for (const call of turn.toolCalls ?? []) blocks.push(fauxToolCall(call.name, call.arguments as never, { id: `call-${++seq}` }));

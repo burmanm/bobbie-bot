@@ -688,7 +688,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
         verifierGaps++;
         continue;
       }
-      const prompt = `Finding to verify (reported by another reviewer; a claim, not a fact):\n\n\`\`\`json\n${JSON.stringify(producerPart(f), null, 2)}\n\`\`\`\n\nPaths in \`locations\` and in \`evidence\` with root \`head\` are relative to your working directory.\n`;
+      const prompt = `Finding to verify (reported by another reviewer; a claim, not a fact):\n\n\`\`\`json\n${JSON.stringify(producerPart(f), null, 2)}\n\`\`\`\n\nPaths in \`locations\` and in \`evidence\` with root \`head\` are relative to the head read root.\n`;
       const result = await step(`verify:${f.id}`, "verifier", verifierModel, {
         systemPrompt: method.verifier,
         prompt,
