@@ -44,7 +44,21 @@ export interface QueryDetails {
 export const QUERY_DEFAULT_TIMEOUT_MS = 30_000;
 export const QUERY_DEFAULT_MAX_BYTES = 24 * 1024;
 
-const TOKEN_LIKE = /\b(?:gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
+/**
+ * Token forms that are redacted (C-3, C-7, A-6 saved scripts):
+ * - an installation token `ghs_<app id>_<JWT>`. A JWT starts "eyJ" (base64url
+ *   of `{"`), which is what tells it from an identifier. It needs no word
+ *   boundary, so it is also found after an escape such as `\n`, and a token
+ *   cut short after ten characters of its header is redacted too;
+ * - the opaque forms `gh[opsur]_...` and `github_pat_...`. These need a word
+ *   boundary at both ends: "highs_..." contains "ghs_".
+ *
+ * Linear, which matters as this runs on text a model wrote: nothing that
+ * must match follows the JWT's header, and an attempt that fails has only
+ * scanned a run of characters in which no other attempt can start.
+ */
+const TOKEN_LIKE =
+  /ghs_\d+_eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+){0,2}|\b(?:gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
 
 export function scrubSecrets(text: string): string {
   return text.replace(TOKEN_LIKE, "[redacted]");

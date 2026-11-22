@@ -5,6 +5,7 @@
  */
 export * from "./schemas.ts";
 export * from "./run-record.ts";
+export * from "./saved-scripts.ts";
 export * from "./diff.ts";
 export * from "./review-md.ts";
 export * from "./skip.ts";
