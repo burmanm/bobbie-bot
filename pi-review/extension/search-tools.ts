@@ -17,7 +17,7 @@
 import { spawn } from "node:child_process";
 import { accessSync, constants, statSync } from "node:fs";
 import { stat } from "node:fs/promises";
-import { delimiter, join } from "node:path";
+import { delimiter, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import {
   createFindToolDefinition,
@@ -43,11 +43,15 @@ const RG_BASE_ARGS = [
 export const RG_MISSING =
   "ripgrep (rg) is not installed on PATH. The review job must provide it; it is never downloaded (C-3a).";
 
-/** Locate an executable on PATH without running or downloading anything. */
+/**
+ * Locate an executable on PATH without running or downloading anything. The
+ * result is absolute: ripgrep is spawned with the searched directory as cwd,
+ * where a relative path would name a file of the PR (C-3, D-19).
+ */
 export function findExecutable(name: string, pathEnv: string = process.env.PATH ?? ""): string | undefined {
   for (const dir of pathEnv.split(delimiter)) {
     if (!dir) continue;
-    const candidate = join(dir, name);
+    const candidate = resolve(dir, name);
     try {
       accessSync(candidate, constants.X_OK);
       if (statSync(candidate).isFile()) return candidate;

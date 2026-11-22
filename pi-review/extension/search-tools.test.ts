@@ -3,7 +3,7 @@
  * `rg`, which the review job provides; `fd` is not used.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -119,6 +119,29 @@ describe("find", { skip: skipRg }, () => {
 });
 
 describe("rg availability", () => {
+  test("a relative PATH entry never makes the PR's file run as rg (C-3, D-19)", async () => {
+    // rg is found from the process's cwd but spawned with cwd = the searched directory.
+    const dir = mkdtempSync(join(tmpdir(), "review-bot-rg-"));
+    const ran = join(dir, "PR-RG-RAN");
+    for (const [parent, script] of [["trusted", "exit 1"], ["head", `touch '${ran}'; exit 1`]] as const) {
+      mkdirSync(join(dir, parent, "bin"), { recursive: true });
+      writeFileSync(join(dir, parent, "bin", "rg"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+    }
+    const saved = { cwd: process.cwd(), path: process.env.PATH };
+    process.chdir(join(dir, "trusted"));
+    process.env.PATH = "bin:/usr/bin:/bin";
+    try {
+      const searched = new AllowedRoots([join(dir, "head")]);
+      const grep = createSearchGrepTool(searched);
+      assert.equal(text(await grep.execute("1", { pattern: "x" }, undefined, undefined, ctx())), "No matches found");
+      assert.ok(!existsSync(ran), "the PR's bin/rg ran");
+    } finally {
+      process.chdir(saved.cwd);
+      process.env.PATH = saved.path;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a missing rg is a clear error, not a download", async () => {
     const grep = createSearchGrepTool(roots);
     const saved = process.env.PATH;
