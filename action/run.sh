@@ -15,8 +15,12 @@
 # The operator's agent directory (F-7, RB_AGENT_DIR: a path in the
 # repository) comes from the default branch, or from RB_AGENT_DIR_REPO
 # (owner/name@<commit SHA>), never from the PR (D-19). The gate fetches it
-# through the API into $work/agent/dir; the workflow hands that directory to
-# the review job as an artifact, and `review` expects it there.
+# through the API into $work/agent/dir and the workflow hands it to the setup
+# job as an artifact. `setup` installs its packages there (C-4: network, no
+# token, no key, lifecycle scripts off) and packs the result into
+# $work/agent-out/agent-dir.tar.gz; the workflow hands that to the review
+# job, and `review` expects it in $work/agent-in. The review job downloads
+# nothing else (C-3a).
 set -euo pipefail
 set -f
 
@@ -80,11 +84,27 @@ agent_path="${RB_AGENT_DIR:-}"
 if [[ -n "$agent_path" ]]; then
   [[ "$agent_path" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && ! "/$agent_path/" =~ /\.\.?/ ]] || fail "invalid agent-dir (a relative directory in the repository): $agent_path"
 fi
-# Mount the agent directory read-only and name it to the CLI.
+# Mount the gate's copy of the agent directory read-only and name it to the CLI.
 use_agent_dir() {
   [[ -n "$agent_path" ]] || return 0
   [[ -d "$agent_dir" && ! -L "$agent_dir" ]] || fail "agent-dir is set but $agent_dir is missing (the gate job fetches it; the review job downloads it)"
   docker_args+=(-v "$agent_dir:/agent:ro")
+  args+=(--agent-dir /agent)
+}
+# The review job: extract the setup job's archive (validating extractor,
+# no network, no token, no key) and mount the result read-only at /agent,
+# the path setup installed under, so pi finds the packages where they were
+# put (F-7).
+use_installed_agent_dir() {
+  [[ -n "$agent_path" ]] || return 0
+  local in="$work/agent-in" out="$work/agent-installed"
+  [[ -f "$in/agent-dir.tar.gz" && ! -L "$in/agent-dir.tar.gz" ]] || fail "agent-dir is set but $in/agent-dir.tar.gz is missing (the setup job makes it; the review job downloads it)"
+  rm -rf "$out" && mkdir -p "$out"
+  docker run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,size=64m --user "$(id -u):$(id -g)" -e HOME=/tmp \
+    -v "$in:/in:ro" -v "$out:/out" \
+    "$image" unpack-agent-dir --archive /in/agent-dir.tar.gz --dest /out
+  docker_args+=(-v "$out/agent:/agent:ro")
   args+=(--agent-dir /agent)
 }
 need_pr() { [[ "$1" =~ ^[1-9][0-9]*$ ]] || fail "pr must be a PR number"; }
@@ -159,6 +179,29 @@ case "$cmd" in
     cat "$out/summary.md" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
     ;;
 
+  setup)
+    # Installs the agent directory's packages (F-7, C-4) in a job that holds
+    # no secret: no GitHub token and no provider key enter this container,
+    # and the job's own token has no permissions. Network is on (registries,
+    # git hosts); lifecycle scripts are off (src/setup/). The read roots are
+    # the review container's paths, so nothing is installed where the review
+    # reads PR content.
+    [[ -n "$agent_path" ]] || fail "setup needs agent-dir"
+    [[ -d "$agent_dir" && ! -L "$agent_dir" ]] || fail "agent-dir is set but $agent_dir is missing (the gate job fetches it; the setup job downloads it)"
+    out="$work/agent-out"
+    rm -rf "$out" && mkdir -p "$out"
+    docker run --rm --init --cap-drop ALL --security-opt no-new-privileges --read-only \
+      --tmpfs /tmp:rw,nosuid,nodev,size=2g --pids-limit 1024 --user "$(id -u):$(id -g)" -e HOME=/tmp \
+      -v "$agent_dir:/agent" \
+      "$image" setup --agent-dir /agent --read-root /snapshot --read-root /runs
+    # Pack it for the review job without network. Hard links become files
+    # (the review job's extractor refuses them); symlinks stay symlinks.
+    docker run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges --read-only \
+      --tmpfs /tmp:rw,nosuid,nodev,size=64m --user "$(id -u):$(id -g)" -e HOME=/tmp \
+      -v "$agent_dir:/in/agent:ro" -v "$out:/out" --entrypoint tar \
+      "$image" --create --gzip --file /out/agent-dir.tar.gz --hard-dereference --numeric-owner --owner=0 --group=0 --directory /in agent
+    ;;
+
   complete-check)
     need_sha head-sha "${RB_HEAD_SHA:-}"
     outcome="${RB_OUTCOME:-}"
@@ -184,8 +227,11 @@ case "$cmd" in
       -v "$work/in:/in:ro" -v "$work/snapshot:/snapshot" \
       "$image" unpack-snapshot --archive /in/snapshot.tar.gz --dest /snapshot
 
-    # 2. Review. The snapshot is mounted read-only; nothing in it is executed.
-    args=(review --pr "$repo#$RB_PR" --snapshot-dir /snapshot --runs-dir /runs --name "$name")
+    # 2. Review, as the pi command /review-bot (F-3): `launch` starts pi from
+    # the image with -ne -e <pi-review>, --no-approve, --offline, stdin
+    # closed and an empty working directory, and forwards SIGTERM to it. The
+    # snapshot is mounted read-only; nothing in it is executed.
+    args=(launch --pr "$repo#$RB_PR" --snapshot-dir /snapshot --runs-dir /runs --name "$name")
     role_lines --model '^(reviewer|verifier)=[^[:space:]]+$' "${RB_MODELS:-}"
     role_lines --thinking '^(reviewer|verifier)=(off|minimal|low|medium|high|xhigh|max)$' "${RB_THINKING:-}"
     role_lines --providers '^(reviewer|verifier)=[A-Za-z0-9._,-]+$' "${RB_PROVIDERS:-}"
@@ -202,7 +248,7 @@ case "$cmd" in
       args+=(--max-cost "$RB_MAX_COST")
     fi
     docker_args+=(-e GH_TOKEN -v "$work/snapshot:/snapshot:ro" -v "$work/runs:/runs")
-    use_agent_dir
+    use_installed_agent_dir
     # Provider keys by name, from this step's environment (C-6). Never a GitHub token.
     provider_env="${RB_PROVIDER_ENV:-OPENROUTER_API_KEY}"
     for var in ${provider_env//,/ }; do

@@ -25,7 +25,7 @@ export function unfinishedOutput(outcome: string): CheckRunOutput {
     case "skipped":
       return {
         title: "Could not complete: not started",
-        summary: "The review did not start, usually because the snapshots could not be prepared. The PR proceeds to human review (S-9).",
+        summary: "The review did not start, usually because the snapshots could not be prepared or the operator's packages could not be installed. The PR proceeds to human review (S-9).",
       };
     default:
       return {

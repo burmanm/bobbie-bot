@@ -16,7 +16,12 @@
  * - `console.log` goes to stderr: the result is written with `--out`;
  * - a malformed `settings.json` is only a warning, a missing package is
  *   skipped offline: the review reads and checks both first and stops with a
- *   configuration error.
+ *   configuration error;
+ * - print mode ends only when the event loop drains, so a module that leaves
+ *   a timer or watcher behind keeps pi running until the job's time limit
+ *   (seen with a real package in the action image, R-1a step 6): once the
+ *   run is over, an unref'd timer ends the process with the run's exit code
+ *   after PRINT_EXIT_GRACE_MS. A clean exit is never delayed by it.
  * Loading by path (`-ne -e`), stdin, `--no-approve` and the empty working
  * directory are the launcher's.
  *
@@ -30,6 +35,9 @@ import { CommandArgsError, splitCommandArgs } from "../../src/cli/command-args.t
 import { type Io, REVIEW_OPTIONS_USAGE, runReviewCommand } from "../../src/cli/review.ts";
 
 export const COMMAND_NAME = "review-bot";
+
+/** How long pi may take to dispose after a print-mode run before the process is ended. */
+export const PRINT_EXIT_GRACE_MS = 5_000;
 
 const USAGE = `Usage:
   /review-bot --fixture <dir> [options]        dry run of a fixture PR
@@ -110,6 +118,13 @@ export default function reviewBotCommand(pi: ExtensionAPI): void {
         finish(1);
       } finally {
         running = undefined;
+        if (!ctx.hasUI) {
+          // The run is published and recorded; nothing left may hold the process (F-3, S-9).
+          setTimeout(() => {
+            stderrSync(`review-bot: pi had not exited ${PRINT_EXIT_GRACE_MS / 1000}s after the run (a module left a timer or watcher behind); ending it\n`);
+            process.exit(typeof process.exitCode === "number" ? process.exitCode : 0);
+          }, PRINT_EXIT_GRACE_MS).unref();
+        }
       }
     },
   });

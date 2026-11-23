@@ -12,14 +12,15 @@ Design references: [C-2 to C-5](plan/06-ci-and-security.md),
 
 One workflow, `review-bot`, triggered by `pull_request_target` (opened,
 reopened, ready for review, synchronize, labeled) and by manual dispatch with
-a PR number. It has four jobs:
+a PR number. It has five jobs:
 
 | Job | Runs when | Does |
 |---|---|---|
 | `gate` | every trigger (except label events for other labels) | Decides whether this PR is reviewed now. If not, completes the `ai-review/<name>` check as *skipped* with the reason |
 | `remove-label` | the gate says the authorization label is stale | Removes it |
 | `prepare` | the gate authorized a review | Downloads the base and head trees, runs `go mod download` for the head's `go.mod`, uploads both trees and the module cache as an artifact |
-| `review` | after `prepare`, also when `prepare` failed | Reviews the prepared snapshot, posts one review and the check, uploads the run record. A final always-run step completes the check if the review did not |
+| `setup` | the gate authorized a review and `REVIEW_BOT_AGENT_DIR` is set | Installs the packages the [agent directory](#the-agent-directory) lists, with lifecycle scripts off, in a job with no secret and no token permissions; hands the result to `review` as an artifact |
+| `review` | after `prepare` and `setup`, also when either failed | Reviews the prepared snapshot as the pi command `/review-bot`, posts one review and the check, uploads the run record. A final always-run step completes the check if the review did not |
 
 A newer push cancels the run in flight for the same PR.
 
@@ -70,6 +71,9 @@ Variables (repository or organization; all optional except the models):
 | `REVIEW_BOT_TIMEOUT_MINUTES` | 40 | Time limit of the review step |
 | `REVIEW_BOT_JOB_TIMEOUT_MINUTES` | 50 | Time limit of the review job; keep it a few minutes above the step's so the always-run steps get to run |
 | `REVIEW_BOT_PREPARE_TIMEOUT_MINUTES` | 20 | Time limit of the prepare job |
+| `REVIEW_BOT_AGENT_DIR` | — | The [agent directory](#the-agent-directory): a directory in this repository, read from the default branch's head |
+| `REVIEW_BOT_AGENT_DIR_REPO` | — | Take `REVIEW_BOT_AGENT_DIR` from another repository at a pinned commit instead: `owner/name@<40-hex SHA>` |
+| `REVIEW_BOT_SETUP_TIMEOUT_MINUTES` | 15 | Time limit of the setup job |
 | `REVIEW_BOT_GO_VERSION` | `stable` | Go used by `go mod download`. Pin it to at least the `go` line of your `go.mod`: with `GOTOOLCHAIN=local` an older Go fails, and the review then runs without a module cache |
 | `REVIEW_BOT_GO_MODULES` | `.` | Directories with a `go.mod`, space-separated |
 | `REVIEW_BOT_APP_ID` | — | Set it to use the GitHub App identity |
@@ -96,6 +100,90 @@ caveats about the label:
 - A YAML file that does not parse is reported by the review as a
   configuration error; the gate keeps the variable's label and uses
   `per-push`, the stricter lifetime.
+
+## The agent directory
+
+The bot is configured as any pi module is (F-7): a pi agent directory, the
+same one you can point `pi` at locally. Put it in a directory on the
+default branch (for example `.github/review-bot/`) and set
+`REVIEW_BOT_AGENT_DIR` to that path, or keep it in an organization
+configuration repository and also set `REVIEW_BOT_AGENT_DIR_REPO` to
+`owner/name@<commit SHA>`. It is never read from the PR, neither its head
+nor its base (D-19): packages run code and `models.json` can run a command.
+The gate fetches it through the API; a change takes effect when it is
+merged.
+
+`settings.json`:
+
+```json
+{
+  "packages": [
+    "npm:@org/pi-provider-x@1.2.3",
+    "git:github.com/org/pi-tool@<40-hex commit>"
+  ],
+  "enabledModels": ["openrouter/vendor/*"],
+  "codemode": { "mode": "on" },
+  "reviewBot": {
+    "roles": {
+      "reviewer": { "model": "openrouter/vendor/model:high", "tools": ["+codemode"] },
+      "verifier": { "model": "openrouter/vendor/other" }
+    },
+    "limits": { "runCostUsd": 5 }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `packages` | pi packages loaded into the model steps, pinned: `npm:<name>@<exact version>`, `git:<host>/<path>@<commit SHA>` (https only), or `./node_modules/<name>` from a `package.json` and lockfile next to `settings.json`. Ranges, branches and paths outside the directory are refused |
+| `enabledModels` | Models `.review/review-bot.yaml` may pick for a role. Without it the YAML cannot change a model |
+| `codemode` | pi's own settings for its built-in `codemode` tool (`mode`: `on` or `only`; `inlineBudget`) |
+| `reviewBot.roles.<role>.model` | `provider/id[:thinking]`, as pi's `--model` takes it. The `REVIEW_BOT_MODELS` variable replaces it |
+| `reviewBot.roles.<role>.tools` | Changes to the role's read-only default, in pi's `defaultTools` syntax: `"+codemode"` enables codemode for that role, `"+<tool>"` a tool from a listed package, `"-<tool>"` removes one |
+| `reviewBot.codemode.models` | `true` lets codemode scripts call `models.*` (default `false`) |
+| `reviewBot.limits`, `skip`, `ci`, `authorization` | As in `.review/review-bot.yaml`, which can only narrow them |
+
+`models.json` (optional) holds custom providers and endpoints, extra model
+ids and `modelOverrides` (prices, context), in pi's format. Keys come from
+environment variables, `"apiKey": "$NAME"`; add the variable's name to the
+action's `provider-env` and the secret to the review step's `env`.
+
+An `AGENTS.md`, `SYSTEM.md` or `APPEND_SYSTEM.md` in the directory is
+refused. The workflow variables override `settings.json`, and the base
+branch's `.review/review-bot.yaml` can only narrow both.
+
+Check it locally: `PI_CODING_AGENT_DIR=<dir> pi --list-models` shows what
+the bot can use, and `/review-bot --dry-run --pr <owner/repo#N>` in that pi
+runs the same review, posting nothing.
+
+**Packages are installed before any secret is present.** The `setup` job
+downloads the gate's copy of the directory, runs `review-bot setup` in the
+action image with network but no GitHub token, no provider key and no token
+permissions, with lifecycle scripts off (npm and git configuration that
+names programs is pinned too), and uploads the installed directory as an
+archive. The review job unpacks it with the snapshot's validating extractor
+in a container without network, mounts it read-only and checks every listed
+package before anything loads; a missing one is a configuration error. The
+review job downloads nothing. Only listed packages load; a dependency that
+happens to be a pi package does not.
+
+**A module is code with the model key and the GitHub token.** It runs in
+the review job and can do anything pi allows: add tools, replace the bot's
+tools, change prompts and responses through hooks (F-7). A module that gives
+the model a shell, network access or an unconfined file reader also gives it
+to whoever writes the PR, through prompt injection. The defaults have none.
+Review a package's source as you would any dependency, pin it, and treat
+adding or upgrading one as a change to replay (E-5). The run record lists
+every loaded package and version, and the review summary lists the extra
+tools that were active.
+
+**Codemode.** With `"+codemode"` in a role's `tools`, the model can write a
+script that calls that role's other tools in pi's sandbox (no file system,
+network or process access); path checks apply to calls from scripts too,
+and their usage counts toward the spend cap. `codemode: false` in
+`.review/review-bot.yaml` turns it off for the repository. Every script a
+run executes is saved, secrets scrubbed, as `scripts.json` next to the run
+record (below).
 
 ## Identity: `GITHUB_TOKEN` or a GitHub App
 
@@ -227,8 +315,8 @@ On a public repository nothing is needed.
 
 ## The action image
 
-The `gate`, `review`, `complete-check` and `remove-label` steps run in a
-container. By default it is the **prebuilt image named by digest in
+The `gate`, `setup`, `review`, `complete-check` and `remove-label` steps
+run in a container. By default it is the **prebuilt image named by digest in
 `action/image.lock`** of the pinned action commit (C-4): the job pulls that
 one image, Docker verifies it against the digest, and nothing else is
 downloaded in the job that holds the model key. While `action/image.lock`
@@ -245,12 +333,20 @@ Publishing (maintainers of this repository):
    prints the line for `action/image.lock`.
 2. Commit that line to `action/image.lock` and change nothing else the image
    contains (`src/`, `pi-review/`, `package*.json`, `action/Dockerfile`,
-   `action/tools.json`, `action/install-tools.mjs`): the image *is* the
-   bot's code, so any such change needs a new image.
+   `action/tools.json`, `action/install-tools.mjs`, `action/debs.json`,
+   `action/fetch-debs.mjs`): the image *is* the bot's code, so any such
+   change needs a new image.
 3. Make the package public (or readable by the consuming organizations) and
    pin consumers to that commit.
 4. Anyone can check it: `gh attestation verify
    oci://ghcr.io/<owner>/review-bot-action@sha256:<digest> --owner <owner>`.
+
+The image has `git` for the setup job's git package sources: Debian packages
+from `snapshot.debian.org` URLs pinned with their SHA-256 in
+`action/debs.json`, installed with `dpkg` (no `apt-get`); git's CA bundle is
+Node's built-in root certificates. To update them, run
+`action/update-debs.sh [<snapshot timestamp>]` (Docker and network), which
+checks each file against Debian's signed index, and publish a new image.
 
 ## Time limits
 
@@ -271,7 +367,10 @@ time, idle and turn limits and the run has a spend cap.
   replies on earlier findings, and resolution of its own verified-fixed
   threads.
 - A workflow artifact `review-bot-record-<name>-pr<N>-<run id>-<attempt>`
-  with the run record (`08-record.json`) and the stage files. It is the only
+  with the run record (`08-record.json`), the stage files and, when a role
+  ran codemode, `scripts.json`: each script's source (secrets scrubbed,
+  size capped), outcome and nested tool calls, enough to replay it against
+  the head SHA in the record. Scripts can quote PR code. It is the only
   thing the review job writes besides the PR (A-7); the harvest job collects
   it later.
 - When the gate completes the check itself (not authorized, CI failed or
@@ -294,6 +393,7 @@ checks out the PR, and nothing from the PR is executed anywhere.
 | `gate` | none with `GITHUB_TOKEN`; the App private key with the App identity | contents: read, pull-requests: read, checks: write, statuses: read, actions: read | Read PR metadata, collaborators' permission levels, label events, `.review/review-bot.yaml` at the base SHA, and the CI results of the head commit; create a *skipped* or *queued* check, and complete a queued one | Read any PR file content other than through the API metadata above; post comments; change labels; run anything from the PR |
 | `remove-label` | as `gate` | pull-requests: write | Remove the authorization label | Anything else; it runs nothing from the PR |
 | `prepare` | **none**, ever (always `GITHUB_TOKEN`) | contents: read | Download the base and head trees as tarballs; run `go mod download` on a copy of the head's `go.mod` | Write to the PR, the repository, the Actions cache or any secret; build, test or `go generate` |
+| `setup` | **none**, and no token | none | Download the packages the agent directory lists (registries, git hosts) with lifecycle scripts off; upload the result | Read the PR or anything from it; post anything; run install scripts |
 | `review` | the model provider key (review step only); the App private key with the App identity | pull-requests: write, checks: write; on private repositories with the history tools also contents: read, issues: read | Post one review, thread replies, resolve its own threads, the check; upload the run record | Push, merge, approve, change labels, read other secrets, write to the repository or storage, run anything from the snapshot |
 
 ### The review job
@@ -309,14 +409,18 @@ checks out the PR, and nothing from the PR is executed anywhere.
 - The model never receives the GitHub token: publishing is code (P-3). Its
   tools are read-only and confined to the head, base and module-cache roots,
   with symlinks resolved; there is no shell and no network tool (C-3).
-- pi runs fully isolated (C-3a): untrusted project settings, no context
-  files, an empty agent directory, our extension only. The snapshot is
+- pi runs isolated (C-3a), started by `review-bot launch` as the command
+  `/review-bot` (`-ne -e <pi-review>`, `--no-approve`, `--offline`, stdin
+  closed) from an empty working directory: untrusted project settings, no
+  context files, the operator's agent directory (or an empty one) and only
+  the packages it lists. The snapshot is
   extracted where no `.git`, `AGENTS.md` or `CLAUDE.md` exists in any
   parent. The repository's `AGENTS.md` reaches the model from the **base**
   branch as delimited data, never as instructions to pi.
-- **No downloads at review time.** `rg` and `fd` (pi's search) and `gh` (the
-  read-only history tools) are built into the action image from pinned
-  release assets verified by SHA-256; `PI_OFFLINE=1` stops pi from fetching
+- **No downloads at review time.** The operator's packages come from the
+  `setup` job. `rg` and `fd` (pi's search) and `gh` (the read-only history
+  tools) are built into the action image from pinned release assets verified
+  by SHA-256; `PI_OFFLINE=1` stops pi from fetching
   binaries or refreshing its model catalog. The image itself is the
   prebuilt one pinned by digest in the action commit
   ([above](#the-action-image)); without one, it is built at the start of
@@ -372,6 +476,14 @@ the log and the job summary.
   one, and so make the bot review before the real CI finished (it cannot
   make the bot do anything else; authorization is checked separately). The
   expected app of a required check is not compared.
+- A cancelled or timed-out review job (SIGTERM reaches pi through the
+  container's init and `review-bot launch`) completes its check as
+  *neutral* and writes the run record, but does not post the findings it
+  already had. The run's own deadline, a few minutes inside the step's
+  limit, does post a partial review.
+- A module that leaves a timer or file watcher running would keep pi alive
+  after the run; the command ends the process 5 seconds after the run is
+  published (seen with a real package).
 - When two open PRs share a head commit, a CI result resumes one of them;
   the other is resumed by the next sweep.
 - Labels other than the authorization label start no job and cancel

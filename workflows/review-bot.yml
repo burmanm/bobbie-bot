@@ -10,7 +10,10 @@
 #                 for CI and resumes or times out waiting PRs (C-9)
 #   remove-label  no secrets; removes a stale authorization label
 #   prepare       no secrets, contents:read; fetches trees, Go module cache
-#   review        model key; reviews the prepared snapshot, never PR code
+#   setup         no secrets, no token permissions; installs the agent
+#                 directory's packages, lifecycle scripts off (F-7, C-4)
+#   review        model key; reviews the prepared snapshot, never PR code,
+#                 as the pi command /review-bot (F-3); downloads nothing
 #
 # pull_request_target, workflow_run, status and schedule all run this file
 # from the DEFAULT/BASE branch with a token for the base repository. No job
@@ -20,7 +23,8 @@
 # directory in this repository (settings.json, models.json), read from the
 # DEFAULT branch's head, or from REVIEW_BOT_AGENT_DIR_REPO
 # (owner/name@<commit SHA>); never from the PR. The gate fetches it through
-# the API and hands it to the review job as an artifact. The other variables
+# the API and hands it to the setup job, which installs the packages it lists
+# and hands the result to the review job, as artifacts. The other variables
 # override its settings, and .review/review-bot.yaml on the base branch can
 # only narrow them.
 name: review-bot
@@ -138,6 +142,8 @@ jobs:
           name: review-bot-agent-dir
           path: ${{ runner.temp }}/review-bot/agent/dir
           if-no-files-found: error
+          # .npmrc next to a package.json is configuration too (F-7).
+          include-hidden-files: true
           retention-days: 1
           overwrite: true
       - name: Upload gate run records (A-6, S-8)
@@ -215,9 +221,41 @@ jobs:
           compression-level: 0
           overwrite: true
 
+  setup:
+    needs: gate
+    if: needs.gate.outputs.review == 'true' && vars.REVIEW_BOT_AGENT_DIR != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON(vars.REVIEW_BOT_SETUP_TIMEOUT_MINUTES || '15') }}
+    # No token permissions and no secret (F-7, C-4): this job downloads and
+    # unpacks the operator's packages, so it is the one that may use the
+    # network for that. Lifecycle scripts stay off (review-bot setup).
+    permissions: {}
+    steps:
+      - name: Download the agent directory (F-7; fetched by the gate, never from the PR)
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: review-bot-agent-dir
+          path: ${{ runner.temp }}/review-bot/agent/dir
+      - name: Install the packages it lists
+        uses: REVIEW_BOT_OWNER/review-bot/action@0000000000000000000000000000000000000000 # set by the sync tool
+        with:
+          command: setup
+          image: ${{ vars.REVIEW_BOT_IMAGE }}
+          agent-dir: ${{ vars.REVIEW_BOT_AGENT_DIR }}
+      - name: Hand the installed agent directory to the review job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: review-bot-agent-installed
+          path: ${{ runner.temp }}/review-bot/agent-out/agent-dir.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
   review:
-    needs: [gate, prepare]
-    # Runs when prepare failed too, so the check is completed (S-9).
+    needs: [gate, prepare, setup]
+    # Runs when prepare or setup failed too, so the check is completed (S-9);
+    # setup is skipped when there is no agent directory.
     if: ${{ !cancelled() && needs.gate.outputs.review == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ fromJSON(vars.REVIEW_BOT_JOB_TIMEOUT_MINUTES || '50') }}
@@ -246,12 +284,12 @@ jobs:
         with:
           name: review-bot-snapshot
           path: ${{ runner.temp }}/review-bot/in
-      - name: Download the agent directory (F-7; fetched by the gate, never from the PR)
+      - name: Download the agent directory with its packages (F-7; from the setup job)
         if: vars.REVIEW_BOT_AGENT_DIR != ''
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: review-bot-agent-dir
-          path: ${{ runner.temp }}/review-bot/agent/dir
+          name: review-bot-agent-installed
+          path: ${{ runner.temp }}/review-bot/agent-in
       - name: Review
         id: review
         timeout-minutes: ${{ fromJSON(vars.REVIEW_BOT_TIMEOUT_MINUTES || '40') }}
@@ -282,7 +320,9 @@ jobs:
           name: ${{ vars.REVIEW_BOT_NAME || 'main' }}
           head-sha: ${{ needs.gate.outputs.head-sha }}
           outcome: ${{ steps.review.outcome }}
-      - name: Upload the run record (S-8, A-7)
+      - name: Upload the run record and saved scripts (S-8, A-6, A-7)
+        # runs/run-<id>/: 08-record.json and the other stage files, and
+        # scripts.json when a role ran codemode scripts (F-7).
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

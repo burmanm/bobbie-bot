@@ -6,6 +6,8 @@
 !pi-review/**
 !action/tools.json
 !action/install-tools.mjs
+!action/debs.json
+!action/fetch-debs.mjs
 **/*.test.ts
 **/fixtures/**
 **/node_modules/**

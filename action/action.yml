@@ -3,28 +3,30 @@
 # part. Pin it by full commit SHA. Setup and the security model:
 # docs/installing.md.
 #
-# gate, review, complete-check, remove-label run in a locked-down container:
+# gate, setup, review, complete-check, remove-label run in a locked-down container:
 # the prebuilt image named by digest in action/image.lock (published by
 # .github/workflows/action-image.yml with provenance), so the jobs download
 # nothing but that image (C-4 "The action image"). Without a digest there,
 # or with `image: build`, the image is built from action/Dockerfile (Node,
-# pinned dependencies, pinned and checksum-verified rg, fd and gh;
+# pinned dependencies, pinned and checksum-verified rg, fd, gh and git;
 # PI_OFFLINE=1). prepare runs on the runner with Go and never sees a secret.
+# setup installs the agent directory's packages in a job with no secret and
+# no token (F-7, C-4); it is the only container that downloads anything.
 name: review-bot
-description: Automated pull-request review (gate, prepare, review, complete-check, remove-label)
+description: Automated pull-request review (gate, prepare, setup, review, complete-check, remove-label)
 author: review-bot
 
 inputs:
   command:
-    description: "gate | prepare | review | complete-check | remove-label"
+    description: "gate | prepare | setup | review | complete-check | remove-label"
     required: true
   token:
     description: >-
       GitHub token for this job: the job's GITHUB_TOKEN, or an App
       installation token from actions/create-github-app-token. Use the same
       identity in gate, review and complete-check (a check run can only be
-      completed by the identity that created it).
-    required: true
+      completed by the identity that created it). setup takes none.
+    default: ""
   repo:
     description: owner/name of the repository under review
     default: ${{ github.repository }}
@@ -42,11 +44,13 @@ inputs:
     default: ""
   agent-dir:
     description: >-
-      gate, review: the operator's pi agent directory (F-7), a directory path
-      in the repository holding settings.json (pi's keys and reviewBot) and
-      models.json. Read from the default branch's head, or from
-      agent-dir-repo; never from the PR. The gate fetches it, and the
-      workflow passes it to the review job as an artifact. Empty: none.
+      gate, setup, review: the operator's pi agent directory (F-7), a
+      directory path in the repository holding settings.json (pi's keys,
+      packages, enabledModels, codemode and reviewBot) and models.json. Read
+      from the default branch's head, or from agent-dir-repo; never from the
+      PR. The gate fetches it; the workflow passes it to the setup job, which
+      installs its packages, and passes the result to the review job, as
+      artifacts. Empty: none.
     default: ""
   agent-dir-repo:
     description: >-

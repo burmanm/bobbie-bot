@@ -14,7 +14,8 @@
 # commit to release, put the printed line in action/image.lock in the next
 # commit (and change nothing else the image contains: src/, pi-review/,
 # package*.json, action/Dockerfile, action/tools.json,
-# action/install-tools.mjs), and pin consumers to that commit.
+# action/install-tools.mjs, action/debs.json, action/fetch-debs.mjs), and pin
+# consumers to that commit.
 name: action-image
 
 on:

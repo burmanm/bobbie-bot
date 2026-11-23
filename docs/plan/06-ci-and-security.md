@@ -120,14 +120,15 @@ PR that the model can read as untrusted data, like any other.
 Fork PRs are the normal path for the target repositories, maintainers
 included, so this is the main design, not a special case.
 
-**Three jobs, plus a small label job:**
+**Four jobs, plus a small label job:**
 
 | Job | Secrets | Token | Does |
 |---|---|---|---|
 | `gate` | none (App identity: the App private key) | `contents: read`, `pull-requests: read`, `checks: write`, `statuses: read`, `actions: read` | Decides whether this PR is reviewed automatically. If not, completes `ai-review/<name>` as *skipped*. `contents: read` is only for the agent directory's `settings.json` on the default branch and `.review/review-bot.yaml` at the base SHA ([A-5](02-architecture.md#a-5--knowledge-sources)). `statuses: read` and `actions: read` are only for the CI state of the head SHA ([C-9](#c-9--waiting-for-ci): commit statuses, and workflow runs when `ci.require` names a workflow); the workflow cannot request them only when waiting is configured |
 | `remove-label` | none (App identity: the App private key) | `pull-requests: write` | Removes the authorization label on the contributor's next push when its lifetime is *per push* ([Q-10](07-roadmap.md#open-questions)). Separate because the gate's token is read-only. Reads nothing from the PR |
 | `prepare` | **none** | `contents: read` | Fetches base and head trees. Runs the language preparation step (Go: `go mod download` for the head's `go.mod`). Uploads snapshots and module cache as an artifact |
-| `review` | model provider key (App identity: also the App private key) | `pull-requests: write`, `checks: write`; on private repositories also `contents: read` (agent directory, history) and `issues: read` (below) | Fetches the agent directory from the default branch, then installs its packages in a step with no secrets in its environment and lifecycle scripts off. Downloads the artifact, extracts it as read-only data to a directory with no `.git` or context files above it, runs `/review-bot` from an empty working directory with `PI_OFFLINE=1`. **Never** checks out the PR, never runs `go`, `make` or anything from the snapshot, never downloads a binary |
+| `setup` | **none** | none | Takes the agent directory the gate fetched from the default branch (or a pinned commit) and installs the packages it lists with `review-bot setup`, lifecycle scripts off, in the action image; uploads the installed directory as an archive. A job of its own (R-1a step 6), so nothing it downloads shares a runner with a secret |
+| `review` | model provider key (App identity: also the App private key) | `pull-requests: write`, `checks: write`; on private repositories also `contents: read` (history) and `issues: read` (below) | Downloads the snapshot artifact and the setup job's agent directory, extracts both as read-only data (no network) to directories with no `.git` or context files above them, runs `/review-bot` through `review-bot launch` from an empty working directory with `PI_OFFLINE=1`. **Never** checks out the PR, never runs `go`, `make` or anything from the snapshot, never downloads a binary or a package |
 
 **Identity in every job.** With the App identity, each job that talks to
 GitHub mints its own token from the App private key, scoped to that job's
@@ -145,9 +146,8 @@ call the GitHub API with the review job's token. On a public repository
 that works with the permissions above. On a private one the token also
 needs `contents: read` and `issues: read`; with the App identity the App
 needs the same permissions and the minted token must request them. Neither
-permission lets the job write anything. `contents: read` is also how the
-job reads the agent directory there, so it is required on a private
-repository that keeps that directory itself. A repository that does not
+permission lets the job write anything. The agent directory is read by
+the gate, which always has `contents: read`. A repository that does not
 grant `issues: read` runs with `--no-history`, and the summary says the
 tools were not available.
 
