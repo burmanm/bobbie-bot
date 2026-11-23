@@ -1,0 +1,1 @@
+{ "name": "fixture-pi-hook", "version": "0.3.0", "type": "module", "pi": { "extensions": ["./index.ts"], "skills": ["./skills"] } }

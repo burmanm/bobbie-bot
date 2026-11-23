@@ -88,6 +88,14 @@ export interface AgentStepRequest<T extends OutputTool = OutputTool> {
    * search (S-4). Optional; a step without them has none.
    */
   queryTools?: readonly QueryTool[];
+  /**
+   * Tools registered by the operator's modules that the role is configured
+   * with (F-7, `reviewBot.roles.<role>.tools`). A name no loaded module
+   * registers is a configuration error. A module tool with the name of one
+   * of the bot's tools replaces it; name that tool in `readTools` or
+   * `outputTools` as usual.
+   */
+  moduleTools?: readonly string[];
   limits: StepLimits;
   /**
    * Run cancellation (for example a newer push), or the run deadline when
@@ -175,11 +183,27 @@ export interface AgentStepResult<T extends OutputTool = OutputTool> {
     /** `pi-sdk`: our pi session. `acp`: an external agent over ACP; `version` is the agent's. */
     name: "pi-sdk" | "acp";
     version: string;
-    /** Extensions loaded into the session; only ours (C-3a). */
+    /** Extensions loaded into the session: the listed packages' entry points, then ours (C-3a, F-7). */
     extensions: string[];
     /** Tools declared to the model. */
     tools: string[];
+    /** The operator's packages loaded into the session, with versions (A-6, F-7). */
+    packages?: Array<{ name: string; source: string; version?: string }>;
+    /**
+     * Declared tools implemented by a module, with the package's source.
+     * `replaces` is set when the module took over one of the bot's tools (F-7).
+     */
+    moduleTools?: ModuleTool[];
   };
+}
+
+/** A tool a loaded package provides in a step (F-7, A-6). */
+export interface ModuleTool {
+  tool: string;
+  /** The package's source as configured in settings.json. */
+  source: string;
+  /** True when the tool has the name of one of the bot's and replaces it. */
+  replaces: boolean;
 }
 
 export interface AgentStep {

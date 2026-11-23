@@ -19,6 +19,8 @@ export interface CommandOptions {
   cwd: string;
   env: Record<string, string>;
   timeoutMs: number;
+  /** Aborting kills the command's whole process group, as the timeout does. */
+  signal?: AbortSignal;
 }
 
 export interface CommandResult {
@@ -123,8 +125,12 @@ const OUTPUT_LIMIT = 16_384;
 /** After exit, how long to wait for a grandchild to let go of the pipes. */
 const DRAIN_MS = 2_000;
 
-export const runCommand: CommandRunner = (command, args, { cwd, env, timeoutMs }) =>
+export const runCommand: CommandRunner = (command, args, { cwd, env, timeoutMs, signal }) =>
   new Promise((done) => {
+    if (signal?.aborted) {
+      done({ code: null, timedOut: false, output: "cancelled before it started" });
+      return;
+    }
     const child = spawn(command, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     let timedOut = false;
@@ -140,9 +146,14 @@ export const runCommand: CommandRunner = (command, args, { cwd, env, timeoutMs }
         // The whole group has already exited.
       }
     };
+    // Installers are detached (their own process group) so that the group
+    // can be killed; Ctrl-C at the terminal therefore no longer reaches them.
+    const onAbort = () => killGroup();
+    signal?.addEventListener("abort", onAbort, { once: true });
     const finish = () => {
       if (finished) return;
       finished = true;
+      signal?.removeEventListener("abort", onAbort);
       clearTimeout(deadline);
       clearTimeout(drain);
       child.stdout.destroy();

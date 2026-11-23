@@ -23,6 +23,11 @@ export const StepRecord = Type.Object({
   thinkingLevel: Type.Optional(Type.String()),
   /** Tools declared to the model in this step (A-6, F-7). */
   tools: Type.Optional(Type.Array(Type.String())),
+  /**
+   * Declared tools implemented by the operator's packages (F-7): the package
+   * source, and whether the tool replaced one of the bot's.
+   */
+  moduleTools: Type.Optional(Type.Array(Type.Object({ tool: Type.String(), source: Type.String(), replaces: Type.Boolean() }))),
   servedModels: Type.Array(Type.String(), { description: "responseModel ?? model, distinct" }),
   outcome: Type.Enum(STEP_OUTCOMES),
   error: Type.Optional(Type.String()),
@@ -139,6 +144,13 @@ export const RunInfo = Type.Object({
     tools: Type.Optional(Type.Record(Type.String(), Type.Array(Type.String()))),
     /** SHA-256 of the agent directory's models.json, when there is one (F-7). */
     modelsJsonSha256: Type.Optional(Type.String()),
+    /**
+     * The packages listed in settings.json as installed (F-7, A-6): name,
+     * source as configured, and the version (npm, local) or commit (git).
+     */
+    packages: Type.Optional(
+      Type.Array(Type.Object({ name: Type.String(), source: Type.String(), version: Type.Optional(Type.String()) })),
+    ),
   }),
   // Inputs
   files: Type.Array(FileRecord),

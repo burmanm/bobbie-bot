@@ -13,7 +13,7 @@ import { randomBytes } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Value } from "typebox/value";
-import type { AgentStep, AgentStepResult, ModelRef, OutputTool, QueryTool, ReadRoots } from "../agent/index.ts";
+import type { AgentStep, AgentStepResult, ModelRef, ModuleTool, OutputTool, QueryTool, ReadRoots } from "../agent/index.ts";
 import { PI_VERSION, RUN_DEADLINE } from "../agent/index.ts";
 import {
   applyVerdict,
@@ -60,6 +60,7 @@ import {
   type SnapshotSource,
 } from "../platform/index.ts";
 import { type AgentSettings, modelsJsonSha256, NO_AGENT_SETTINGS, resolveRoleTools } from "./agent-settings.ts";
+import { type InstalledPackage, SetupConfigError, verifyInstalled } from "../setup/index.ts";
 import {
   type ConfigInputs,
   ConfigError,
@@ -219,6 +220,10 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
   /** Each role's tools as configured (F-7), before output tools; set with the config. */
   const roleTools: Partial<Record<PipelineRole, ReadonlySet<string>>> = {};
   let modelsJsonHash: string | undefined;
+  /** The operator's packages, as installed (F-7, A-6); set once checked. */
+  let installedPackages: InstalledPackage[] | undefined;
+  /** Tools from packages that were active in some step, for the summary (F-7). */
+  const extraTools: ModuleTool[] = [];
   let partialNote: string | undefined;
 
   // Run deadline (S-4 Limits, S-9). One signal for the whole run: aborted
@@ -341,6 +346,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     const maxCostUsd = Math.min(roleLimits.maxCostUsd ?? Infinity, remaining);
     const tools = roleTools[role] ?? new Set(ROLE_DEFAULT_TOOLS);
     const queryTools = (req.queryTools ?? []).filter((t) => tools.has(t.name));
+    const moduleTools = [...tools].filter((t) => !ROLE_DEFAULT_TOOLS.includes(t));
     let lastBeat = 0;
     const t = performance.now();
     const result = await o.agentStep.run({
@@ -352,6 +358,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       readTools: READ_TOOLS.filter((t) => tools.has(t)),
       outputTools: req.outputTools,
       ...(queryTools.length === 0 ? {} : { queryTools }),
+      ...(moduleTools.length === 0 ? {} : { moduleTools }),
       limits: { ...roleLimits, maxCostUsd },
       signal: runSignal,
       onProgress: (p) => {
@@ -368,6 +375,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       configuredModel: formatModel(model),
       ...(model.thinkingLevel === undefined ? {} : { thinkingLevel: model.thinkingLevel }),
       tools: result.harness.tools,
+      ...(result.harness.moduleTools === undefined || result.harness.moduleTools.length === 0 ? {} : { moduleTools: result.harness.moduleTools }),
       servedModels: result.servedModels,
       outcome: result.outcome,
       usage: {
@@ -384,6 +392,9 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       rejectedCalls: result.rejectedCalls.map((r) => ({ tool: r.tool, reason: `${r.kind}: ${r.reason}` })),
     };
     if (result.providerRequests.length > 0) record.requests = result.providerRequests;
+    for (const t of result.harness.moduleTools ?? []) {
+      if (!extraTools.some((x) => x.tool === t.tool && x.source === t.source)) extraTools.push(t);
+    }
     const err = result.error
       ? `${result.error.kind}: ${result.error.message}${result.stoppedBy ? ` (stopped by ${result.stoppedBy})` : ""}`
       : result.stoppedBy
@@ -422,6 +433,22 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     knowledge = loadKnowledge(heads.base, o.knowledgeOverride ?? {});
     const agentDir = o.agent?.dir;
     if (agentDir !== undefined) modelsJsonHash = modelsJsonSha256(agentDir);
+    // F-7, A-6: the listed packages as installed, checked offline before any
+    // step loads them (files only; nothing is spawned). Each step checks
+    // again against its own read roots.
+    if (agentDir !== undefined && settings.packages.length > 0) {
+      try {
+        installedPackages = verifyInstalled({
+          agentDir,
+          packages: settings.packages,
+          forbiddenRoots: [runDir!, ...(o.modcache === undefined ? [] : [resolve(o.modcache)])],
+        });
+      } catch (e) {
+        if (e instanceof SetupConfigError) throw new ConfigError(e.message);
+        throw e;
+      }
+      log(`S-1 packages ${installedPackages.map((p) => `${p.name}${p.version === undefined ? "" : `@${p.version}`}`).join(", ")}`);
+    }
     // F-7: what the repository may pick, as pi resolves enabledModels; only
     // models with credentials match.
     let enabled: EnabledModel[] = [];
@@ -435,9 +462,13 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     if (config.limits.runTimeoutMs !== deadlineMs) armDeadline(config.limits.runTimeoutMs);
     for (const role of PIPELINE_ROLES) {
       const tools = resolveRoleTools(config.tools[role], ROLE_DEFAULT_TOOLS);
-      // Module tools (codemode included) need module loading, R-1a steps 4b and 5b.
+      // F-7: other names are tools of the listed packages; each step refuses
+      // one that no loaded package registers. Codemode is R-1a step 5b.
       const unknown = tools.filter((t) => !ROLE_DEFAULT_TOOLS.includes(t));
-      if (unknown.length > 0) throw new ConfigError(`reviewBot.roles.${role}.tools in settings.json names ${unknown.join(", ")}, which this version does not provide; it offers ${ROLE_DEFAULT_TOOLS.join(", ")}`);
+      if (unknown.includes("codemode")) throw new ConfigError(`reviewBot.roles.${role}.tools in settings.json names codemode, which this version does not provide yet (R-1a step 5b)`);
+      if (unknown.length > 0 && settings.packages.length === 0) {
+        throw new ConfigError(`reviewBot.roles.${role}.tools in settings.json names ${unknown.join(", ")}, but no packages are listed; the bot offers ${ROLE_DEFAULT_TOOLS.join(", ")}`);
+      }
       roleTools[role] = new Set(tools);
     }
     const prior: PriorState = derivePriorState(comments, botId);
@@ -799,6 +830,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       ...(partialText === undefined ? {} : { partial: partialText }),
       ...(ciNote(o.waiting) === undefined ? {} : { ci: ciNote(o.waiting)! }),
       needsHuman,
+      ...(extraTools.length === 0 ? {} : { extraTools }),
       marker: { kind: "summary", bot: botId, run: runId, sha: pr.headSha, fingerprintVersion: FINGERPRINT_VERSION },
     });
     const review = buildReview(pr.headSha, summary, findings, botId, runId);
@@ -913,6 +945,7 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
           thinking,
           tools,
           ...(modelsJsonHash === undefined ? {} : { modelsJsonSha256: modelsJsonHash }),
+          ...(installedPackages === undefined ? {} : { packages: installedPackages }),
         },
         files,
         knowledgeFiles: knowledge === undefined ? [] : knowledgeFileList(knowledge),

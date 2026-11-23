@@ -10,7 +10,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { type AgentDir, assertOutsideRoots } from "./agent-dir.ts";
-import { PackageInstallError, SetupConfigError } from "./errors.ts";
+import { PackageInstallError, SetupCancelledError, SetupConfigError } from "./errors.ts";
 import { followLinks, isWithin } from "./files.ts";
 import { type CommandRunner, installerEnv, pnpmEnv, runCommand } from "./installer.ts";
 import { type Project, readProject } from "./project.ts";
@@ -23,6 +23,8 @@ export interface SetupOptions extends PackagesInput {
   /** Where the allowlisted variables are copied from. */
   env?: NodeJS.ProcessEnv;
   run?: CommandRunner;
+  /** Stops setup: the running installer's process group is killed. */
+  signal?: AbortSignal;
 }
 
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
@@ -55,7 +57,7 @@ export async function setupPackages(options: SetupOptions): Promise<InstalledPac
     const work = realpathSync(mkdtempSync(join(tmpdir(), "review-bot-setup-")));
     try {
       assertOutsideRoots(dir, work, "setup's working directory");
-      const exec = createExec(dir, work, timeoutMs, options.env ?? process.env, options.run ?? runCommand);
+      const exec = createExec(dir, work, timeoutMs, options.env ?? process.env, options.run ?? runCommand, options.signal);
       if (project !== undefined) await installProject(dir, project, work, exec);
       if (npm.length > 0) await installNpm(dir, npm, exec);
       for (const pkg of git) await installGit(dir, pkg, exec);
@@ -73,12 +75,27 @@ function assertInAgentDir(dir: AgentDir, path: string): void {
   }
 }
 
-function createExec(dir: AgentDir, work: string, timeoutMs: number, from: NodeJS.ProcessEnv, run: CommandRunner): Exec {
+function createExec(
+  dir: AgentDir,
+  work: string,
+  timeoutMs: number,
+  from: NodeJS.ProcessEnv,
+  run: CommandRunner,
+  signal: AbortSignal | undefined,
+): Exec {
   const env = installerEnv(from, work, dir);
   const cwd = join(work, "cwd");
   mkdirSync(cwd);
+  const cancelled = () => new SetupCancelledError(`setup was stopped; the running installer was killed`);
   return async (command, args) => {
-    const result = await run(command, args, { cwd, env: command === "pnpm" ? pnpmEnv(env) : env, timeoutMs });
+    if (signal?.aborted) throw cancelled();
+    const result = await run(command, args, {
+      cwd,
+      env: command === "pnpm" ? pnpmEnv(env) : env,
+      timeoutMs,
+      ...(signal === undefined ? {} : { signal }),
+    });
+    if (signal?.aborted) throw cancelled();
     if (result.code === 0 && !result.timedOut) return;
     const reason = result.timedOut ? `timed out after ${timeoutMs} ms` : `failed with exit code ${result.code ?? "none"}`;
     throw new PackageInstallError(`${command} ${args.join(" ")} ${reason}\n${result.output.trim()}`.trim());

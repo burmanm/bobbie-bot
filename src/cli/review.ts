@@ -389,9 +389,12 @@ export async function runReviewCommand(argv: readonly string[], io: Io, entry: R
         settings = readAgentSettings(agentDir);
         // pi skips a listed package that is not installed (offline) and
         // goes on without it; for the bot that is a configuration error
-        // (F-3). Loading them is R-1a step 4b. The read roots do not exist
-        // yet: the given source directories and the runs directory stand in.
-        if (settings.packages.length > 0) {
+        // (F-7). This also refuses an AGENTS.md or SYSTEM.md in the
+        // directory (C-3a): always for --agent-dir, and for pi's own agent
+        // directory (/review-bot) when it lists packages. The read roots do
+        // not exist yet: the given source directories and the runs
+        // directory stand in. The run and every step check again.
+        if (args["agent-dir"] !== undefined || settings.packages.length > 0) {
           const { SetupConfigError, verifyInstalled } = await import("../setup/index.ts");
           try {
             verifyInstalled({ agentDir, packages: settings.packages, forbiddenRoots: knownRoots(args) });
@@ -418,7 +421,11 @@ export async function runReviewCommand(argv: readonly string[], io: Io, entry: R
     const acpAgents = readAcpAgents(args["acp-config"], args["acp-agent"]);
     let agentStep: AgentStep;
     let extraProviders: Parameters<typeof createModelRuntime>[0] = {};
-    const withAgentDir = agentDir === undefined ? {} : { agentDir };
+    // F-7: the step loads exactly the listed packages into every session.
+    const withAgentDir =
+      agentDir === undefined
+        ? {}
+        : { agentDir, ...(args["agent-dir"] !== undefined || settings!.packages.length > 0 ? { packages: settings!.packages } : {}) };
     if (args.script !== undefined) {
       const script = JSON.parse(readFileSync(resolve(args.script), "utf8")) as Script;
       const scripted = createScriptedProvider(script);

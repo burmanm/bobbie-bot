@@ -8,8 +8,11 @@ backed by the pi SDK; the guard and tools it loads live in
 |---|---|
 | `types.ts` | `AgentStep`, request and result types |
 | `pi-sdk-step.ts` | The pi SDK implementation: isolation and the neutral working directory (C-3a, D-15), limits (F-3), usage (A-6) |
+| `modules.ts` | The operator's listed packages for a step: checked offline, resolved with pi's package manager, every resource outside the read roots (F-7) |
 | `model-runtime.ts` | pi's model runtime: pi's catalog plus the operator's `models.json` (F-7), credentials and catalog cache in memory, offline |
 | `accounting.ts` | Usage sums and the turn and spend caps, pure |
+| `fixtures/packages/` | Local fixture pi packages: provider, tool, hooks, a `read` replacement, an output-tool replacement; tests only |
+| `modules.test.ts` | Loading those packages into a real step, and what is refused before loading |
 | `testing.ts` | Hostile snapshot fixture, working-directory payloads and a module that would trigger them, scripted-model helpers; tests only |
 | `acp/acp-step.ts` | `AgentStep` over the Agent Client Protocol: the step runs in an external agent |
 | `acp/connection.ts` | Minimal ACP client: JSON-RPC 2.0, one message per line, over the agent's stdio |
@@ -97,9 +100,12 @@ that is never the snapshot (C-3a).
   directory they were created with, so `resolveInHead` shows head to those
   tools, and only to them. What the model passes and gets back is as it was
   when head was the cwd.
-- **A tool that replaces one of these names** would get the neutral
-  `ctx.cwd`, while the guard judges its relative path against head. Whoever
-  loads such tools (F-7, R-1a step 4) has to hand them the resolved path.
+- **A module tool that replaces one of these names** gets the neutral
+  `ctx.cwd`, while the guard judges its relative path against head. So the
+  guard hands it the checked path: it sets `path` in the call's input to the
+  canonical absolute path (head when omitted), which pi then executes. The
+  transcript keeps what the model wrote. The bot's own tools are left as
+  they are (only their message text would change).
 - **The prompt.** pi adds a `<cwd>` section with the session's cwd. The
   extension replaces it with head, so the model never sees the neutral
   directory and the prompt does not change from step to step. Hooks still
@@ -130,8 +136,10 @@ that is never the snapshot (C-3a).
 - **Isolation is checked on the live session** before the first call: the
   working directory (the session manager's and the extensions') must be the
   step's own, outside every read root, which is checked before extensions
-  get `session_start`; the project must not be trusted, our extension must
-  be the only one, and the active tools must equal the allowlist. Otherwise the step fails with an
+  get `session_start`; the project must not be trusted; the loaded
+  extensions must be exactly the listed packages' entry points followed by
+  ours; the active tools must equal the role's configured set; no skill or
+  prompt template may be loaded. Otherwise the step fails with an
   `internal` error. Several isolation options overlap, so losing one would
   not always change what the model sees; this check catches it.
 - **Process environment.** Every step sets `PI_OFFLINE=1`,
@@ -217,5 +225,54 @@ held in memory (keys from the environment or `models.json`'s `apiKey`), and
 pi's refreshed-catalog cache too, so nothing is written next to
 `models.json` and no `auth.json` is read. A malformed `models.json` is a
 `config` error whose message does not quote the file. Nothing else in the
-agent directory is read here yet: modules are R-1a step 4b. The session's own
-agent directory stays the private, empty one (C-3a).
+agent directory is read by the model runtime. The session's own agent
+directory stays the private, empty one (C-3a); packages are passed to it
+explicitly (below).
+
+## The operator's packages (F-7, R-1a step 4b)
+
+`PiSdkAgentStepOptions.packages` is `packages` from the agent directory's
+`settings.json`; the CLI passes it with `agentDir`. `review-bot setup`
+installs them beforehand (`src/setup/`, `src/cli/setup.ts`); the step only
+loads.
+
+- **Checked before anything loads.** `verifyInstalled` (files only, no npm or
+  git) with the step's real read roots: a missing package or a wrong version
+  is a `config` error, and so is an `AGENTS.md`, `SYSTEM.md` or
+  `APPEND_SYSTEM.md` in the agent directory. The run checks once more at S-1
+  and puts the list, with versions or commits, in `versions.packages` (A-6).
+- **Exactly the listed packages.** pi's package manager resolves them (so a
+  manifest's `pi.extensions` and per-package filters mean what they mean in
+  pi), with the step's empty cwd and an untrusted project. Only resources of
+  origin `package` are kept: the agent directory's own `extensions/`,
+  `skills/`, `prompts/`, `themes/`, a top-level `extensions` setting and
+  pi's built-ins are not loaded. The entry points go to the session's
+  resource loader as paths, with discovery still off. Every resource must
+  resolve, through symlinks, outside the read roots.
+- **Skills and prompt templates** are never loaded into a step, also not
+  those a module offers at `resources_discover` (overrides on the resource
+  loader). A module can still change the prompt with `before_agent_start`;
+  if it returns a whole prompt, our handler, which runs last, puts head back
+  where pi wrote the neutral cwd.
+- **Providers** a package registers are added to the step's model runtime
+  before the model is chosen, so a role can use them. Their credentials are
+  the module's business: a missing key fails at the provider.
+- **Tools.** `AgentStepRequest.moduleTools` are the names from the role's
+  `tools` that the bot does not provide. They are active, and allowed by the
+  guard, only when named; a name that neither the bot nor a loaded package
+  registers is a `config` error, pi's own built-ins (`bash`, `write`, ...)
+  included. Two packages registering a tool the role names is a `config`
+  error. Nested calls are still refused (codemode is R-1a step 5b).
+- **Replacing the bot's tools.** Packages load before our extension and pi
+  keeps the first registration of a name, so a package tool named `read`,
+  `report_finding` and so on replaces ours. pi reports each such conflict
+  as a load error; those are expected and tolerated, any other error is a
+  `config` error. Our `tool_call` guard still runs, last, so the allowlist
+  and the path checks on `read`, `grep`, `find` and `ls` hold whoever
+  implements them; the guard checks only the `path` argument, so a
+  replacement that reads another argument is unconfined (D-19: the
+  maintainers' choice). An output tool's result is re-validated against its
+  schema and `validate`, which is then the only check (D-4).
+  `harness.moduleTools` lists every declared tool a package implements,
+  with `replaces`; the run record has it per step and the summary lists them
+  under "Extra tools from packages".
