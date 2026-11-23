@@ -4,7 +4,7 @@
  * real pi CLI runs it in src/cli/launch.test.ts.
  */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -16,6 +16,10 @@ import { quoteCommandArgs } from "../../src/cli/command-args.ts";
 const FIXTURE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "src", "pipeline", "fixtures", "prs", "basic");
 const work = realpathSync(mkdtempSync(join(tmpdir(), "review-bot-command-")));
 after(() => rmSync(work, { recursive: true, force: true }));
+// Beside the runs directories, not around them: an agent directory that
+// overlaps a read root is refused (F-7, C-3a).
+const agentDir = join(work, "agent");
+mkdirSync(agentDir);
 const savedExitCode = process.exitCode;
 afterEach(() => {
   process.exitCode = savedExitCode;
@@ -50,7 +54,7 @@ const args = (extra: string[] = [], script = join(FIXTURE, "script.json")) => {
   const dir = join(work, `run-${++n}`);
   return {
     dir,
-    text: quoteCommandArgs(["--fixture", FIXTURE, "--script", script, "--no-modcache", "--runs-dir", join(dir, "runs"), "--out", join(dir, "out.json"), "--agent-dir", work, ...extra]),
+    text: quoteCommandArgs(["--fixture", FIXTURE, "--script", script, "--no-modcache", "--runs-dir", join(dir, "runs"), "--out", join(dir, "out.json"), "--agent-dir", agentDir, ...extra]),
   };
 };
 

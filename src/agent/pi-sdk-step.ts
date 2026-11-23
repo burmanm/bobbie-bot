@@ -6,6 +6,11 @@
  * and calling `session.abort()`; pi has no turn cap, step timeout or spend
  * cap.
  *
+ * The operator's pi packages (F-7, R-1a step 4b) load into every session:
+ * exactly the listed ones, checked offline and resolved outside the read
+ * roots (`modules.ts`), before our extension, so a module tool with one of
+ * the bot's names replaces it while our guard still runs last.
+ *
  * The provider API key comes from the environment only (C-5). This module
  * never reads, stores or logs it.
  */
@@ -17,6 +22,8 @@ import {
   type AgentSessionEvent,
   createAgentSession,
   DefaultResourceLoader,
+  type Extension,
+  type LoadExtensionsResult,
   type ModelRuntime,
   SessionManager,
   SettingsManager,
@@ -38,11 +45,13 @@ import { requireExplicitBareRepository } from "../core/git-env.ts";
 import { StepAccounting } from "./accounting.ts";
 import { createModelRuntime, ModelsFileError } from "./model-runtime.ts";
 import { stopReasonOf } from "./limits.ts";
+import { ModulesConfigError, type ResolvedModules, resolveModules } from "./modules.ts";
 import { summarizeProviderRequest } from "./request-summary.ts";
 import type {
   AgentStep,
   AgentStepRequest,
   AgentStepResult,
+  ModuleTool,
   OutputTool,
   RejectedCall,
   StoppedBy,
@@ -66,14 +75,21 @@ export interface PiSdkAgentStepOptions {
   abortGraceMs?: number;
   /**
    * The operator's agent directory (F-7): its `models.json` adds providers,
-   * endpoints and model overrides. Nothing else in it is read here; modules
-   * are R-1a step 4b. Absent: pi's built-in catalog only.
+   * endpoints and model overrides. Absent: pi's built-in catalog only.
    */
   agentDir?: string;
+  /**
+   * `packages` from the agent directory's settings.json (F-7): loaded into
+   * every session, as `review-bot setup` installed them. Needs `agentDir`.
+   * When given, empty included, the agent directory is checked as C-3a
+   * requires (no AGENTS.md, SYSTEM.md or APPEND_SYSTEM.md).
+   */
+  packages?: readonly unknown[];
 }
 
 const DEFAULT_RETRY = { enabled: true, maxRetries: 2, baseDelayMs: 1000 };
 const TOOL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const OUR_EXTENSION = `<inline:${EXTENSION_NAME}>`;
 
 /** A `.git` entry, or a context file pi would pick up walking to the filesystem root (C-3a). */
 const FORBIDDEN_ABOVE_CWD = [".git", "AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
@@ -166,6 +182,14 @@ function validateRequest(request: AgentStepRequest<OutputTool>, options: PiSdkAg
     if (names.has(t.name)) throw new ConfigError(`duplicate tool name: ${t.name}`);
     names.add(t.name);
   }
+  for (const name of request.moduleTools ?? []) {
+    if (!TOOL_NAME.test(name)) throw new ConfigError(`invalid tool name: ${name}`);
+    if (names.has(name)) throw new ConfigError(`duplicate tool name: ${name}`);
+    names.add(name);
+  }
+  if (options.packages !== undefined && options.agentDir === undefined) {
+    throw new ConfigError("packages need the agent directory they are installed in");
+  }
   const needsRg = request.readTools.includes("grep") || request.readTools.includes("find");
   if (needsRg && (options.rgPath ?? findExecutable("rg")) === undefined) throw new ConfigError(RG_MISSING);
 }
@@ -242,6 +266,13 @@ async function runStep<T extends OutputTool>(
     // it starts finds configuration from the PR in its working directory.
     cwd = mkdtempSync(join(temp, "review-bot-cwd-"));
 
+    // F-7: the listed packages, checked before anything is loaded.
+    const modules: ResolvedModules =
+      options.packages === undefined || options.agentDir === undefined
+        ? { packages: [], extensions: [] }
+        : await resolveModules({ agentDir: options.agentDir, packages: options.packages }, roots, cwd);
+    if (options.packages !== undefined) result.harness.packages = modules.packages;
+
     // Model runtime (F-7, C-3a): pi's catalog and the operator's models.json;
     // credentials and catalog cache in memory; the API key comes from the
     // environment or models.json.
@@ -249,7 +280,81 @@ async function runStep<T extends OutputTool>(
       ...(options.agentDir === undefined ? {} : { agentDir: options.agentDir }),
       ...(options.providers === undefined ? {} : { providers: options.providers }),
     });
-    const ownProviders = new Set<string>((options.providers ?? []).map((p) => p.id));
+
+    const guardRejections = new Map<string, GuardRejection>();
+    const replacedPathTools = new Set<string>();
+    const extension = createReviewExtension({
+      roots: roots.roots,
+      readTools: request.readTools,
+      outputTools: request.outputTools,
+      ...(request.queryTools === undefined ? {} : { queryTools: request.queryTools }),
+      ...(request.moduleTools === undefined ? {} : { moduleTools: request.moduleTools }),
+      replaced: () => replacedPathTools,
+      ...(options.rgPath === undefined ? {} : { rgPath: options.rgPath }),
+      onReject: (r) => guardRejections.set(r.toolCallId, r),
+      onProviderRequest: (payload) => {
+        const previous = [...result.providerRequests].reverse().find((r) => r.toolNames !== undefined)?.toolNames;
+        result.providerRequests.push(summarizeProviderRequest(payload, previous));
+      },
+    });
+
+    // C-3a: in-memory settings with projectTrusted false keeps the
+    // snapshot's .pi/ (settings, extensions, skills, prompts, themes,
+    // SYSTEM.md) and the user's settings out. The SDK default trusts the
+    // project.
+    const settingsManager = SettingsManager.inMemory(
+      { compaction: { enabled: false }, retry: options.retry ?? DEFAULT_RETRY },
+      { projectTrusted: false },
+    );
+    const resourceLoader = new DefaultResourceLoader({
+      cwd,
+      agentDir,
+      settingsManager,
+      // Nothing discovered. The packages' entry points are passed as paths
+      // and load before our extension (F-7).
+      noExtensions: true,
+      additionalExtensionPaths: modules.extensions.map((e) => e.path),
+      extensionFactories: [{ name: EXTENSION_NAME, factory: extension }],
+      noSkills: true,
+      noPromptTemplates: true,
+      noThemes: true,
+      // F-7: skills and prompt templates are not discovered into model
+      // steps, also not those a module adds at session start.
+      skillsOverride: () => ({ skills: [], diagnostics: [] }),
+      promptsOverride: () => ({ prompts: [], diagnostics: [] }),
+      themesOverride: () => ({ themes: [], diagnostics: [] }),
+      // AGENTS.md / CLAUDE.md: a separate switch from project trust, and pi
+      // walks from cwd to the filesystem root.
+      noContextFiles: true,
+      systemPrompt: composeSystemPrompt(request),
+      appendSystemPrompt: [],
+    });
+    await resourceLoader.reload();
+
+    const allowlist = [
+      ...new Set<string>([
+        ...request.readTools,
+        ...request.outputTools.map((t) => t.name),
+        ...(request.queryTools ?? []).map((t) => t.name),
+        ...(request.moduleTools ?? []),
+      ]),
+    ];
+    const loaded = inspectLoaded(resourceLoader.getExtensions(), modules, roots, new Set(allowlist));
+
+    // Providers a module registers are known to pi only once the session
+    // binds; the model is chosen before that, so they are registered here
+    // too (the session registers them again, unchanged).
+    const moduleProviders = new Set<string>();
+    for (const { name, config } of loaded.runtime.pendingProviderRegistrations) {
+      modelRuntime.registerProvider(name, config as Parameters<ModelRuntime["registerProvider"]>[1]);
+      moduleProviders.add(name);
+    }
+    for (const { provider } of loaded.runtime.pendingNativeProviderRegistrations) {
+      modelRuntime.registerNativeProvider(provider);
+      moduleProviders.add(provider.id);
+    }
+
+    const ownProviders = new Set<string>([...(options.providers ?? []).map((p) => p.id), ...moduleProviders]);
     let model = modelRuntime.getModel(request.model.provider, request.model.id);
     if (model === undefined) {
       // C-6: models change faster than pi's offline catalog. Like pi's own CLI
@@ -275,56 +380,11 @@ async function runStep<T extends OutputTool>(
       const compat = (model as { compat?: Record<string, unknown> }).compat ?? {};
       model = { ...model, compat: { ...compat, openRouterRouting: request.model.routing } } as typeof model;
     }
+    // A module's provider brings its own authentication; a missing key fails at the provider.
     if (!ownProviders.has(request.model.provider) && !modelRuntime.getProviderAuthStatus(request.model.provider).configured) {
       throw new ConfigError(`no credentials for provider "${request.model.provider}"; set its API key in the environment`);
     }
 
-    const guardRejections = new Map<string, GuardRejection>();
-    const extension = createReviewExtension({
-      roots: roots.roots,
-      readTools: request.readTools,
-      outputTools: request.outputTools,
-      ...(request.queryTools === undefined ? {} : { queryTools: request.queryTools }),
-      ...(options.rgPath === undefined ? {} : { rgPath: options.rgPath }),
-      onReject: (r) => guardRejections.set(r.toolCallId, r),
-      onProviderRequest: (payload) => {
-        const previous = [...result.providerRequests].reverse().find((r) => r.toolNames !== undefined)?.toolNames;
-        result.providerRequests.push(summarizeProviderRequest(payload, previous));
-      },
-    });
-
-    // C-3a: in-memory settings with projectTrusted false keeps the
-    // snapshot's .pi/ (settings, extensions, skills, prompts, themes,
-    // SYSTEM.md) and the user's settings out. The SDK default trusts the
-    // project.
-    const settingsManager = SettingsManager.inMemory(
-      { compaction: { enabled: false }, retry: options.retry ?? DEFAULT_RETRY },
-      { projectTrusted: false },
-    );
-    const resourceLoader = new DefaultResourceLoader({
-      cwd,
-      agentDir,
-      settingsManager,
-      noExtensions: true,
-      extensionFactories: [{ name: EXTENSION_NAME, factory: extension }],
-      noSkills: true,
-      noPromptTemplates: true,
-      noThemes: true,
-      // AGENTS.md / CLAUDE.md: a separate switch from project trust, and pi
-      // walks from cwd to the filesystem root.
-      noContextFiles: true,
-      systemPrompt: composeSystemPrompt(request),
-      appendSystemPrompt: [],
-    });
-    await resourceLoader.reload();
-
-    const allowlist = [
-      ...new Set<string>([
-        ...request.readTools,
-        ...request.outputTools.map((t) => t.name),
-        ...(request.queryTools ?? []).map((t) => t.name),
-      ]),
-    ];
     const created = await createAgentSession({
       cwd,
       agentDir,
@@ -344,31 +404,43 @@ async function runStep<T extends OutputTool>(
         return fail("internal", `isolation: the working directory ${live} is not the step's own directory outside the read roots`);
       }
     }
+    for (const name of loaded.replaced) if ((READ_TOOLS as readonly string[]).includes(name)) replacedPathTools.add(name);
     await session.bindExtensions({ mode: "json" });
 
     result.harness.extensions = created.extensionsResult.extensions.map((e) => e.path);
     result.harness.tools = session.getActiveToolNames();
-    if (created.extensionsResult.errors.length > 0) {
+    if (created.extensionsResult.errors.length > loaded.toleratedErrors) {
       return fail("internal", `extension failed to load: ${created.extensionsResult.errors.map((e) => e.error).join("; ")}`);
     }
-    // Isolation invariants (C-3a), checked on the live session before any
-    // model call. Several options overlap, so losing one would not show in
-    // what the model sees; it is caught here instead.
+    const moduleTools: ModuleTool[] = result.harness.tools.flatMap((tool) => {
+      const source = loaded.moduleOwner.get(tool);
+      return source === undefined ? [] : [{ tool, source, replaces: loaded.replaced.has(tool) }];
+    });
+    if (options.packages !== undefined) result.harness.moduleTools = moduleTools;
+    // Isolation invariants (C-3a, F-7), checked on the live session before
+    // any model call. Several options overlap, so losing one would not show
+    // in what the model sees; it is caught here instead.
     if (session.settingsManager.isProjectTrusted()) {
       return fail("internal", "isolation: the session trusts the project");
     }
-    if (result.harness.extensions.join(",") !== `<inline:${EXTENSION_NAME}>`) {
+    const expected = [...modules.extensions.map((e) => e.path), OUR_EXTENSION];
+    const live = created.extensionsResult.extensions.map((e) => (e.path === OUR_EXTENSION ? e.path : realpathSync(e.resolvedPath)));
+    if (live.join("\n") !== expected.join("\n")) {
       return fail("internal", `isolation: unexpected extensions loaded: ${result.harness.extensions.join(", ")}`);
     }
     if ([...result.harness.tools].sort().join(",") !== [...allowlist].sort().join(",")) {
       return fail("internal", `isolation: active tools ${result.harness.tools.join(",")} differ from the allowlist ${allowlist.join(",")}`);
+    }
+    if (resourceLoader.getSkills().skills.length > 0 || resourceLoader.getPrompts().prompts.length > 0) {
+      return fail("internal", "isolation: a skill or prompt template was loaded into the step (F-7)");
     }
 
     await drive(session, request, options, result, guardRejections);
     return finish();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return fail(error instanceof ConfigError || error instanceof ModelsFileError || /^read root/.test(message) ? "config" : "internal", message);
+    const config = error instanceof ConfigError || error instanceof ModelsFileError || error instanceof ModulesConfigError || /^read root/.test(message);
+    return fail(config ? "config" : "internal", message);
   } finally {
     session?.dispose();
     for (const dir of [agentDir, cwd]) {
@@ -380,6 +452,71 @@ async function runStep<T extends OutputTool>(
       }
     }
   }
+}
+
+interface LoadedExtensions {
+  runtime: LoadExtensionsResult["runtime"];
+  /** The bot's tools that a module registered first, and so replaced. */
+  replaced: ReadonlySet<string>;
+  /** Tool name -> source of the package whose registration pi uses, for module tools. */
+  moduleOwner: ReadonlyMap<string, string>;
+  /** Load errors that are only pi reporting a replacement. */
+  toleratedErrors: number;
+}
+
+/**
+ * What the loaded extensions register (F-7). pi keeps the first registration
+ * of a tool name and reports each later one as an error, our extension's
+ * included. Only those are tolerated: anything else a module reports is a
+ * configuration error, and a configured tool that nothing registers is too.
+ */
+function inspectLoaded(
+  result: LoadExtensionsResult,
+  modules: ResolvedModules,
+  roots: AllowedRoots,
+  allowlist: ReadonlySet<string>,
+): LoadedExtensions {
+  const sourceOf = new Map(modules.extensions.map((e) => [e.path, e.source]));
+  const describe = (ext: Extension) => (ext.path === OUR_EXTENSION ? "the bot" : JSON.stringify(sourceOf.get(realpathSync(ext.resolvedPath)) ?? ext.path));
+  for (const ext of result.extensions) {
+    if (ext.path === OUR_EXTENSION) continue;
+    const real = realpathSync(ext.resolvedPath);
+    if (!sourceOf.has(real) || roots.contains(real)) throw new Error(`isolation: unexpected extension ${ext.path} (F-7)`);
+  }
+  const owner = new Map<string, Extension>();
+  const tolerated = new Set<string>();
+  const replaced = new Set<string>();
+  for (const ext of result.extensions) {
+    for (const [kind, names] of [["Tool", ext.tools.keys()], ["Flag", ext.flags.keys()]] as const) {
+      for (const name of names) {
+        const key = `${kind}:${name}`;
+        const first = owner.get(key);
+        if (first === undefined) {
+          owner.set(key, ext);
+          continue;
+        }
+        tolerated.add(`${ext.path}\0${kind === "Tool" ? `Tool "${name}"` : `Flag "--${name}"`} conflicts with ${first.path}`);
+        if (kind !== "Tool") continue;
+        if (ext.path === OUR_EXTENSION) replaced.add(name);
+        else if (allowlist.has(name)) {
+          throw new ConfigError(`packages ${describe(first)} and ${describe(ext)} both register the tool "${name}" (F-7)`);
+        }
+      }
+    }
+  }
+  const errors = result.errors.filter((e) => !tolerated.has(`${e.path}\0${e.error}`));
+  if (errors.length > 0) {
+    throw new ConfigError(`a package failed to load: ${errors.map((e) => `${e.path}: ${e.error}`).join("; ")}`);
+  }
+  const missing = [...allowlist].filter((name) => !owner.has(`Tool:${name}`));
+  if (missing.length > 0) {
+    throw new ConfigError(`the role's tools ${missing.join(", ")} are provided neither by the bot nor by a listed package (F-7)`);
+  }
+  const moduleOwner = new Map<string, string>();
+  for (const [key, ext] of owner) {
+    if (key.startsWith("Tool:") && ext.path !== OUR_EXTENSION) moduleOwner.set(key.slice(5), sourceOf.get(realpathSync(ext.resolvedPath))!);
+  }
+  return { runtime: result.runtime, replaced, moduleOwner, toleratedErrors: result.errors.length - errors.length };
 }
 
 /** Prompt the session, watch its events, enforce the limits, fill `result`. */
@@ -472,8 +609,9 @@ async function drive<T extends OutputTool>(
           const tool = outputTools.get(event.toolName);
           if (tool !== undefined) {
             const value = (event.result?.details as OutputDetails | undefined)?.output;
-            // pi validated already; this is defence in depth (S-5).
-            if (Value.Check(tool.parameters, value)) {
+            // pi validated already; this is defence in depth (S-5), and the
+            // only check when a module replaced the output tool (F-7).
+            if (Value.Check(tool.parameters, value) && tool.validate?.(value as never) === undefined) {
               result.outputs.push({ tool: tool.name, value } as ToolOutput<T>);
             } else {
               result.toolCalls.failed++;

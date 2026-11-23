@@ -11,10 +11,14 @@
  * The snapshot also holds what would take over a module, or git, working in
  * it: a config with a command and embedded bare repositories (D-19). The
  * controls show that each fires when its protection is missing.
+ *
+ * The step's checks run twice: with the bot alone, and with the operator's
+ * fixture packages loaded (F-7, R-1a step 4b), one of which replaces
+ * `read` and one of which rewrites a path in a hook.
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, afterEach, before, beforeEach, describe, test } from "node:test";
@@ -32,6 +36,7 @@ import {
   buildHostileSnapshot,
   CANARIES,
   declaredToolsIn,
+  FIXTURE_PACKAGES,
   type HostileLayout,
   MARKERS,
   type ModuleSaw,
@@ -250,7 +255,15 @@ describe("control: the working-directory payloads are hostile (D-19)", () => {
   });
 });
 
-describe("isolated step on the hostile snapshot", () => {
+/**
+ * The hostile-PR checks, run with the bot alone and with the operator's
+ * fixture packages loaded (F-7, R-1a step 4b): a provider, a tool, hooks
+ * that rewrite a path and offer a skill, and a replacement for \`read\`.
+ */
+function hostileStepSuite(variant: "bot only" | "with packages"): void {
+describe(`isolated step on the hostile snapshot, ${variant}`, () => {
+  const withPackages = variant === "with packages";
+  const packages = [FIXTURE_PACKAGES.provider, FIXTURE_PACKAGES.tool, FIXTURE_PACKAGES.hook, FIXTURE_PACKAGES.read];
   const contexts: unknown[] = [];
   let result: AgentStepResult<typeof noteTool>;
   const byId = new Map<string, SeenToolResult>();
@@ -318,6 +331,12 @@ describe("isolated step on the hostile snapshot", () => {
       ["f-write", "write", { path: "pwned.txt", content: "x" }],
       ["f-planted", "planted_tool", {}],
     ];
+    if (withPackages) {
+      // A path the hook package rewrites after the model chose it.
+      escapes.push(["e-hook-redirect", "read", { path: "hook-redirect-me" }]);
+      legit.push(["l-lookup", "fixture_lookup", { key: "k" }]);
+      forbidden.push(["f-unconfigured", "fixture_unconfigured", {}]);
+    }
 
     const faux = fauxProvider();
     const capture = (context: unknown) => {
@@ -338,7 +357,15 @@ describe("isolated step on the hostile snapshot", () => {
     ]);
 
     plantedBefore = (globalThis as Record<string, unknown>).__REVIEW_BOT_PLANTED__;
-    const step = createPiSdkAgentStep({ providers: [faux.provider], retry: { enabled: false } });
+    const agentDir = join(layout.work, `agent-${withPackages ? "packages" : "empty"}`);
+    mkdirSync(agentDir);
+    const restoreEnv = setEnv({ REVIEW_BOT_FIXTURE_REDIRECT: outsideSecret, REVIEW_BOT_FIXTURE_LOG: join(layout.work, "fixture-log") });
+    after(restoreEnv);
+    const step = createPiSdkAgentStep({
+      providers: [faux.provider],
+      retry: { enabled: false },
+      ...(withPackages ? { agentDir, packages } : {}),
+    });
     const model = faux.getModel();
     const module = workingDirectoryModule(join(head, NESTED_REPO));
     saw = module.saw;
@@ -350,6 +377,7 @@ describe("isolated step on the hostile snapshot", () => {
       roots: { head, base, modcache },
       readTools: READ,
       outputTools: [noteTool],
+      ...(withPackages ? { moduleTools: ["fixture_lookup"] } : {}),
       limits: { timeoutMs: 30_000, maxTurns: 10 },
     }));
     for (const r of toolResultsIn(contexts.at(-1))) byId.set(r.toolCallId, r);
@@ -360,8 +388,10 @@ describe("isolated step on the hostile snapshot", () => {
     assert.equal(result.usage.turns, 4);
   });
 
-  test("our extension is the only one loaded", () => {
-    assert.deepEqual(result.harness.extensions, ["<inline:review-bot>"]);
+  test("our extension and exactly the listed packages are loaded", () => {
+    const listed = withPackages ? packages.map((p) => join(p, "index.ts")) : [];
+    assert.deepEqual(result.harness.extensions, [...listed, "<inline:review-bot>"]);
+    assert.deepEqual(result.harness.packages?.map((p) => p.source), withPackages ? packages : undefined);
     assert.ok(!existsSync(layout.plantedRanFile), "a planted extension ran");
     assert.equal((globalThis as Record<string, unknown>).__REVIEW_BOT_PLANTED__, plantedBefore);
   });
@@ -409,7 +439,7 @@ describe("isolated step on the hostile snapshot", () => {
   });
 
   test("the model is offered exactly the allowlist", () => {
-    const allow = [...READ, noteTool.name].sort();
+    const allow = [...READ, noteTool.name, ...(withPackages ? ["fixture_lookup"] : [])].sort();
     assert.deepEqual([...result.harness.tools].sort(), allow);
     assert.deepEqual(declaredToolsIn(contexts[0]), allow);
   });
@@ -423,13 +453,14 @@ describe("isolated step on the hostile snapshot", () => {
   });
 
   test("tools that are not on the allowlist cannot run", () => {
-    for (const id of ["f-bash", "f-write", "f-planted"]) {
+    const ids = ["f-bash", "f-write", "f-planted", ...(withPackages ? ["f-unconfigured"] : [])];
+    for (const id of ids) {
       assert.equal(byId.get(id)?.isError, true, id);
     }
     assert.ok(!existsSync(`${layout.head}/pwned.txt`));
     assert.ok(!existsSync(`${layout.plantedRanFile}.tool`));
     const notAllowed = result.rejectedCalls.filter((r) => r.kind === "not-allowed").map((r) => r.toolCallId);
-    assert.deepEqual(notAllowed.sort(), ["f-bash", "f-planted", "f-write"]);
+    assert.deepEqual(notAllowed.sort(), ids.sort());
   });
 
   test("nothing outside the roots is readable", () => {
@@ -494,6 +525,25 @@ describe("isolated step on the hostile snapshot", () => {
     const found = byId.get("l-find-go")!.text.split("\n");
     for (const f of ["main.go", "ignored/hidden.go", "dotignored.go", "rgignored.go"]) {
       assert.ok(found.includes(f), `find is missing ${f}: ${found.join(",")}`);
+    }
+  });
+});
+}
+
+hostileStepSuite("bot only");
+hostileStepSuite("with packages");
+
+describe("with packages: what the modules did", () => {
+  test("a replaced read is confined and given paths in head; the hook ran; an unconfigured tool did not", () => {
+    // Filled by the "with packages" suite above, which ran first.
+    const lines = readFileSync(join(layout.work, "fixture-log"), "utf8").split("\n");
+    assert.ok(lines.includes("hook:before_agent_start"), "the hook package did not run");
+    assert.ok(lines.includes("tool:lookup k"), "the tool package's tool did not run");
+    assert.ok(!lines.includes("tool:unconfigured ran"), "an unconfigured tool ran");
+    const reads = lines.filter((l) => l.startsWith("read:")).map((l) => l.slice(5));
+    assert.ok(reads.length > 0, "the replacing read never ran");
+    for (const path of reads) {
+      assert.ok([layout.head, layout.base, layout.modcache].some((root) => path.startsWith(`${root}/`)), `the replaced read got ${path}`);
     }
   });
 });

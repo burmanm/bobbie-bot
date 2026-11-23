@@ -4,7 +4,7 @@
  * the offline review. Loading them into sessions is not here.
  */
 export { REFUSED_FILES } from "./agent-dir.ts";
-export { PackageInstallError, SetupConfigError } from "./errors.ts";
+export { PackageInstallError, SetupCancelledError, SetupConfigError } from "./errors.ts";
 export type { CommandOptions, CommandResult, CommandRunner } from "./installer.ts";
 export { setupPackages, type SetupOptions } from "./setup.ts";
 export { type Package, type PackagesInput, validatePackages } from "./sources.ts";

@@ -6,9 +6,21 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { DefaultResourceLoader, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { OutputTool } from "./types.ts";
+
+const PACKAGES = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "packages");
+
+/** The local fixture pi packages (fixtures/packages/README.md), by absolute path (F-7). */
+export const FIXTURE_PACKAGES = {
+  provider: join(PACKAGES, "provider"),
+  tool: join(PACKAGES, "tool"),
+  hook: join(PACKAGES, "hook"),
+  read: join(PACKAGES, "read-replacing"),
+  output: join(PACKAGES, "output-replacing"),
+} as const;
 
 /** Strings that must never reach the model through the system prompt or tool list. */
 export const CANARIES = {
@@ -25,6 +37,8 @@ export const CANARIES = {
   userAgents: "USER-AGENTS-CANARY-1111",
   userSkill: "USER-SKILL-CANARY-1112",
   homeAgentsSkill: "HOME-AGENTS-SKILL-CANARY-1113",
+  /** In the hook fixture package's skill (F-7: package skills are not loaded). */
+  packageSkill: "PACKAGE-SKILL-CANARY-3304",
 } as const;
 
 /** File contents the model may only reach through search, or never. */

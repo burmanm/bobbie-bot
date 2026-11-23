@@ -10,7 +10,8 @@
  * - the step's typed output tools,
  * - the step's query tools (history, issue search), answered by the
  *   orchestrator (S-4),
- * - the `tool_call` guard,
+ * - the `tool_call` guard, which also covers the tools of the operator's
+ *   modules (F-7): the role's allowlist and path checks by tool name,
  * - the system prompt's `cwd` section.
  *
  * The session's cwd is an empty directory outside every root (C-3a, D-15),
@@ -52,6 +53,13 @@ export interface ReviewExtensionOptions {
   rgPath?: string;
   onReject?: (rejection: GuardRejection) => void;
   /**
+   * Tools that loaded modules register and the role is configured with
+   * (F-7). The guard allows them; they are registered by the modules.
+   */
+  moduleTools?: readonly string[];
+  /** The bot's path tools that a module replaced; see `GuardOptions.replaced`. */
+  replaced?: () => ReadonlySet<string>;
+  /**
    * Called with each provider request body just before it is sent
    * (`before_provider_request`; real providers only). Observes; never
    * changes the request.
@@ -67,6 +75,7 @@ export function createReviewExtension(options: ReviewExtensionOptions): Extensio
     ...options.readTools,
     ...options.outputTools.map((t) => t.name),
     ...queryTools.map((t) => t.name),
+    ...(options.moduleTools ?? []),
   ]);
 
   return (pi) => {
@@ -84,13 +93,24 @@ export function createReviewExtension(options: ReviewExtensionOptions): Extensio
       allowedTools,
       roots,
       ...(options.onReject === undefined ? {} : { onReject: options.onReject }),
+      ...(options.replaced === undefined ? {} : { replaced: options.replaced }),
     });
+    // Modules load before this extension, so this handler runs after theirs
+    // and judges the input as it will be executed (F-7).
     pi.on("tool_call", (event) => guard(event));
     // pi shows the model the session's cwd. That directory is no use to it
     // (empty, outside the roots, new in every step), and head is what
     // relative paths mean to it (C-3a).
     pi.on("before_agent_start", (event) => {
-      event.systemPromptOptions.sections.cwd = `${roots.head} (head: read, ls, grep and find resolve relative and omitted paths here)`;
+      const shown = `${roots.head} (head: read, ls, grep and find resolve relative and omitted paths here)`;
+      const options = event.systemPromptOptions;
+      options.sections.cwd = shown;
+      // A module hook that returned a whole prompt (F-7) rendered it with the
+      // neutral directory; this handler runs last, so it puts head there.
+      const forced = options.forceSystemPrompt;
+      const neutral = options.cwd.replace(/\\/g, "/");
+      if (forced !== undefined && neutral !== "" && forced.includes(neutral)) return { systemPrompt: forced.split(neutral).join(shown) };
+      return undefined;
     });
     const onRequest = options.onProviderRequest;
     if (onRequest !== undefined) {

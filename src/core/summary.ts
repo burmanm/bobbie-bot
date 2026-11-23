@@ -9,7 +9,8 @@
  *   4. Pre-existing items, each with a proposed tech-debt issue or a link.
  *   5. Questions for the author.
  *   6. Checked, nothing found.
- *   7. CI note (C-9), not run / partial-run note.
+ *   7. CI note (C-9), not run / partial-run note, extra tools from the
+ *      operator's packages (F-7).
  *   8. How to resolve: [wrong] / [intentional] / [not-worth-it].
  *   9. Needs human lines.
  *
@@ -59,7 +60,21 @@ export interface SummaryParts {
   /** C-9: the review ran although CI failed or could not be read. */
   ci?: string;
   needsHuman?: NeedsHumanNote[];
+  /**
+   * Tools from the operator's packages that were active (F-7, H-60): the
+   * maintainers chose them, readers should know the review had them.
+   */
+  extraTools?: ExtraTool[];
   marker: SummaryMarker;
+}
+
+/** A tool a package provided in the review (F-7). */
+export interface ExtraTool {
+  tool: string;
+  /** The package's source as configured. */
+  source: string;
+  /** It replaced the bot's own tool of that name. */
+  replaces: boolean;
 }
 
 /** Counts over the findings that will be published (live statuses). */
@@ -177,6 +192,14 @@ export function renderSummary(p: SummaryParts): string {
   if (p.ci !== undefined) notRun.push(`**CI:** ${labelled(p.ci)}`);
   if (p.partial !== undefined) notRun.push(`**Partial review:** ${labelled(p.partial)}`);
   if (p.notRun?.length) notRun.push(["**Not run:**", ...p.notRun.map((n) => `- ${item(n)}`)].join("\n"));
+  if (p.extraTools?.length) {
+    notRun.push(
+      [
+        "**Extra tools from packages:**",
+        ...p.extraTools.map((t) => `- ${codeSpan(t.tool)} from ${codeSpan(t.source)}${t.replaces ? ", replacing the bot's own" : ""}`),
+      ].join("\n"),
+    );
+  }
   if (notRun.length) blocks.push(notRun.join("\n\n"));
 
   blocks.push(RESOLVE_LINE);

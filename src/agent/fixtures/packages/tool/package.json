@@ -1,0 +1,1 @@
+{ "name": "fixture-pi-tool", "version": "2.1.0", "type": "module", "pi": { "extensions": ["./index.ts"] } }
