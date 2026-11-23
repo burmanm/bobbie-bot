@@ -6,6 +6,21 @@ GitHub: the PR is read with `gh` using GET requests only, and the review,
 thread replies and check-run conclusion are printed as JSON in GitHub's
 payload shape (the same shape as review-process `Claude outputs/*.json`).
 
+The same review runs inside pi as the `/review-bot` command of the
+`pi-review/` package, with the same options (F-3):
+
+- **Interactively:** `pi -e ./pi-review`, then `/review-bot --pr <owner/repo#N>`.
+  It is a dry run unless `--live` is given. Without `--agent-dir` it uses pi's
+  own agent directory, so the same providers and models as your pi.
+- **Packages:** with `--agent-dir`, the packages its `settings.json` lists
+  are loaded into every role session. Install them first with
+  `node src/cli/main.ts setup --agent-dir <dir>`; a missing one is a
+  configuration error.
+- **Headless:** `node src/cli/main.ts launch <options>` starts pi the way CI
+  will (only this package loaded, `--no-approve`, offline, stdin closed, an
+  empty working directory). In print mode the command posts unless
+  `--dry-run` is given, like the CLI, and the result goes only to `--out`.
+
 ## Prerequisites
 
 - Node 22.19 or later, and `npm ci --ignore-scripts` done in this repository.
@@ -32,6 +47,11 @@ export VERIFIER_MODEL=openrouter/<vendor>/<model>
 ```bash
 node src/cli/main.ts review --dry-run --pr k8ssandra/cass-operator#1021 --knowledge-dir ~/projects/git/review-guidelines/pilot/cass-operator --guidelines ~/projects/git/review-guidelines/shared/go-operator-guidelines.md --model reviewer="$REVIEWER_MODEL" --model verifier="$VERIFIER_MODEL" --max-cost 3 --out "$TMPDIR/cass-operator-1021.json"
 ```
+
+Thinking levels are pi's: `off`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`, as `--thinking reviewer=high` or a `:high` suffix on the
+model. To use a provider or endpoint pi does not ship, define it in a
+`models.json` and pass its directory with `--agent-dir`.
 
 Any model id the provider serves works, including ones newer than pi's
 offline catalog (the log then says it was used as a custom id; its context
@@ -104,35 +124,49 @@ node src/cli/main.ts review --dry-run --pr k8ssandra/cass-operator#1021 --head <
 
 ## Output
 
-- **stdout / `--out`:** `{ dry_run, repo, pull_number, review, thread_replies,
+- **stdout / `--out`** (only `--out` for `/review-bot` and `launch`): `{ dry_run, repo, pull_number, review, thread_replies,
   resolve_threads, failure_comment?, check_run }`. `review` is the body of
   GitHub's "create a review" call, event `COMMENT`.
 - **Run directory** (path printed at the end): `01-intake.json` …
   `07-publish.json` per stage, `inputs/context.md` and `inputs/patches/`
   as the reviewer saw them, and `08-record.json`, the run record (A-6) with
   every finding including dropped ones and why, per-step usage and cost,
-  configured and served model IDs.
+  configured and served model IDs. `scripts.json` sits next to it when a
+  step ran a codemode script: each script's scrubbed source, the step that
+  ran it and the tool calls it made (no arguments or results). A finding
+  reported from inside a script carries its `scriptId`.
 - **Exit code:** 0 reviewed or skipped, 1 could not complete (the check
   would be `neutral`), 2 usage error.
 
 ## Configuration
 
-Flags are the workflow inputs. A `.review/review-bot.yaml` on the
-repository's base branch overrides them (C-2), for example:
+Configuration comes in three layers (F-7):
+
+1. **The operator's agent directory**, `--agent-dir <dir>`: pi's
+   `settings.json` (with the bot's `reviewBot` key and `enabledModels`) and
+   `models.json` (providers, endpoints, model overrides). Without it there
+   are no settings and no `enabledModels`.
+2. **Flags**, which are the workflow inputs: they replace the settings.
+3. **`.review/review-bot.yaml` on the repository's base branch**, which can
+   only narrow: lower a limit, and pick a model from `enabledModels` (with
+   an optional `:<thinking>` suffix). Without `enabledModels` it cannot
+   change a model at all. It can still set the skip rules, and turn
+   codemode off with `codemode: false`. A refused value
+   (a higher limit, another `chunkPatchLines`, a model outside the list) is
+   a configuration error: the check completes *neutral*, names the value,
+   and nothing is reviewed.
+
+For example, with `enabledModels` listing both models:
 
 ```yaml
 roles:
   reviewer: openrouter/<vendor>/<model>
-  verifier:
-    model: openrouter/<vendor>/<model>
-    thinking: low
-    providers: [anthropic, amazon-bedrock]
-    routing: { sort: price }
+  verifier: openrouter/<vendor>/<model>:low
 limits:
-  reviewer: { timeoutSeconds: 1200, idleTimeoutSeconds: 180, maxTurns: 120, maxCostUsd: 3 }
+  reviewer: { timeoutSeconds: 1200, idleTimeoutSeconds: 180, maxTurns: 120, maxCostUsd: 2 }
   verifier: { timeoutSeconds: 480, maxTurns: 40 }
-  runCostUsd: 5
-  runTimeoutSeconds: 2700
+  runCostUsd: 3
+  runTimeoutSeconds: 1800 # the action's default deadline is 2220
   chunkPatchLines: 4000
 skip:
   draft: true
@@ -162,10 +196,21 @@ Labels match case-insensitively. A `deps`-labelled PR that also changes
 anything else is reviewed in full (the log says why). Each list replaces
 its default; `[]` turns a condition off.
 
-`providers` (OpenRouter models only) restricts which upstream providers may
-serve the model: it becomes OpenRouter's routing `only` with fallbacks off,
-merged into any other `routing`. The same from the command line:
-`--providers reviewer=anthropic,amazon-bedrock`.
+Restricting the upstream providers that may serve an OpenRouter model is
+the operator's: `--providers reviewer=anthropic,amazon-bedrock` (OpenRouter's
+routing `only`, fallbacks off), or `compat.openRouterRouting` in
+`models.json`. The YAML has no `thinking`, `providers` or `routing` keys
+any more; use the model's `:<thinking>` suffix.
+
+**Codemode** (F-7) is off by default. A role turns it on in `settings.json`
+with `"+codemode"` in `reviewBot.roles.<role>.tools`; pi's own `codemode`
+key sets `mode` (`on` or `only`) and `inlineBudget`. Scripts run in pi's
+QuickJS sandbox and reach only the role's tools, through the same path
+checks as the model. The step's time and cost limits cover them. Scripts get
+pi's `models` API only with `reviewBot.codemode: { models: true }`, which
+lets them call models outside `enabledModels`, and the cost of those calls is
+known only when the script ends. `codemode: true` in the YAML is refused
+unless `settings.json` already enables it.
 
 Without a `verifier` model, Important findings are posted labelled
 *unverified* and the summary says verification was not run.
@@ -196,12 +241,14 @@ The root `REVIEW.md` is still what onboards a repository.
 
 | Limit | Default | Flag | YAML |
 |---|---|---|---|
-| Whole run | 45 min | `--run-timeout 30m` | `limits.runTimeoutSeconds` |
+| Whole run | 45 min | `--run-timeout 30m`; `--max-run-timeout` caps whatever is configured | `limits.runTimeoutSeconds` |
 | One step, wall clock | reviewer 20 min, verifier 8 min | `--step-timeout reviewer=15m` (no role: both) | `limits.<role>.timeoutSeconds` |
 | One step, no activity | 3 min | `--idle-timeout 90s` | `limits.<role>.idleTimeoutSeconds` |
 
-Durations are `90s`, `20m`, `1.5h`; a bare number is seconds. As with every
-setting, the base branch's YAML overrides the flags.
+Durations are `90s`, `20m`, `1.5h`; a bare number is seconds. The agent
+directory's `reviewBot.limits` sets them too, flags replace those, and the
+base branch's YAML can lower them, never raise them. The action passes its
+job limit as `--max-run-timeout`, so a lower value from any layer applies.
 
 - **Step timeout and inactivity** stop the step: the model request in
   flight is aborted (not just abandoned), a running tool call is ended, and

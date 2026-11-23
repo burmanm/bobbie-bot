@@ -56,18 +56,21 @@ Secrets (repository or organization):
 | `OPENROUTER_API_KEY` | yes | the review step only |
 | `REVIEW_BOT_APP_PRIVATE_KEY` | with the GitHub App identity | gate, remove-label, review (to mint a short-lived installation token) |
 
-Variables (repository or organization; all optional except the models):
+Variables (repository or organization; all optional except the models). An
+unset variable leaves the agent directory's `settings.json` in effect (F-7):
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `REVIEW_BOT_AGENT_DIR` | — | The operator's pi agent directory, a path in this repository (`settings.json` with `reviewBot` and `enabledModels`, `models.json`). Read from the **default branch's** head, never from a PR |
+| `REVIEW_BOT_AGENT_DIR_REPO` | — | Take `REVIEW_BOT_AGENT_DIR` from an organization configuration repository instead: `owner/name@<40-hex commit SHA>`. The gate's token must be able to read it |
 | `REVIEW_BOT_MODELS` | — | Role→model map, one per line: `reviewer=openrouter/<vendor>/<model>` and `verifier=openrouter/<vendor>/<model>`. Without a verifier, Important findings are posted as unverified |
-| `REVIEW_BOT_THINKING` | — | One per line, `<role>=off\|minimal\|low\|medium\|high` |
+| `REVIEW_BOT_THINKING` | — | One per line, `<role>=off\|minimal\|low\|medium\|high\|xhigh\|max` |
 | `REVIEW_BOT_PROVIDERS` | — | OpenRouter only, one per line, `<role>=<provider>,<provider>`: the upstream providers allowed to serve the model |
 | `REVIEW_BOT_MAX_COST_USD` | 5 (pipeline default) | Spend cap for one run |
 | `REVIEW_BOT_NAME` | `main` | Reviewer name; the check is `ai-review/<name>` |
 | `REVIEW_BOT_AUTH_LABEL` | `ai-review/approved` | Authorization label (C-4) |
 | `REVIEW_BOT_AUTH_LABEL_LIFETIME` | `per-push` | `per-push` or `per-pr` (Q-10) |
-| `REVIEW_BOT_TIMEOUT_MINUTES` | 40 | Time limit of the review step |
+| `REVIEW_BOT_TIMEOUT_MINUTES` | 40 | Time limit of the review step. The run deadline is capped three minutes inside it; a lower `runTimeoutSeconds` in settings or the YAML applies |
 | `REVIEW_BOT_JOB_TIMEOUT_MINUTES` | 50 | Time limit of the review job; keep it a few minutes above the step's so the always-run steps get to run |
 | `REVIEW_BOT_PREPARE_TIMEOUT_MINUTES` | 20 | Time limit of the prepare job |
 | `REVIEW_BOT_GO_VERSION` | `stable` | Go used by `go mod download`. Pin it to at least the `go` line of your `go.mod`: with `GOTOOLCHAIN=local` an older Go fails, and the review then runs without a module cache |
@@ -81,17 +84,22 @@ Variables (repository or organization; all optional except the models):
 | `REVIEW_BOT_NO_HISTORY` | — | `true`: no history or issue tools ([private repositories](#private-repositories)) |
 | `REVIEW_BOT_HISTORY_READ` | — | `true`: the App token of the review job also requests `contents: read` and `issues: read` ([private repositories](#private-repositories)) |
 
-Per-step limits (time, idle time, turns, cost per role), skip rules and
-chunking are set in `.review/review-bot.yaml` (format in
+Per-step limits, roles, tools and skip rules are set in the agent
+directory's `settings.json` under `reviewBot`; the base branch's
+`.review/review-bot.yaml` can narrow them (format in
 [running-dry-run.md](running-dry-run.md#configuration)).
 
-**`.review/review-bot.yaml` on the base branch overrides the variables**
-(C-2, A-5): roles, limits, skip rules, `authorization.label` /
+**`.review/review-bot.yaml` on the base branch can only lower limits**
+(F-7): a higher one, for example `runCostUsd` above
+`REVIEW_BOT_MAX_COST_USD` or `runTimeoutSeconds` above the review step's
+deadline (2220 by default), completes the check *neutral* without a review.
+It can pick a model only from `enabledModels` in `settings.json`. It does
+replace the variables (C-2, A-5) for skip rules, `authorization.label` /
 `authorization.lifetime`, and `ci.require` / `ci.onFailure` / `ci.timeout`. The reviewer name is never read from it. Two
 caveats about the label:
 
-- If the YAML sets `authorization.label`, set `REVIEW_BOT_AUTH_LABEL` to the
-  same name. The workflow drops label events for other labels before any job
+- If the YAML or `settings.json` sets `authorization.label`, set
+  `REVIEW_BOT_AUTH_LABEL` to the same name. The workflow drops label events for other labels before any job
   starts, using the variable.
 - A YAML file that does not parse is reported by the review as a
   configuration error; the gate keeps the variable's label and uses
@@ -163,8 +171,9 @@ this workflow the gate is the control.
 
 Optional, per repository (C-9): the bot does not review a head commit until
 the repository's own CI has passed on it. Set it in
-`.review/review-bot.yaml` on the base branch (or with the `REVIEW_BOT_CI_*`
-variables, which the YAML overrides):
+`.review/review-bot.yaml` on the base branch (or with `reviewBot.ci` in
+`settings.json` or the `REVIEW_BOT_CI_*` variables, which the YAML
+replaces):
 
 ```yaml
 ci:
@@ -364,6 +373,27 @@ the log and the job summary.
 - With the App identity, `gate` and `remove-label` hold the App private key
   (to mint a scoped token). Neither job runs anything from the PR. With
   `GITHUB_TOKEN` they hold no secret at all.
+- Install the agent directory's packages with `review-bot setup --agent-dir
+  <dir>` in a step that has no secrets (exit 0 installed, 1 an installer
+  failed, 2 usage, 3 configuration). Step 6 adds it to the workflow. A role's
+  `tools` can then name tools those packages provide. A package that replaces
+  one of the bot's tools is recorded in the run record and listed in the
+  review summary. A replacement that reads an argument other than `path` is
+  not confined.
+- Codemode is enabled per role with `"+codemode"` in the agent directory's
+  `reviewBot.roles.<role>.tools`; the base branch's YAML can only turn it
+  off. Scripts' tool calls pass the same checks as the model's, and the
+  executed scripts are saved to `scripts.json` next to the run record.
+  `reviewBot.codemode.models: true` gives scripts pi's `models` API, which is
+  not limited to `enabledModels`; leave it off unless you need it.
+- An agent directory containing `AGENTS.md`, `SYSTEM.md` or
+  `APPEND_SYSTEM.md`, or overlapping a read root, is refused.
+- The runner must start the real `node` binary for `review-bot launch`
+  (R-1a step 6 switches the action to it). A version-manager shim such as
+  Volta's does not pass SIGTERM on, and a cancelled review then publishes
+  nothing.
+- A package listed in the agent directory's `settings.json` that is not
+  installed stops the review as a configuration error (exit 1).
 - Until `action/image.lock` names a published digest, the action image is
   built in each job: its downloads are pinned and verified, but they happen
   in the job.
