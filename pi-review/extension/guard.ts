@@ -12,6 +12,12 @@
  * A blocked call is returned to the model as an error result and the run
  * continues.
  *
+ * Calls made by another tool (pi's `parentToolCallId`: a codemode script,
+ * or a module tool using `ctx.executeTool`) get the same checks, on the
+ * same allowlist and roots (F-7 Codemode, R-1a step 5b). A script cannot
+ * name a tool the step does not allow, such as pi's `bash`, and cannot
+ * start another script.
+ *
  * A module may replace one of these tools (F-7, H-29). The checks stay on
  * the name, and the replacement is handed the checked, absolute path:
  * pi's own tools resolve relative paths against `ctx.cwd`, which is the
@@ -19,6 +25,9 @@
  */
 import type { ToolCallEvent, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
 import type { AllowedRoots } from "./paths.ts";
+
+/** pi's built-in tool that runs a model-written script calling other tools (F-7 Codemode). */
+export const CODEMODE_TOOL = "codemode";
 
 /** pi's read tools, each with a `path` argument (required for read, optional otherwise). */
 export const READ_TOOLS = ["read", "grep", "find", "ls"] as const;
@@ -53,8 +62,10 @@ export function checkToolCall(event: ToolCallEvent, options: GuardOptions): stri
 
 /** As `checkToolCall`, with the canonical path a path tool will work on (head when omitted). */
 export function checkToolCallPath(event: ToolCallEvent, options: GuardOptions): ToolCallCheck {
-  if (event.parentToolCallId !== undefined) {
-    return { ok: false, reason: `Tool "${event.toolName}" may not be called from another tool.` };
+  // pi already keeps codemode from its own scripts (exposure "model-only");
+  // a module tool could still try.
+  if (event.parentToolCallId !== undefined && event.toolName === CODEMODE_TOOL) {
+    return { ok: false, reason: `Tool "${CODEMODE_TOOL}" may not be called from another tool.` };
   }
   if (!options.allowedTools.has(event.toolName)) {
     return { ok: false, reason: `Tool "${event.toolName}" is not on this step's allowlist.` };

@@ -425,7 +425,12 @@ export async function runReviewCommand(argv: readonly string[], io: Io, entry: R
     const withAgentDir =
       agentDir === undefined
         ? {}
-        : { agentDir, ...(args["agent-dir"] !== undefined || settings!.packages.length > 0 ? { packages: settings!.packages } : {}) };
+        : {
+            agentDir,
+            ...(args["agent-dir"] !== undefined || settings!.packages.length > 0 ? { packages: settings!.packages } : {}),
+            // F-7 Codemode: pi's mode and budget, and whether scripts get `models`.
+            ...(settings!.codemode === undefined ? {} : { codemode: settings!.codemode }),
+          };
     if (args.script !== undefined) {
       const script = JSON.parse(readFileSync(resolve(args.script), "utf8")) as Script;
       const scripted = createScriptedProvider(script);

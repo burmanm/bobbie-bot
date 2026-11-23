@@ -234,6 +234,8 @@ export const Finding = Type.Object(
     /** Set when grounding re-tagged the finding (S-5). */
     retaggedFrom: Type.Optional(Tag),
     verdict: Type.Optional(SubmitVerdictParams),
+    /** The saved codemode script that reported it, in the run's `scripts.json` (A-6). */
+    scriptId: Type.Optional(Type.String({ pattern: "^script-[1-9][0-9]*$" })),
   },
   { additionalProperties: false },
 );

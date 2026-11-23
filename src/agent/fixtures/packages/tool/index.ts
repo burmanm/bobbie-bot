@@ -1,7 +1,7 @@
 /**
  * Fixture: a tool package (F-7). `fixture_lookup` answers from a table;
- * with `nested`, it tries to reach other tools through `ctx.executeTool`,
- * which the bot's guard refuses (5b allows configured ones).
+ * with `nested`, it calls other tools through `ctx.executeTool`, which the
+ * bot's guard checks like the model's own calls (R-1a step 5b).
  */
 import { appendFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";

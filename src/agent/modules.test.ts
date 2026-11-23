@@ -106,7 +106,7 @@ describe("loading the listed packages", () => {
     assert.deepEqual(result.servedModels, ["echo"]);
     assert.deepEqual(result.outputs.map((o) => o.value.title), ["FIXTURE-PROVIDER-ANSWER-3301"]);
     assert.deepEqual(result.harness.packages, [{ name: "fixture-pi-provider", source: FIXTURE_PACKAGES.provider, version: "1.0.0" }]);
-    assert.deepEqual(result.harness.extensions, [join(FIXTURE_PACKAGES.provider, "index.ts"), "<inline:review-bot>"]);
+    assert.deepEqual(result.harness.extensions, [join(FIXTURE_PACKAGES.provider, "index.ts"), "<inline:pi-codemode>", "<inline:review-bot>"]);
   });
 
   test("a tool package's tool is active only when the role names it", async () => {
@@ -134,20 +134,25 @@ describe("loading the listed packages", () => {
     assert.deepEqual(logged(), []);
   });
 
-  test("a tool cannot reach another tool, configured or not (nested calls are R-1a step 5b)", async () => {
+  test("a tool reaches only configured tools, with the same path checks (F-7, R-1a step 5b)", async () => {
     const nested = [
       { tool: "fixture_unconfigured", args: {} },
       { tool: "read", args: { path: "main.go" } },
+      { tool: "read", args: { path: join(work, "outside.txt") } },
+      { tool: "read", args: { path: "../outside.txt" } },
       { tool: "bash", args: { command: "id" } },
     ];
     const { result, byId } = await run([FIXTURE_PACKAGES.tool], [calls(["t-nested", "fixture_lookup", { key: "n", nested }]), done], {
       moduleTools: ["fixture_lookup"],
     });
     assert.equal(result.outcome, "ok", JSON.stringify(result.error));
-    const text = byId.get("t-nested")!.text;
-    for (const { tool } of nested) assert.match(text, new RegExp(`nested ${tool}: error`));
-    assert.ok(!text.includes("UNCONFIGURED-RAN") && !text.includes("HEAD-CONTENT"), text);
+    const lines = byId.get("t-nested")!.text.split("\n").filter((l) => l.startsWith("nested "));
+    assert.deepEqual(lines.map((l) => l.split(" ").slice(1, 3).join(" ")), ["fixture_unconfigured: error", "read: ok", "read: error", "read: error", "bash: error"]);
+    assert.ok(lines[1]!.includes("HEAD-CONTENT"), lines[1]);
+    assert.match(lines[2]!, /outside the allowed read roots/);
+    assert.ok(!lines.join("\n").includes("UNCONFIGURED-RAN"));
     assert.ok(!logged().includes("tool:unconfigured ran"));
+    assert.deepEqual(result.rejectedCalls.filter((r) => r.kind === "guard").map((r) => r.tool), ["read", "read"]);
   });
 
   test("hooks run in the session and change the prompt; the package's skill is not loaded", async () => {
@@ -284,7 +289,7 @@ describe("refused before anything is loaded", () => {
     }
     const { result } = await run([FIXTURE_PACKAGES.tool], [done], {}, { agentDir: dir });
     assert.equal(result.outcome, "ok", JSON.stringify(result.error));
-    assert.deepEqual(result.harness.extensions, [join(FIXTURE_PACKAGES.tool, "index.ts"), "<inline:review-bot>"]);
+    assert.deepEqual(result.harness.extensions, [join(FIXTURE_PACKAGES.tool, "index.ts"), "<inline:pi-codemode>", "<inline:review-bot>"]);
     assert.deepEqual(logged(), []);
   });
 });

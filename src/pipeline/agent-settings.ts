@@ -4,7 +4,7 @@
  * module must not import pi, nor anything that does.
  *
  * The file is pi's. Its other keys are tolerated and left to pi; only
- * `reviewBot`, `enabledModels` and `packages` are read and checked here. pi
+ * `reviewBot`, `enabledModels`, `packages` and `codemode` are read and checked here. pi
  * treats a malformed file as a warning; for the bot it is a configuration
  * error (F-3).
  */
@@ -175,10 +175,23 @@ const RoleSettings = Type.Object(
   { additionalProperties: false },
 );
 
+/**
+ * `reviewBot.codemode` (F-7 Codemode, R-1a step 5b). Codemode itself is
+ * enabled per role with `"+codemode"` in `tools`.
+ *
+ * `models`: give scripts pi's `models` API (classifiers, image models).
+ * Off unless set: scripts could then run any such model the process has
+ * credentials for, outside `enabledModels`, and a call cut off when its
+ * script ends may be billed without reporting usage, a hole in the spend
+ * cap (the step marks such usage incomplete, A-6).
+ */
+const ReviewBotCodemode = Type.Object({ models: Type.Optional(Type.Boolean()) }, { additionalProperties: false });
+
 /** The `reviewBot` key (F-7). */
 export const ReviewBotSettings = Type.Object(
   {
     roles: Type.Optional(Type.Object({ reviewer: Type.Optional(RoleSettings), verifier: Type.Optional(RoleSettings) }, { additionalProperties: false })),
+    codemode: Type.Optional(ReviewBotCodemode),
     limits: Type.Optional(LimitsSchema),
     skip: Type.Optional(SkipSchema),
     ci: Type.Optional(CiSchema),
@@ -202,12 +215,30 @@ const PackageSource = Type.Union([
 ]);
 export type PackageSource = Static<typeof PackageSource>;
 
+/** pi's own `codemode` key (pi's settings.md), passed to its codemode extension. */
+const PiCodemode = Type.Object({
+  mode: Type.Optional(Type.Enum(["on", "only"] as const)),
+  inlineBudget: Type.Optional(Type.Number({ minimum: 0 })),
+});
+
 /** pi's other keys are allowed and not looked at. */
 const SettingsFile = Type.Object({
   reviewBot: Type.Optional(ReviewBotSettings),
   enabledModels: Type.Optional(Type.Array(Type.String({ pattern: "\\S" }))),
   packages: Type.Optional(Type.Array(PackageSource)),
+  codemode: Type.Optional(PiCodemode),
 });
+
+/**
+ * How pi's codemode extension is set up when a role enables codemode (F-7):
+ * `mode` and `inlineBudget` from pi's `codemode` key, `models` from
+ * `reviewBot.codemode`.
+ */
+export interface CodemodeSettings {
+  mode?: "on" | "only";
+  inlineBudget?: number;
+  models?: boolean;
+}
 
 export interface AgentSettings {
   reviewBot: ReviewBotSettings;
@@ -217,6 +248,8 @@ export interface AgentSettings {
    */
   enabledModels: string[];
   packages: PackageSource[];
+  /** Absent: pi's defaults, and no `models` API for scripts. */
+  codemode?: CodemodeSettings;
 }
 
 /**
@@ -268,7 +301,16 @@ export function parseAgentSettings(text: string, file: string = SETTINGS_FILE): 
   if (typeof timeout === "string" && parseDuration(timeout) === undefined) {
     throw new ConfigError(`${file} is invalid: /reviewBot/ci/timeout: must be a duration such as 6h or 90m`);
   }
-  return { reviewBot, enabledModels: data.enabledModels ?? [], packages: data.packages ?? [] };
+  const codemode: CodemodeSettings = {};
+  if (data.codemode?.mode !== undefined) codemode.mode = data.codemode.mode;
+  if (data.codemode?.inlineBudget !== undefined) codemode.inlineBudget = data.codemode.inlineBudget;
+  if (reviewBot.codemode?.models !== undefined) codemode.models = reviewBot.codemode.models;
+  return {
+    reviewBot,
+    enabledModels: data.enabledModels ?? [],
+    packages: data.packages ?? [],
+    ...(Object.keys(codemode).length === 0 ? {} : { codemode }),
+  };
 }
 
 /**

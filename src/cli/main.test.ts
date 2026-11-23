@@ -135,11 +135,11 @@ test("--agent-dir (F-7): settings reach the run; a broken settings.json is a con
   const { mkdirSync, writeFileSync } = await import("node:fs");
   const dir = join(work, "agent");
   mkdirSync(dir);
-  writeFileSync(join(dir, "settings.json"), JSON.stringify({ reviewBot: { roles: { reviewer: { tools: ["+codemode"] } } } }));
+  writeFileSync(join(dir, "settings.json"), JSON.stringify({ reviewBot: { roles: { reviewer: { tools: ["+fixture_lookup"] } } } }));
   const base = ["review", "--dry-run", "--fixture", FIXTURE, "--script", join(FIXTURE, "script.json"), "--no-modcache", "--runs-dir", join(work, "runs"), "--quiet"];
   const cap = io();
   assert.equal(await main([...base, "--agent-dir", dir], cap.io), 1);
-  assert.match(cap.out.stdout, /tools in settings\.json names codemode/);
+  assert.match(cap.out.stdout, /tools in settings\.json names fixture_lookup, but no packages are listed/);
 
   writeFileSync(join(dir, "settings.json"), '{"reviewBot": ');
   const broken = io();

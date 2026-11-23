@@ -14,6 +14,7 @@
  * | `limits.*` | Equal or lower, per field. A per-step `maxCostUsd` may be set where there is none |
  * | `limits.chunkPatchLines` | Fixed: only the value in effect. Lower means more steps, each with its own turn and time limits, and higher means more in one step, so neither direction narrows |
  * | `roles.<role>` | A model in `enabledModels`, or the one already configured. Without that list, only the latter |
+ * | `codemode` | `false` turns codemode off for every role. `true` only restates settings.json, where a role names `+codemode`; anywhere else it is refused (R-1a step 5b) |
  * | `skip`, `ci`, `authorization` | The repository's own policy: replace what is above |
  * | anything else (tools, packages, providers, endpoints) | No such key |
  *
@@ -56,6 +57,7 @@ import {
   PIPELINE_ROLES,
   type PipelineRole,
   quoteValue,
+  resolveRoleTools,
   secondsToMs,
   SkipSchema,
   stepLimitsFromSchema,
@@ -69,6 +71,7 @@ export interface PipelineConfig {
   /**
    * Each role's `tools` setting as written (F-7); only settings.json can
    * give one. Resolve with `resolveRoleTools` against the role's default.
+   * `.review/review-bot.yaml` can only append `-codemode`.
    */
   tools: Partial<Record<PipelineRole, string[]>>;
   limits: Record<PipelineRole, StepLimits> & {
@@ -87,6 +90,9 @@ export interface PipelineConfig {
   /** S-1 skip conditions; see skip.ts. */
   skip: SkipConfig;
 }
+
+/** pi's built-in codemode tool (F-7); a role enables it with `+codemode`. Same name as the extension's `CODEMODE_TOOL`, which this module cannot import (no pi here). */
+export const CODEMODE = "codemode";
 
 export const DEFAULT_LIMITS: PipelineConfig["limits"] = {
   reviewer: { timeoutMs: 20 * 60_000, idleTimeoutMs: 3 * 60_000, maxTurns: 120 },
@@ -116,6 +122,8 @@ export const BotConfigYaml = Type.Object(
   {
     roles: Type.Optional(Type.Object({ reviewer: Type.Optional(RoleYaml), verifier: Type.Optional(RoleYaml) }, { additionalProperties: false })),
     limits: Type.Optional(LimitsSchema),
+    /** Narrowing only: `false` turns codemode off for every role (F-7). */
+    codemode: Type.Optional(Type.Boolean()),
     skip: Type.Optional(SkipSchema),
     /** Used by the gate job only; accepted and ignored by the review run. */
     ci: Type.Optional(CiSchema),
@@ -318,6 +326,11 @@ function applyYaml(config: PipelineConfig, y: BotConfigYaml, settings: AgentSett
       const why = settings.enabledModels.length > 0 ? "not in enabledModels" : "no enabledModels, so the model is fixed";
       refused.push(`roles.${role} ${quoteValue(spec)} (${why})`);
     }
+  }
+  if (y.codemode === false) {
+    for (const role of PIPELINE_ROLES) config.tools[role] = [...(config.tools[role] ?? []), `-${CODEMODE}`];
+  } else if (y.codemode === true && !PIPELINE_ROLES.some((role) => resolveRoleTools(config.tools[role], []).includes(CODEMODE))) {
+    refused.push("codemode true (only settings.json can enable it, with +codemode in a role's tools)");
   }
   if (refused.length > 0) {
     // Short: the failure comment keeps the first 300 characters (S-9).

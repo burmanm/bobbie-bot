@@ -60,7 +60,7 @@ describe("settings.json (F-7, F-3)", () => {
     };
     const packages = ["npm:@org/pi-x@1.2.3", { source: "./node_modules/pi-y", extensions: ["index.ts"], autoload: false }];
     const s = settingsOf({ $schema: "x", codemode: { mode: "on" }, defaultTools: ["bash"], somethingNew: 1, reviewBot, enabledModels: ["openrouter/*"], packages });
-    assert.deepEqual(s, { reviewBot, enabledModels: ["openrouter/*"], packages });
+    assert.deepEqual(s, { reviewBot, enabledModels: ["openrouter/*"], packages, codemode: { mode: "on" } });
   });
 
   test("without the keys: no settings, and no enabledModels", () => {

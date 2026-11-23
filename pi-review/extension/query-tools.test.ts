@@ -78,6 +78,24 @@ describe("the existing forms", () => {
     }
   });
 
+  test("found right after a string escape (H-47)", () => {
+    for (const t of [classic("s"), classic("p"), classic("o"), fineGrained()]) {
+      // JSON of text with a newline before the token: a literal backslash-n.
+      assert.equal(scrubSecrets(JSON.stringify({ out: `line\n${t}` })), JSON.stringify({ out: `line\n${R}` }));
+      assert.equal(scrubSecrets(JSON.stringify(`a\t${t}\r\n`)), JSON.stringify(`a\t${R}\r\n`));
+      for (const escape of ["\\n", "\\r", "\\t", "\\b", "\\f", "\\v", "\\0", "\\x41", "\\u0041", "\\u{1F600}"]) {
+        assert.equal(scrubSecrets(`const s = "x${escape}${t}";`), `const s = "x${escape}${R}";`, escape);
+      }
+    }
+  });
+
+  test("a letter before the token is still not a boundary, escaped or not", () => {
+    const long = "abcdefghij".repeat(4);
+    for (const text of [`highs_${long}`, `\\nhighs_${long}`, `\\qghs_${long}`, `\\xZghs_${long}`, `\\u004ghs_${long}`]) {
+      assert.equal(scrubSecrets(text), text);
+    }
+  });
+
   test("redacting twice changes nothing more", () => {
     const once = scrubSecrets(`${installation()} ${classic("o")} ${fineGrained()}`);
     assert.equal(scrubSecrets(once), once);
@@ -125,6 +143,7 @@ describe("large adversarial input", () => {
     "opaque starts with no boundary": () => fill(`-ghp_${"a".repeat(20)}_`),
     "fine-grained prefixes": () => fill("github_pat_"),
     "fine-grained body": () => `github_pat_${fill("a_")}`,
+    "escapes before prefixes": () => fill(`\\n\\u0041ghp_${"a".repeat(19)}`),
   };
   for (const [name, build] of Object.entries(inputs)) {
     test(name, () => {

@@ -11,6 +11,13 @@
  * roots (`modules.ts`), before our extension, so a module tool with one of
  * the bot's names replaces it while our guard still runs last.
  *
+ * pi's codemode extension is registered in every session, inactive unless
+ * the role enables it (F-7 Codemode, C-3a, R-1a step 5b). Its scripts' tool
+ * calls pass our guard like the model's own, usage reported on tool results
+ * counts toward the spend cap as soon as it arrives, the step's time limits
+ * stop a script that runs on, and every script is reported to the run's
+ * saved-scripts collector (A-6).
+ *
  * The provider API key comes from the environment only (C-5). This module
  * never reads, stores or logs it.
  */
@@ -21,6 +28,7 @@ import {
   type AgentSession,
   type AgentSessionEvent,
   createAgentSession,
+  createCodemodeExtension,
   DefaultResourceLoader,
   type Extension,
   type LoadExtensionsResult,
@@ -32,6 +40,7 @@ import {
 import { Value } from "typebox/value";
 import {
   AllowedRoots,
+  CODEMODE_TOOL,
   createReviewExtension,
   EXTENSION_NAME,
   findExecutable,
@@ -85,11 +94,23 @@ export interface PiSdkAgentStepOptions {
    * requires (no AGENTS.md, SYSTEM.md or APPEND_SYSTEM.md).
    */
   packages?: readonly unknown[];
+  /**
+   * pi's codemode settings from the agent directory (F-7): `mode` and
+   * `inlineBudget` from pi's `codemode` key, `models` from
+   * `reviewBot.codemode`. Used by steps whose request enables codemode.
+   * `models` defaults to false here, unlike in pi.
+   */
+  codemode?: { mode?: "on" | "only"; inlineBudget?: number; models?: boolean };
 }
 
 const DEFAULT_RETRY = { enabled: true, maxRetries: 2, baseDelayMs: 1000 };
 const TOOL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const OUR_EXTENSION = `<inline:${EXTENSION_NAME}>`;
+/** pi's codemode extension, passed as a factory under this name (F-7, C-3a). */
+const CODEMODE_EXTENSION_NAME = "pi-codemode";
+const CODEMODE_EXTENSION = `<inline:${CODEMODE_EXTENSION_NAME}>`;
+/** Extensions the step passes in itself, as opposed to the operator's packages. */
+const OWN_EXTENSIONS: ReadonlySet<string> = new Set([CODEMODE_EXTENSION, OUR_EXTENSION]);
 
 /** A `.git` entry, or a context file pi would pick up walking to the filesystem root (C-3a). */
 const FORBIDDEN_ABOVE_CWD = [".git", "AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
@@ -184,6 +205,7 @@ function validateRequest(request: AgentStepRequest<OutputTool>, options: PiSdkAg
   }
   for (const name of request.moduleTools ?? []) {
     if (!TOOL_NAME.test(name)) throw new ConfigError(`invalid tool name: ${name}`);
+    if (name === CODEMODE_TOOL) throw new ConfigError(`${CODEMODE_TOOL} is enabled with the request's codemode flag, not as a module tool`);
     if (names.has(name)) throw new ConfigError(`duplicate tool name: ${name}`);
     names.add(name);
   }
@@ -289,6 +311,7 @@ async function runStep<T extends OutputTool>(
       outputTools: request.outputTools,
       ...(request.queryTools === undefined ? {} : { queryTools: request.queryTools }),
       ...(request.moduleTools === undefined ? {} : { moduleTools: request.moduleTools }),
+      ...(request.codemode === true ? { codemode: true } : {}),
       replaced: () => replacedPathTools,
       ...(options.rgPath === undefined ? {} : { rgPath: options.rgPath }),
       onReject: (r) => guardRejections.set(r.toolCallId, r),
@@ -314,7 +337,20 @@ async function runStep<T extends OutputTool>(
       // and load before our extension (F-7).
       noExtensions: true,
       additionalExtensionPaths: modules.extensions.map((e) => e.path),
-      extensionFactories: [{ name: EXTENSION_NAME, factory: extension }],
+      // pi's codemode, registered inactive (C-3a), then ours, whose guard
+      // must run last. Mode and budget are passed: pi would read them from
+      // the session's settings, which are in memory and empty here.
+      extensionFactories: [
+        {
+          name: CODEMODE_EXTENSION_NAME,
+          factory: createCodemodeExtension({
+            models: options.codemode?.models === true,
+            ...(options.codemode?.mode === undefined ? {} : { mode: options.codemode.mode }),
+            ...(options.codemode?.inlineBudget === undefined ? {} : { inlineBudget: options.codemode.inlineBudget }),
+          }),
+        },
+        { name: EXTENSION_NAME, factory: extension },
+      ],
       noSkills: true,
       noPromptTemplates: true,
       noThemes: true,
@@ -337,6 +373,7 @@ async function runStep<T extends OutputTool>(
         ...request.outputTools.map((t) => t.name),
         ...(request.queryTools ?? []).map((t) => t.name),
         ...(request.moduleTools ?? []),
+        ...(request.codemode === true ? [CODEMODE_TOOL] : []),
       ]),
     ];
     const loaded = inspectLoaded(resourceLoader.getExtensions(), modules, roots, new Set(allowlist));
@@ -423,8 +460,8 @@ async function runStep<T extends OutputTool>(
     if (session.settingsManager.isProjectTrusted()) {
       return fail("internal", "isolation: the session trusts the project");
     }
-    const expected = [...modules.extensions.map((e) => e.path), OUR_EXTENSION];
-    const live = created.extensionsResult.extensions.map((e) => (e.path === OUR_EXTENSION ? e.path : realpathSync(e.resolvedPath)));
+    const expected = [...modules.extensions.map((e) => e.path), CODEMODE_EXTENSION, OUR_EXTENSION];
+    const live = created.extensionsResult.extensions.map((e) => (OWN_EXTENSIONS.has(e.path) ? e.path : realpathSync(e.resolvedPath)));
     if (live.join("\n") !== expected.join("\n")) {
       return fail("internal", `isolation: unexpected extensions loaded: ${result.harness.extensions.join(", ")}`);
     }
@@ -477,9 +514,10 @@ function inspectLoaded(
   allowlist: ReadonlySet<string>,
 ): LoadedExtensions {
   const sourceOf = new Map(modules.extensions.map((e) => [e.path, e.source]));
-  const describe = (ext: Extension) => (ext.path === OUR_EXTENSION ? "the bot" : JSON.stringify(sourceOf.get(realpathSync(ext.resolvedPath)) ?? ext.path));
+  const describe = (ext: Extension) =>
+    ext.path === OUR_EXTENSION ? "the bot" : ext.path === CODEMODE_EXTENSION ? "pi's codemode" : JSON.stringify(sourceOf.get(realpathSync(ext.resolvedPath)) ?? ext.path);
   for (const ext of result.extensions) {
-    if (ext.path === OUR_EXTENSION) continue;
+    if (OWN_EXTENSIONS.has(ext.path)) continue;
     const real = realpathSync(ext.resolvedPath);
     if (!sourceOf.has(real) || roots.contains(real)) throw new Error(`isolation: unexpected extension ${ext.path} (F-7)`);
   }
@@ -514,7 +552,7 @@ function inspectLoaded(
   }
   const moduleOwner = new Map<string, string>();
   for (const [key, ext] of owner) {
-    if (key.startsWith("Tool:") && ext.path !== OUR_EXTENSION) moduleOwner.set(key.slice(5), sourceOf.get(realpathSync(ext.resolvedPath))!);
+    if (key.startsWith("Tool:") && !OWN_EXTENSIONS.has(ext.path)) moduleOwner.set(key.slice(5), sourceOf.get(realpathSync(ext.resolvedPath))!);
   }
   return { runtime: result.runtime, replaced, moduleOwner, toleratedErrors: result.errors.length - errors.length };
 }
@@ -572,10 +610,35 @@ async function drive<T extends OutputTool>(
   };
 
   const recordRejection = (call: RejectedCall) => result.rejectedCalls.push(call);
+  /**
+   * Tool calls that started and have not ended. One left at the end (a
+   * call a script did not await, or a step abandoned) never reported its
+   * usage (A-6 `usageComplete`).
+   */
+  const running = new Set<string>();
+  /** Reporting scripts is recording: it never fails the step (S-8). */
+  const scripts = request.scripts;
+  const report = (event: Parameters<NonNullable<typeof scripts>["record"]>[0]) => {
+    try {
+      scripts?.record(event);
+    } catch {
+      // A collector bug must not break the review.
+    }
+  };
 
   const onEvent = (event: AgentSessionEvent) => {
     resetIdle();
     switch (event.type) {
+      case "tool_execution_start":
+        running.add(event.toolCallId);
+        report({
+          type: "tool_execution_start",
+          toolCallId: event.toolCallId,
+          toolName: event.toolName,
+          args: event.args,
+          ...(event.parentToolCallId === undefined ? {} : { parentToolCallId: event.parentToolCallId }),
+        });
+        break;
       case "turn_start":
         requestInFlight = true;
         break;
@@ -588,6 +651,27 @@ async function drive<T extends OutputTool>(
         break;
       }
       case "tool_execution_end": {
+        // Resolved before the end is recorded: a later script may reuse the provider's call id.
+        let scriptId: string | undefined;
+        try {
+          scriptId = scripts?.scriptIdOf(event.parentToolCallId);
+        } catch {
+          scriptId = undefined;
+        }
+        report({
+          type: "tool_execution_end",
+          toolCallId: event.toolCallId,
+          toolName: event.toolName,
+          isError: event.isError,
+          ...(event.parentToolCallId === undefined ? {} : { parentToolCallId: event.parentToolCallId }),
+        });
+        running.delete(event.toolCallId);
+        // F-7 Codemode: what a call reports for itself, at any depth. A
+        // script's nested spend can be any amount within one turn, so the
+        // cap is checked here too, not only between turns.
+        const costBefore = accounting.costUsd;
+        accounting.addToolResult(event);
+        if (limits.maxCostUsd !== undefined && accounting.costUsd > costBefore && accounting.costUsd >= limits.maxCostUsd) stop("cost");
         result.toolCalls.total++;
         lastTool = event.toolName;
         const guarded = guardRejections.get(event.toolCallId);
@@ -612,7 +696,7 @@ async function drive<T extends OutputTool>(
             // pi validated already; this is defence in depth (S-5), and the
             // only check when a module replaced the output tool (F-7).
             if (Value.Check(tool.parameters, value) && tool.validate?.(value as never) === undefined) {
-              result.outputs.push({ tool: tool.name, value } as ToolOutput<T>);
+              result.outputs.push({ tool: tool.name, value, ...(scriptId === undefined ? {} : { scriptId }) } as ToolOutput<T>);
             } else {
               result.toolCalls.failed++;
               recordRejection({
@@ -671,7 +755,7 @@ async function drive<T extends OutputTool>(
     ...(accounting.reasoning === undefined ? {} : { reasoning: accounting.reasoning }),
     costUsd: accounting.costUsd,
     costIsBilled: accounting.costIsBilled,
-    usageComplete: !abortedInFlight && accounting.abortedCalls === 0 && settledInGrace,
+    usageComplete: !abortedInFlight && accounting.abortedCalls === 0 && settledInGrace && !accounting.toolUsageMissing && running.size === 0,
   };
   result.servedModels = [...accounting.servedModels];
 
