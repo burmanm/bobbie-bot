@@ -51,14 +51,17 @@ export const QUERY_DEFAULT_MAX_BYTES = 24 * 1024;
  *   boundary, so it is also found after an escape such as `\n`, and a token
  *   cut short after ten characters of its header is redacted too;
  * - the opaque forms `gh[opsur]_...` and `github_pat_...`. These need a word
- *   boundary at both ends: "highs_..." contains "ghs_".
+ *   boundary at both ends: "highs_..." contains "ghs_". A string escape
+ *   (`\n`, `\t`, `\x41`, `\u0041`, `\u{41}`, as JSON and script source
+ *   carry them) also counts as one before the token, as its last character
+ *   is a letter or digit (H-47).
  *
  * Linear, which matters as this runs on text a model wrote: nothing that
  * must match follows the JWT's header, and an attempt that fails has only
  * scanned a run of characters in which no other attempt can start.
  */
 const TOKEN_LIKE =
-  /ghs_\d+_eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+){0,2}|\b(?:gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
+  /ghs_\d+_eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]+){0,2}|(?:\b|(?<=\\(?:[0bfnrtv]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4}|u\{[0-9A-Fa-f]{1,6}\})))(?:gh[opsur]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
 
 export function scrubSecrets(text: string): string {
   return text.replace(TOKEN_LIKE, "[redacted]");

@@ -96,6 +96,19 @@ export interface AgentStepRequest<T extends OutputTool = OutputTool> {
    * `outputTools` as usual.
    */
   moduleTools?: readonly string[];
+  /**
+   * pi's built-in `codemode` tool is declared to the model (F-7 Codemode,
+   * `"+codemode"` in the role's tools). Every call a script makes passes the
+   * same guard as the model's own; usage reported on tool results counts
+   * toward `maxCostUsd`; the step's time limits stop a script that runs on.
+   */
+  codemode?: boolean;
+  /**
+   * Where the step reports tool execution events, nested ones included, for
+   * the run's saved scripts (A-6 `scripts.json`). Bound to the step's name
+   * by the caller.
+   */
+  scripts?: ScriptSink;
   limits: StepLimits;
   /**
    * Run cancellation (for example a newer push), or the run deadline when
@@ -106,9 +119,24 @@ export interface AgentStepRequest<T extends OutputTool = OutputTool> {
   onProgress?: (progress: StepProgress) => void;
 }
 
-/** One validated output, tagged with the tool that produced it. */
+/** A tool execution start or end as pi emits it; nested calls carry their parent's call id. */
+export type ToolExecutionEvent =
+  | { type: "tool_execution_start"; toolCallId: string; toolName: string; args: unknown; parentToolCallId?: string }
+  | { type: "tool_execution_end"; toolCallId: string; toolName: string; isError: boolean; parentToolCallId?: string };
+
+/** A step's view of the run's saved-scripts collector (`core/saved-scripts.ts`). */
+export interface ScriptSink {
+  record(event: ToolExecutionEvent): void;
+  /** The saved script a call was made from, given that call's `parentToolCallId`. */
+  scriptIdOf(parentToolCallId: string | undefined): string | undefined;
+}
+
+/**
+ * One validated output, tagged with the tool that produced it. `scriptId`
+ * is set when a codemode script made the call (A-6).
+ */
 export type ToolOutput<T extends OutputTool> =
-  T extends OutputTool<infer Name, infer Schema extends TSchema> ? { tool: Name; value: Static<Schema> } : never;
+  T extends OutputTool<infer Name, infer Schema extends TSchema> ? { tool: Name; value: Static<Schema>; scriptId?: string } : never;
 
 export type StepOutcome = "ok" | "timeout" | "error" | "truncated" | "cancelled";
 
@@ -138,11 +166,18 @@ export interface StepUsage {
   cacheWrite: number;
   reasoning?: number;
   costUsd: number;
-  /** False when any call's cost is a catalog estimate rather than the provider's billed amount. */
+  /**
+   * False when any call's cost is a catalog estimate rather than the
+   * provider's billed amount. Usage reported on tool results (codemode's
+   * `models.*` calls, a module's tool) counts here and in the totals above.
+   */
   costIsBilled: boolean;
   /**
    * False when a model call was aborted in flight: aborted calls report zero
    * usage, so the figures above under-report (A-6, Q-16). Not estimated.
+   * Also false when a tool's usage could not be read or was never reported:
+   * a script's model call cut off, or a tool call still running when the
+   * step ended.
    */
   usageComplete: boolean;
   wallMs: number;
@@ -155,7 +190,7 @@ export interface AgentStepResult<T extends OutputTool = OutputTool> {
   /** Validated, in call order. */
   outputs: Array<ToolOutput<T>>;
   rejectedCalls: RejectedCall[];
-  /** All tool calls, and those that ended in an error (rejected or failed). */
+  /** All tool calls, nested ones (from codemode scripts) included, and those that ended in an error (rejected or failed). */
   toolCalls: { total: number; failed: number };
   usage: StepUsage;
   /** `responseModel ?? model` per call, distinct, in first-seen order (A-6, C-6). */

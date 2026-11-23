@@ -19,14 +19,14 @@
  * and omitted paths in head.
  */
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
-import { createToolCallGuard, type GuardRejection, type ReadToolName } from "./guard.ts";
+import { CODEMODE_TOOL, createToolCallGuard, type GuardRejection, type ReadToolName } from "./guard.ts";
 import { type OutputTool, registerOutputTool } from "./output-tools.ts";
 import { type QueryTool, registerQueryTool } from "./query-tools.ts";
 import { AllowedRoots } from "./paths.ts";
 import { createConfinedLsTool, createConfinedReadTool } from "./read-tools.ts";
 import { createSearchFindTool, createSearchGrepTool } from "./search-tools.ts";
 
-export { READ_TOOLS, type GuardRejection, type ReadToolName } from "./guard.ts";
+export { CODEMODE_TOOL, READ_TOOLS, type GuardRejection, type ReadToolName } from "./guard.ts";
 export type { OutputDetails, OutputTool } from "./output-tools.ts";
 export {
   capText,
@@ -57,6 +57,12 @@ export interface ReviewExtensionOptions {
    * (F-7). The guard allows them; they are registered by the modules.
    */
   moduleTools?: readonly string[];
+  /**
+   * The role may call pi's built-in `codemode` tool (F-7 Codemode). pi's
+   * codemode extension registers it; the guard allows it, and checks every
+   * call its scripts make like any other.
+   */
+  codemode?: boolean;
   /** The bot's path tools that a module replaced; see `GuardOptions.replaced`. */
   replaced?: () => ReadonlySet<string>;
   /**
@@ -76,6 +82,7 @@ export function createReviewExtension(options: ReviewExtensionOptions): Extensio
     ...options.outputTools.map((t) => t.name),
     ...queryTools.map((t) => t.name),
     ...(options.moduleTools ?? []),
+    ...(options.codemode === true ? [CODEMODE_TOOL] : []),
   ]);
 
   return (pi) => {

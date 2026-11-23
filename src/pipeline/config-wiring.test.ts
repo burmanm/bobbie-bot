@@ -147,12 +147,21 @@ describe("settings reach the run (F-7, A-6)", () => {
   });
 
   test("a tool this version does not provide is a configuration error, not dropped", async () => {
-    const dir = agentDir({ "settings.json": { reviewBot: { roles: { reviewer: { model: "openrouter/vendor/model", tools: ["+codemode"] } } } } });
+    const dir = agentDir({ "settings.json": { reviewBot: { roles: { reviewer: { model: "openrouter/vendor/model", tools: ["+mytool"] } } } } });
     const { step, requests } = recordingStep();
     const { result } = await review({ dir: prWithYaml(""), agentStep: step, inputs: {}, agent: { dir, settings: parseAgentSettings(readFileSync(join(dir, "settings.json"), "utf8")) } });
     assert.equal(result.conclusion, "neutral");
-    assert.match(result.checkSummary, /tools in settings\.json names codemode/);
+    assert.match(result.checkSummary, /tools in settings\.json names mytool, but no packages are listed/);
     assert.equal(requests.length, 0);
+  });
+
+  test("codemode is pi's (R-1a step 5b): it reaches the step as the codemode flag, without packages", async () => {
+    const dir = agentDir({ "settings.json": { reviewBot: { roles: { reviewer: { model: "openrouter/vendor/model", tools: ["+codemode"] } } } } });
+    const { step, requests } = recordingStep();
+    await review({ dir: prWithYaml(""), agentStep: step, inputs: {}, agent: { dir, settings: parseAgentSettings(readFileSync(join(dir, "settings.json"), "utf8")) } });
+    assert.equal(requests[0]?.codemode, true);
+    assert.equal(requests[0]?.moduleTools, undefined);
+    assert.ok(requests[0]?.scripts !== undefined, "no collector for the saved scripts");
   });
 
   test("without an agent directory the defaults are today's read-only set and nothing is hashed", async () => {

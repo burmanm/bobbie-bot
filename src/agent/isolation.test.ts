@@ -260,9 +260,30 @@ describe("control: the working-directory payloads are hostile (D-19)", () => {
  * fixture packages loaded (F-7, R-1a step 4b): a provider, a tool, hooks
  * that rewrite a path and offer a skill, and a replacement for \`read\`.
  */
-function hostileStepSuite(variant: "bot only" | "with packages"): void {
+const SCRIPT_ID = "cm-iso";
+
+/** A codemode script making each call by name and reporting `<id> OK|ERR <text>` per line. */
+function scriptOf(list: ReadonlyArray<[id: string, tool: string, args: Record<string, string>]>): string {
+  return `
+const out = [];
+for (const [id, tool, args] of ${JSON.stringify(list)}) {
+  try {
+    const fn = tools[tool];
+    if (typeof fn !== "function") throw new Error("no such tool: " + tool);
+    out.push(id + " OK " + JSON.stringify(await fn(args)));
+  } catch (e) {
+    out.push(id + " ERR " + String(e && e.message));
+  }
+}
+return out.join("\\n");
+`;
+}
+
+function hostileStepSuite(variant: "bot only" | "with packages" | "with packages and codemode"): void {
 describe(`isolated step on the hostile snapshot, ${variant}`, () => {
-  const withPackages = variant === "with packages";
+  const withPackages = variant !== "bot only";
+  // F-7 Codemode, R-1a step 5b: the same calls again, made from a script.
+  const withCodemode = variant === "with packages and codemode";
   const packages = [FIXTURE_PACKAGES.provider, FIXTURE_PACKAGES.tool, FIXTURE_PACKAGES.hook, FIXTURE_PACKAGES.read];
   const contexts: unknown[] = [];
   let result: AgentStepResult<typeof noteTool>;
@@ -353,11 +374,21 @@ describe(`isolated step on the hostile snapshot, ${variant}`, () => {
         return fauxAssistantMessage(calls(escapes), { stopReason: "toolUse" });
       },
       (context) => (capture(context), fauxAssistantMessage(calls(legit), { stopReason: "toolUse" })),
+      ...(withCodemode
+        ? [
+            (context: unknown) => (
+              capture(context),
+              fauxAssistantMessage([fauxToolCall("codemode", { code: scriptOf([...forbidden, ...escapes, ...legit]) }, { id: SCRIPT_ID })], {
+                stopReason: "toolUse",
+              })
+            ),
+          ]
+        : []),
       (context) => (capture(context), fauxAssistantMessage(fauxText("DONE"))),
     ]);
 
     plantedBefore = (globalThis as Record<string, unknown>).__REVIEW_BOT_PLANTED__;
-    const agentDir = join(layout.work, `agent-${withPackages ? "packages" : "empty"}`);
+    const agentDir = join(layout.work, `agent-${withCodemode ? "codemode" : withPackages ? "packages" : "empty"}`);
     mkdirSync(agentDir);
     const restoreEnv = setEnv({ REVIEW_BOT_FIXTURE_REDIRECT: outsideSecret, REVIEW_BOT_FIXTURE_LOG: join(layout.work, "fixture-log") });
     after(restoreEnv);
@@ -365,6 +396,8 @@ describe(`isolated step on the hostile snapshot, ${variant}`, () => {
       providers: [faux.provider],
       retry: { enabled: false },
       ...(withPackages ? { agentDir, packages } : {}),
+      // Scripts get pi's `models` API too, here: no provider has a classifier.
+      ...(withCodemode ? { codemode: { models: true } } : {}),
     });
     const model = faux.getModel();
     const module = workingDirectoryModule(join(head, NESTED_REPO));
@@ -378,19 +411,41 @@ describe(`isolated step on the hostile snapshot, ${variant}`, () => {
       readTools: READ,
       outputTools: [noteTool],
       ...(withPackages ? { moduleTools: ["fixture_lookup"] } : {}),
+      ...(withCodemode ? { codemode: true } : {}),
       limits: { timeoutMs: 30_000, maxTurns: 10 },
     }));
     for (const r of toolResultsIn(contexts.at(-1))) byId.set(r.toolCallId, r);
   });
 
+  const turns = withCodemode ? 5 : 4;
+
   test("the step completes", () => {
     assert.equal(result.outcome, "ok", JSON.stringify(result.error));
-    assert.equal(result.usage.turns, 4);
+    assert.equal(result.usage.turns, turns);
   });
+
+  if (withCodemode) {
+    test("from a script: every escape is refused, nothing outside is read, unconfigured tools do not exist", () => {
+      const out = byId.get(SCRIPT_ID);
+      assert.ok(out !== undefined && !out.isError, out?.text);
+      const line = (id: string) => new RegExp(`^${id} (OK|ERR) `, "m").exec(out.text)?.[1];
+      for (const [id] of escapes) assert.equal(line(id), "ERR", `${id} from a script`);
+      for (const id of ["f-bash", "f-write", "f-planted", "f-unconfigured"]) assert.equal(line(id), "ERR", id);
+      for (const [id] of legit) assert.equal(line(id), "OK", `${id} from a script`);
+      assert.ok(out.text.includes(MARKERS.head) && out.text.includes(MARKERS.base) && out.text.includes(MARKERS.modcache));
+      assertNoCanary(out.text, "the script's output");
+      assert.ok(!out.text.includes(MARKERS.outside), "outside content reached the script");
+      const nestedGuarded = result.rejectedCalls.filter((r) => r.kind === "guard" && r.toolCallId.startsWith(`${SCRIPT_ID}/`));
+      assert.equal(nestedGuarded.length, escapes.length, JSON.stringify(nestedGuarded));
+      assert.ok(!existsSync(`${layout.head}/pwned.txt`));
+      assert.ok(!existsSync(`${layout.plantedRanFile}.tool`));
+    });
+  }
 
   test("our extension and exactly the listed packages are loaded", () => {
     const listed = withPackages ? packages.map((p) => join(p, "index.ts")) : [];
-    assert.deepEqual(result.harness.extensions, [...listed, "<inline:review-bot>"]);
+    // pi's codemode is registered, inactive unless enabled, in every session (C-3a).
+    assert.deepEqual(result.harness.extensions, [...listed, "<inline:pi-codemode>", "<inline:review-bot>"]);
     assert.deepEqual(result.harness.packages?.map((p) => p.source), withPackages ? packages : undefined);
     assert.ok(!existsSync(layout.plantedRanFile), "a planted extension ran");
     assert.equal((globalThis as Record<string, unknown>).__REVIEW_BOT_PLANTED__, plantedBefore);
@@ -439,13 +494,13 @@ describe(`isolated step on the hostile snapshot, ${variant}`, () => {
   });
 
   test("the model is offered exactly the allowlist", () => {
-    const allow = [...READ, noteTool.name, ...(withPackages ? ["fixture_lookup"] : [])].sort();
+    const allow = [...READ, noteTool.name, ...(withPackages ? ["fixture_lookup"] : []), ...(withCodemode ? ["codemode"] : [])].sort();
     assert.deepEqual([...result.harness.tools].sort(), allow);
     assert.deepEqual(declaredToolsIn(contexts[0]), allow);
   });
 
   test("no context file, system-prompt file, skill or prompt reaches the model", () => {
-    assert.ok(contexts.length === 4);
+    assert.ok(contexts.length === turns);
     contexts.forEach((c, i) => assertNoCanary(JSON.stringify(c), `request ${i + 1}`));
     const first = JSON.stringify(contexts[0]);
     assert.ok(first.includes("You review code."), "our system prompt is missing");
@@ -470,7 +525,7 @@ describe(`isolated step on the hostile snapshot, ${variant}`, () => {
       assert.equal(seen.isError, true, `${id} was not blocked: ${seen.text}`);
       assert.ok(seen.text.includes(OUTSIDE), `${id}: ${seen.text}`);
     }
-    const guarded = result.rejectedCalls.filter((r) => r.kind === "guard").map((r) => r.toolCallId);
+    const guarded = result.rejectedCalls.filter((r) => r.kind === "guard" && !r.toolCallId.startsWith(`${SCRIPT_ID}/`)).map((r) => r.toolCallId);
     assert.deepEqual(guarded.sort(), escapes.map(([id]) => id).sort());
     // The marker is in some call arguments (grep patterns); check what came back.
     for (const c of contexts) {
@@ -532,6 +587,7 @@ describe(`isolated step on the hostile snapshot, ${variant}`, () => {
 
 hostileStepSuite("bot only");
 hostileStepSuite("with packages");
+hostileStepSuite("with packages and codemode");
 
 describe("with packages: what the modules did", () => {
   test("a replaced read is confined and given paths in head; the hook ran; an unconfigured tool did not", () => {

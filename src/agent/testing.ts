@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DefaultResourceLoader, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { EXTENSION_NAME } from "../../pi-review/extension/index.ts";
 import type { OutputTool } from "./types.ts";
 
 const PACKAGES = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "packages");
@@ -298,13 +299,18 @@ export async function withTestExtension<T>(extension: ExtensionFactory, body: ()
   const reload = proto.reload;
   proto.reload = function (this: DefaultResourceLoader, ...args: Parameters<typeof reload>) {
     const loader = this as unknown as { extensionFactories: Array<{ name: string; factory: ExtensionFactory }> };
-    loader.extensionFactories = loader.extensionFactories.map(({ name, factory }) => ({
-      name,
-      factory: async (pi) => {
-        await factory(pi);
-        await extension(pi);
-      },
-    }));
+    // Only the bot's own factory: the step also passes pi's codemode extension.
+    loader.extensionFactories = loader.extensionFactories.map(({ name, factory }) =>
+      name !== EXTENSION_NAME
+        ? { name, factory }
+        : {
+            name,
+            factory: async (pi) => {
+              await factory(pi);
+              await extension(pi);
+            },
+          },
+    );
     return reload.apply(this, args);
   };
   try {

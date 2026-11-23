@@ -16,6 +16,9 @@ import { Type, type Static } from "typebox";
 
 export const SAVED_SCRIPTS_SCHEMA_VERSION = 1;
 
+/** The file's name, next to the run record (A-6). */
+export const SAVED_SCRIPTS_FILE = "scripts.json";
+
 /** The tool whose calls are scripts. */
 const SCRIPT_TOOL = "codemode";
 

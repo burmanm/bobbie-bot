@@ -15,6 +15,8 @@ import { join, resolve } from "node:path";
 import { Value } from "typebox/value";
 import type { AgentStep, AgentStepResult, ModelRef, ModuleTool, OutputTool, QueryTool, ReadRoots } from "../agent/index.ts";
 import { PI_VERSION, RUN_DEADLINE } from "../agent/index.ts";
+import { scrubSecrets } from "../../pi-review/extension/query-tools.ts";
+import { SAVED_SCRIPTS_FILE, ScriptCollector } from "../core/saved-scripts.ts";
 import {
   applyVerdict,
   BOT_VERSION,
@@ -62,6 +64,7 @@ import {
 import { type AgentSettings, modelsJsonSha256, NO_AGENT_SETTINGS, resolveRoleTools } from "./agent-settings.ts";
 import { type InstalledPackage, SetupConfigError, verifyInstalled } from "../setup/index.ts";
 import {
+  CODEMODE,
   type ConfigInputs,
   ConfigError,
   type EnabledModel,
@@ -151,6 +154,8 @@ export interface ReviewRunResult {
   publication?: Publication;
   record?: RunRecord;
   recordPath?: string;
+  /** `scripts.json` next to the record, when a step ran a codemode script (A-6). */
+  scriptsPath?: string;
 }
 
 export interface RecheckOutcome {
@@ -222,6 +227,8 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
   let modelsJsonHash: string | undefined;
   /** The operator's packages, as installed (F-7, A-6); set once checked. */
   let installedPackages: InstalledPackage[] | undefined;
+  /** Every codemode script the run's steps executed, scrubbed (A-6 `scripts.json`, F-7). */
+  const savedScripts = new ScriptCollector(scrubSecrets);
   /** Tools from packages that were active in some step, for the summary (F-7). */
   const extraTools: ModuleTool[] = [];
   let partialNote: string | undefined;
@@ -346,7 +353,8 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     const maxCostUsd = Math.min(roleLimits.maxCostUsd ?? Infinity, remaining);
     const tools = roleTools[role] ?? new Set(ROLE_DEFAULT_TOOLS);
     const queryTools = (req.queryTools ?? []).filter((t) => tools.has(t.name));
-    const moduleTools = [...tools].filter((t) => !ROLE_DEFAULT_TOOLS.includes(t));
+    const moduleTools = [...tools].filter((t) => !ROLE_DEFAULT_TOOLS.includes(t) && t !== CODEMODE);
+    const codemode = tools.has(CODEMODE);
     let lastBeat = 0;
     const t = performance.now();
     const result = await o.agentStep.run({
@@ -359,6 +367,15 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       outputTools: req.outputTools,
       ...(queryTools.length === 0 ? {} : { queryTools }),
       ...(moduleTools.length === 0 ? {} : { moduleTools }),
+      ...(codemode
+        ? {
+            codemode: true,
+            scripts: {
+              record: (event) => savedScripts.record(stepName, event),
+              scriptIdOf: (parent) => savedScripts.scriptIdOf(stepName, parent),
+            },
+          }
+        : {}),
       limits: { ...roleLimits, maxCostUsd },
       signal: runSignal,
       onProgress: (p) => {
@@ -462,10 +479,11 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     if (config.limits.runTimeoutMs !== deadlineMs) armDeadline(config.limits.runTimeoutMs);
     for (const role of PIPELINE_ROLES) {
       const tools = resolveRoleTools(config.tools[role], ROLE_DEFAULT_TOOLS);
-      // F-7: other names are tools of the listed packages; each step refuses
-      // one that no loaded package registers. Codemode is R-1a step 5b.
-      const unknown = tools.filter((t) => !ROLE_DEFAULT_TOOLS.includes(t));
-      if (unknown.includes("codemode")) throw new ConfigError(`reviewBot.roles.${role}.tools in settings.json names codemode, which this version does not provide yet (R-1a step 5b)`);
+      // F-7: codemode is pi's (R-1a step 5b); other names are tools of the
+      // listed packages, and each step refuses one that no loaded package
+      // registers.
+      const unknown = tools.filter((t) => !ROLE_DEFAULT_TOOLS.includes(t) && t !== CODEMODE);
+      if (tools.includes(CODEMODE)) log(`S-1 codemode enabled for the ${role} role`);
       if (unknown.length > 0 && settings.packages.length === 0) {
         throw new ConfigError(`reviewBot.roles.${role}.tools in settings.json names ${unknown.join(", ")}, but no packages are listed; the bot offers ${ROLE_DEFAULT_TOOLS.join(", ")}`);
       }
@@ -671,6 +689,8 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
               fingerprintVersion: FINGERPRINT_VERSION,
               source: `reviewer:${chunk.name}`,
               status: "proposed",
+              // A-6: reported from inside a saved codemode script.
+              ...(out.scriptId === undefined ? {} : { scriptId: out.scriptId }),
             });
             break;
           }
@@ -895,6 +915,17 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     } catch (e) {
       // Recording failures never affect the review (S-8).
       log(`S-8 record failed: ${errorMessage(e)}`);
+    }
+    try {
+      // A-6: next to the record, uploaded with it. Compact JSON: the size cap is measured on it.
+      const scripts = savedScripts.file();
+      if (scripts !== undefined && runDir !== undefined) {
+        out.scriptsPath = join(runDir, SAVED_SCRIPTS_FILE);
+        writeFileSync(out.scriptsPath, JSON.stringify(scripts) + "\n");
+        log(`S-8 scripts ${out.scriptsPath}: ${scripts.scripts.length} saved${scripts.droppedScripts > 0 ? `, ${scripts.droppedScripts} over the size cap` : ""}`);
+      }
+    } catch (e) {
+      log(`S-8 scripts failed: ${errorMessage(e)}`);
     }
     return out;
   }

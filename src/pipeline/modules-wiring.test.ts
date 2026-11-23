@@ -117,7 +117,6 @@ test("no packages, no extra tools in the summary or the record", async () => {
 
 for (const [name, settings, pattern] of [
   ["a tool name without any package", { reviewBot: { roles: { reviewer: { tools: ["+fixture_lookup"] } } } }, /names fixture_lookup, but no packages are listed/],
-  ["codemode, with packages (R-1a step 5b)", { packages: [FIXTURE_PACKAGES.tool], reviewBot: { roles: { reviewer: { tools: ["+codemode"] } } } }, /codemode, which this version does not provide yet/],
   ["a package that is not installed", { packages: ["npm:fixture-pi-missing@1.0.0"] }, /not installed .*review-bot setup/],
 ] as const) {
   test(`configuration error before any step: ${name}`, async () => {

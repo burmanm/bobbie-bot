@@ -128,7 +128,23 @@ describe("checkToolCall", () => {
     assert.equal(guard(call("read", { path: "a.txt" })), undefined);
     assert.equal(guard(call("read", { path: "../secret.txt" }))?.block, true);
   });
-  test("nested calls are refused", () => {
-    assert.match(checkToolCall(call("read", { path: "a.txt" }, "p"), options()) ?? "", /from another tool/);
+  test("nested calls get the same checks (F-7 Codemode, H-21, H-23)", () => {
+    assert.equal(checkToolCall(call("read", { path: "a.txt" }, "p"), options()), undefined);
+    assert.equal(checkToolCall(call("grep", { pattern: "x" }, "p/1"), options()), undefined);
+    assert.match(checkToolCall(call("read", { path: "../secret.txt" }, "p"), options()) ?? "", /outside/);
+    assert.match(checkToolCall(call("read", { path: join(work, "secret.txt") }, "p"), options()) ?? "", /outside/);
+    assert.match(checkToolCall(call("bash", { command: "env" }, "p"), options()) ?? "", /not on this step's allowlist/);
+    assert.match(checkToolCall(call("ls", {}, "p"), options()) ?? "", /not on this step's allowlist/);
+  });
+  test("no tool may start a script, even with codemode allowed", () => {
+    const allowed = { ...options(), allowedTools: new Set(["read", "codemode"]) };
+    assert.equal(checkToolCall(call("codemode", { code: "return 1" }), allowed), undefined);
+    assert.match(checkToolCall(call("codemode", { code: "return 1" }, "p"), allowed) ?? "", /from another tool/);
+  });
+  test("a replaced path tool is handed the checked path when called from a script too", () => {
+    const guard = createToolCallGuard({ ...options(), replaced: () => new Set(["read"]) });
+    const event = call("read", { path: "a.txt" }, "p/1") as { input: { path: string } };
+    assert.equal(guard(event as never), undefined);
+    assert.equal(event.input.path, join(roots.head, "a.txt"));
   });
 });

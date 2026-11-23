@@ -10,7 +10,9 @@ backed by the pi SDK; the guard and tools it loads live in
 | `pi-sdk-step.ts` | The pi SDK implementation: isolation and the neutral working directory (C-3a, D-15), limits (F-3), usage (A-6) |
 | `modules.ts` | The operator's listed packages for a step: checked offline, resolved with pi's package manager, every resource outside the read roots (F-7) |
 | `model-runtime.ts` | pi's model runtime: pi's catalog plus the operator's `models.json` (F-7), credentials and catalog cache in memory, offline |
-| `accounting.ts` | Usage sums and the turn and spend caps, pure |
+| `accounting.ts` | Usage sums and the turn and spend caps, pure; tool-result usage at any depth (F-7 Codemode) |
+| `replay-script.ts` | Replays a saved codemode script from `scripts.json` against a snapshot, without a model (A-6, R-6) |
+| `codemode.test.ts` | Codemode in a step: injected script, nested cost cap, endless scripts, saved scripts and replay (R-1a step 5b) |
 | `fixtures/packages/` | Local fixture pi packages: provider, tool, hooks, a `read` replacement, an output-tool replacement; tests only |
 | `modules.test.ts` | Loading those packages into a real step, and what is refused before loading |
 | `testing.ts` | Hostile snapshot fixture, working-directory payloads and a module that would trigger them, scripted-model helpers; tests only |
@@ -22,7 +24,7 @@ backed by the pi SDK; the guard and tools it loads live in
 | `limits.ts` | `RUN_DEADLINE`: the abort reason that stops a step as a run-deadline timeout |
 | `timeouts.test.ts` | Step timeout, inactivity, run deadline, hung provider, hung tool call, query tools |
 | `routed-step.ts` | Sends `acp/<agent>` models to the ACP step, everything else to pi |
-| `isolation.test.ts` | The mandatory isolation regression test (C-3a). Run it on every pi upgrade |
+| `isolation.test.ts` | The mandatory isolation regression test (C-3a), also with packages and codemode enabled. Run it on every pi upgrade |
 
 ## Changes from the interface proposed in spike-r0-findings.md
 
@@ -262,7 +264,26 @@ loads.
   guard, only when named; a name that neither the bot nor a loaded package
   registers is a `config` error, pi's own built-ins (`bash`, `write`, ...)
   included. Two packages registering a tool the role names is a `config`
-  error. Nested calls are still refused (codemode is R-1a step 5b).
+  error. A tool may call other tools (`ctx.executeTool`, codemode): each
+  nested call gets the same guard, allowlist and path checks, and none may
+  start a script.
+- **Codemode** (F-7, R-1a step 5b). pi's codemode extension is passed in
+  every session, after the packages and before ours, registered inactive;
+  `AgentStepRequest.codemode` activates the `codemode` tool. Its mode and
+  inline budget come from pi's `codemode` key in settings.json
+  (`PiSdkAgentStepOptions.codemode`); scripts get pi's `models` API only with
+  `reviewBot.codemode.models: true`. Scripts have no file system, network
+  or process; their tool calls pass the guard (above). Usage a tool result
+  reports, at any depth, counts toward the totals and `maxCostUsd` when the
+  call ends, so a script's nested spend stops the step mid-turn
+  (`stoppedBy: "cost"`). Scripts have no deadline of their own: the step's
+  idle and step timeouts abort them, which stops their worker.
+  `usageComplete` is false when a script's model call went unreported or a
+  tool call never ended. Every tool execution start and end goes to
+  `AgentStepRequest.scripts`, the run's `scripts.json` collector (A-6), and
+  an output made from a script carries its `scriptId`.
+  `replaySavedScript` (`replay-script.ts`) runs a saved script again, through
+  the same step, from a scripted model.
 - **Replacing the bot's tools.** Packages load before our extension and pi
   keeps the first registration of a name, so a package tool named `read`,
   `report_finding` and so on replaces ours. pi reports each such conflict
