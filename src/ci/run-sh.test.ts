@@ -30,7 +30,7 @@ for a in "$@"; do
   if [[ "$prev" == -v && "$a" == *:/agent-out ]]; then mkdir -p "\${a%:/agent-out}/dir"; fi
   prev="$a"
 done
-[[ " $* " == *" review --pr "* ]] && exit "\${FAKE_EXIT:-0}"
+[[ " $* " == *" launch --pr "* ]] && exit "\${FAKE_EXIT:-0}"
 exit 0
 `;
 const FAKE_TIMEOUT = `#!/usr/bin/env bash
@@ -134,7 +134,8 @@ test("review: extraction offline and keyless; the review gets the snapshot read-
   for (const f of ["--cap-drop", "--read-only", "--security-opt"]) assert.ok(review.includes(f), f);
   const cli = review.slice(review.indexOf("review-bot-action:local") + 1);
   assert.deepEqual(cli, [
-    "review", "--pr", "k8ssandra/cass-operator#1021", "--snapshot-dir", "/snapshot", "--runs-dir", "/runs", "--name", "main",
+    // The pi command /review-bot through the launcher (F-3), not the plain CLI.
+    "launch", "--pr", "k8ssandra/cass-operator#1021", "--snapshot-dir", "/snapshot", "--runs-dir", "/runs", "--name", "main",
     "--model", "reviewer=openrouter/vendor/model-a", "--model", "verifier=openrouter/vendor/model-b", "--thinking", "verifier=low", "--max-cost", "3",
     // 30 min step: container stopped at 29 min, run deadline at most 2 min inside that (S-9).
     "--max-run-timeout", "1620s",
@@ -259,7 +260,7 @@ test("agent directory (F-7): the gate fetches it from the default branch or a pi
   }
 });
 
-test("agent directory (F-7): the review mounts the gate's copy read-only and never fetches; without it the step fails", async () => {
+test("agent directory (F-7): the review unpacks the setup job's archive offline and mounts it read-only; never fetches; without it the step fails", async () => {
   const mk = () => {
     const s = setup();
     mkdirSync(join(s.dir, "review-bot", "in"), { recursive: true });
@@ -267,19 +268,65 @@ test("agent directory (F-7): the review mounts the gate's copy read-only and nev
     return s;
   };
   const s = mk();
+  mkdirSync(join(s.dir, "review-bot", "agent-in"), { recursive: true });
+  writeFileSync(join(s.dir, "review-bot", "agent-in", "agent-dir.tar.gz"), "");
+  // The gate's copy is not what the review uses, even when present.
   mkdirSync(join(s.dir, "review-bot", "agent", "dir"), { recursive: true });
-  const r = await run(s, { RB_COMMAND: "review", RB_PR: "5", RB_AGENT_DIR: ".github/review-bot" });
+  const r = await run(s, { RB_COMMAND: "review", RB_PR: "5", RB_AGENT_DIR: ".github/review-bot", OPENROUTER_API_KEY: "sk-or-secret" });
   assert.equal(r.code, 0, r.stderr);
-  assert.ok(!r.calls.some((c) => c.includes("fetch-agent-dir")));
-  const review = r.calls.filter((c) => c[0] === "run")[1]!;
-  assert.ok(flagValues(review, "-v").includes(`${join(s.dir, "review-bot", "agent", "dir")}:/agent:ro`));
+  assert.ok(!r.calls.some((c) => c.includes("fetch-agent-dir") || c.includes("setup")));
+  const runs = r.calls.filter((c) => c[0] === "run");
+  assert.equal(runs.length, 3);
+  const unpack = runs.find((c) => c.includes("unpack-agent-dir"))!;
+  assert.deepEqual(flagValues(unpack, "--network"), ["none"]);
+  assert.ok(!flagValues(unpack, "-e").some((e) => e.startsWith("GH_TOKEN") || e.startsWith("OPENROUTER")));
+  assert.ok(flagValues(unpack, "-v").includes(`${join(s.dir, "review-bot", "agent-in")}:/in:ro`));
+  assert.deepEqual(unpack.slice(unpack.indexOf("unpack-agent-dir")), ["unpack-agent-dir", "--archive", "/in/agent-dir.tar.gz", "--dest", "/out"]);
+  const review = runs.at(-1)!;
+  assert.ok(review.includes("launch"));
+  assert.ok(flagValues(review, "-v").includes(`${join(s.dir, "review-bot", "agent-installed", "agent")}:/agent:ro`));
+  assert.ok(!flagValues(review, "-v").some((v) => v.startsWith(join(s.dir, "review-bot", "agent", "dir"))));
   assert.deepEqual(flagValues(review, "--agent-dir"), ["/agent"]);
   assert.deepEqual(flagValues(review, "--max-run-timeout"), ["2220s"], "a ceiling, so lower configured values apply");
   assert.ok(!review.includes("--run-timeout"));
 
   const missing = await run(mk(), { RB_COMMAND: "review", RB_PR: "5", RB_AGENT_DIR: ".github/review-bot" });
   assert.equal(missing.code, 2);
-  assert.match(missing.stderr, /agent-dir is set but .* is missing/);
+  assert.match(missing.stderr, /agent-dir is set but .*agent-dir\.tar\.gz is missing/);
   const thinking = await run(mk(), { RB_COMMAND: "review", RB_PR: "5", RB_THINKING: "reviewer=xhigh\nverifier=max" });
   assert.equal(thinking.code, 0, thinking.stderr);
+});
+
+test("setup (F-7, C-4): installs with network but no token or key, under /agent with the review's read roots, then packs offline", async () => {
+  const s = setup();
+  const agent = join(s.dir, "review-bot", "agent", "dir");
+  mkdirSync(agent, { recursive: true });
+  const r = await run(s, { RB_COMMAND: "setup", RB_AGENT_DIR: ".github/review-bot", OPENROUTER_API_KEY: "sk-or-secret" });
+  assert.equal(r.code, 0, r.stderr);
+  const runs = r.calls.filter((c) => c[0] === "run");
+  assert.equal(runs.length, 2);
+  const [install, pack] = runs as [string[], string[]];
+  for (const c of runs) {
+    // No token and no key in either container, by name or by value.
+    assert.deepEqual(flagValues(c, "-e"), ["HOME=/tmp"]);
+    assert.ok(!c.join(" ").includes("ghs_secret") && !c.join(" ").includes("sk-or-secret"));
+    for (const f of ["--cap-drop", "--read-only", "--security-opt", "--init"]) assert.ok(c.includes(f), f);
+  }
+  // Installers need the network; the pack step does not get it.
+  assert.deepEqual(flagValues(install, "--network"), []);
+  assert.deepEqual(flagValues(pack, "--network"), ["none"]);
+  assert.deepEqual(flagValues(install, "-v"), [`${agent}:/agent`]);
+  assert.deepEqual(install.slice(install.indexOf("review-bot-action:local") + 1), ["setup", "--agent-dir", "/agent", "--read-root", "/snapshot", "--read-root", "/runs"]);
+  assert.deepEqual(flagValues(pack, "-v"), [`${agent}:/in/agent:ro`, `${join(s.dir, "review-bot", "agent-out")}:/out`]);
+  assert.deepEqual(flagValues(pack, "--entrypoint"), ["tar"]);
+  const tarArgs = pack.slice(pack.indexOf("review-bot-action:local") + 1);
+  assert.ok(tarArgs.includes("--hard-dereference"), "the review's extractor refuses hard links");
+  assert.deepEqual(tarArgs.slice(-3), ["--directory", "/in", "agent"]);
+  assert.ok(tarArgs.includes("/out/agent-dir.tar.gz"));
+
+  assert.equal((await run(setup(), { RB_COMMAND: "setup" })).code, 2, "no agent-dir");
+  const missing = await run(setup(), { RB_COMMAND: "setup", RB_AGENT_DIR: ".github/review-bot" });
+  assert.equal(missing.code, 2);
+  assert.equal(missing.calls.filter((c) => c[0] === "run").length, 0);
+  assert.equal((await run(setup(), { RB_COMMAND: "setup", RB_AGENT_DIR: "../x" })).code, 2);
 });

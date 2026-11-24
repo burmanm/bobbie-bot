@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { parse } from "yaml";
+import { SAVED_SCRIPTS_FILE } from "../core/saved-scripts.ts";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
@@ -86,7 +87,9 @@ test("no default token permissions; each job gets exactly its C-4 set", () => {
   assert.deepEqual(wf.jobs["remove-label"]!.permissions, { "pull-requests": "write" });
   assert.deepEqual(wf.jobs.prepare!.permissions, { contents: "read" });
   assert.deepEqual(wf.jobs.review!.permissions, { "pull-requests": "write", checks: "write" });
-  assert.deepEqual(Object.keys(wf.jobs).sort(), ["gate", "prepare", "remove-label", "review"]);
+  // F-7, C-4: the job that downloads packages gets no token permissions at all.
+  assert.deepEqual(wf.jobs.setup!.permissions, {});
+  assert.deepEqual(Object.keys(wf.jobs).sort(), ["gate", "prepare", "remove-label", "review", "setup"]);
 });
 
 test("concurrency per PR with cancel-in-progress (S-9); unrelated label events cancel nothing; C-9 events queue per SHA", () => {
@@ -127,10 +130,14 @@ test("no expression is interpolated into a shell script (script injection)", () 
   for (const s of action.runs.steps) assert.ok(s.run === undefined || !s.run.includes("${{"), String(s.name));
 });
 
-test("secrets: only the review job has the model key; prepare holds nothing", () => {
+test("secrets: only the review job has the model key; prepare and setup hold nothing", () => {
   const secretsIn = (job: Job) => JSON.stringify(job).match(/secrets\.[A-Z_]+/g) ?? [];
-  assert.deepEqual(secretsIn(wf.jobs.prepare!), []);
-  assert.ok(!JSON.stringify(wf.jobs.prepare).includes("steps.app"));
+  for (const name of ["prepare", "setup"]) {
+    assert.deepEqual(secretsIn(wf.jobs[name]!), [], name);
+    assert.ok(!JSON.stringify(wf.jobs[name]).includes("steps.app"), name);
+  }
+  // setup gets no GitHub token either (F-7, C-4).
+  assert.ok(!/token/i.test(JSON.stringify(wf.jobs.setup)));
   for (const name of ["gate", "remove-label"]) {
     assert.deepEqual([...new Set(secretsIn(wf.jobs[name]!))], ["secrets.REVIEW_BOT_APP_PRIVATE_KEY"], name);
   }
@@ -145,6 +152,7 @@ test("both identities (C-5): every token is the App token when configured, else 
     if (!s.uses || !ACTION.test(s.uses)) continue;
     const token = s.with?.token;
     if (job === "prepare") assert.equal(token, "${{ github.token }}");
+    else if (job === "setup") assert.equal(token, undefined);
     else assert.equal(token, "${{ steps.app.outputs.token || github.token }}", `${job}/${s.name}`);
   }
   for (const [job, s] of allSteps()) {
@@ -160,6 +168,8 @@ test("S-8, S-9: the check is completed and the record uploaded on every exit pat
   const record = steps.find((s) => String(s.with?.name ?? "").startsWith("review-bot-record-"))!;
   assert.equal(record.if, "always()");
   assert.match(String(record.with?.path), /runs\/\*\/\*\.json$/);
+  // scripts.json sits next to 08-record.json in runs/run-<id>/, so the same glob uploads it (A-6, F-7).
+  assert.match(SAVED_SCRIPTS_FILE, /^[^/]+\.json$/);
   assert.equal(wf.jobs.review!.if, "${{ !cancelled() && needs.gate.outputs.review == 'true' }}");
   assert.ok(steps.indexOf(complete) > steps.findIndex((s) => s.id === "review"));
   // A check the gate completes itself leaves a record too (R-2 exit).
@@ -199,6 +209,26 @@ test("the image: pinned base by digest, pinned checksummed tools, npm ci --ignor
   assert.doesNotMatch(instructions, /apt-get|curl|wget/);
   assert.match(docker, /npm ci --ignore-scripts/);
   assert.match(docker, /PI_OFFLINE=1/);
+  // The real node by absolute path, so SIGTERM reaches review-bot launch (F-3, S-9).
+  assert.match(docker, /^ENTRYPOINT \["\/usr\/local\/bin\/node", "\/opt\/review-bot\/src\/cli\/main\.ts"\]$/m);
+  // git (F-7 setup): pinned .debs from snapshot.debian.org with SHA-256, installed by dpkg from a bind mount.
+  assert.match(docker, /fetch-debs\.mjs \/build\/debs\.json/);
+  assert.match(docker, /--mount=type=bind,from=tools,source=\/build\/debs,target=\/debs/);
+  const debs = JSON.parse(read("action/debs.json")) as { snapshot: string; debs: Record<string, Array<{ name: string; version: string; url: string; sha256: string }>> };
+  assert.deepEqual(Object.keys(debs.debs).sort(), ["arm64", "x64"]);
+  for (const list of Object.values(debs.debs)) {
+    assert.ok(list.some((d) => d.name === "git"));
+    for (const d of list) {
+      assert.match(d.sha256, /^[0-9a-f]{64}$/);
+      assert.ok(d.url.startsWith(`https://snapshot.debian.org/archive/debian`) && d.url.includes(`/${debs.snapshot}/pool/`), d.url);
+      assert.match(d.url, /\.deb$/);
+    }
+    assert.equal(new Set(list.map((d) => d.name)).size, list.length);
+  }
+  // The same package set on both architectures.
+  assert.deepEqual(debs.debs.x64!.map((d) => d.name), debs.debs.arm64!.map((d) => d.name));
+  const ignore = read("action/Dockerfile.dockerignore");
+  for (const f of ["action/debs.json", "action/fetch-debs.mjs"]) assert.match(ignore, new RegExp(`^!${f.replace(".", "\\.")}$`, "m"));
   const tools = JSON.parse(read("action/tools.json")) as { tools: Array<{ name: string; version: string; assets: Record<string, { url: string; sha256: string; member: string }> }> };
   assert.deepEqual(tools.tools.map((t) => t.name).sort(), ["fd", "gh", "rg"]);
   for (const t of tools.tools) {
@@ -213,7 +243,7 @@ test("the image: pinned base by digest, pinned checksummed tools, npm ci --ignor
 });
 
 test("shell scripts parse", () => {
-  for (const f of ["action/prepare.sh", "action/run.sh"]) execFileSync("bash", ["-n", join(ROOT, f)]);
+  for (const f of ["action/prepare.sh", "action/run.sh", "action/update-debs.sh"]) execFileSync("bash", ["-n", join(ROOT, f)]);
 });
 
 test("the image publish workflow (C-4): manual, default branch only, pinned, provenance and attestation", () => {
@@ -251,10 +281,33 @@ test("the agent directory (F-7, D-19): fetched by the gate, never from the PR, h
   assert.match(String(upload.if), /vars\.REVIEW_BOT_AGENT_DIR != ''/);
   assert.match(String(upload.with?.path), /review-bot\/agent\/dir$/);
 
+  // .npmrc is hidden, and upload-artifact skips hidden files by default.
+  assert.equal(upload.with?.["include-hidden-files"], true);
+
+  // The setup job installs its packages (F-7, C-4) and hands on an archive.
+  const setupJob = wf.jobs.setup!;
+  assert.equal(setupJob.needs, "gate");
+  assert.equal(setupJob.if, "needs.gate.outputs.review == 'true' && vars.REVIEW_BOT_AGENT_DIR != ''");
+  const fromGate = setupJob.steps.find((s) => s.with?.name === "review-bot-agent-dir")!;
+  assert.ok(fromGate.uses?.startsWith("actions/download-artifact@"));
+  assert.match(String(fromGate.with?.path), /review-bot\/agent\/dir$/);
+  const install = setupJob.steps.find((s) => s.with?.command === "setup")!;
+  assert.equal(install.with?.["agent-dir"], "${{ vars.REVIEW_BOT_AGENT_DIR }}");
+  assert.deepEqual(Object.keys(install.with ?? {}).sort(), ["agent-dir", "command", "image"]);
+  const handOn = setupJob.steps.find((s) => s.with?.name === "review-bot-agent-installed")!;
+  assert.ok(handOn.uses?.startsWith("actions/upload-artifact@"));
+  assert.match(String(handOn.with?.path), /review-bot\/agent-out\/agent-dir\.tar\.gz$/);
+  assert.ok(setupJob.steps.indexOf(fromGate) < setupJob.steps.indexOf(install) && setupJob.steps.indexOf(install) < setupJob.steps.indexOf(handOn));
+
+  // The review job takes the setup job's result, never the gate's copy, and downloads nothing else.
+  assert.deepEqual(wf.jobs.review!.needs, ["gate", "prepare", "setup"]);
   const review = wf.jobs.review!.steps;
-  const download = review.find((s) => s.with?.name === "review-bot-agent-dir")!;
+  assert.ok(!review.some((s) => s.with?.name === "review-bot-agent-dir"));
+  const download = review.find((s) => s.with?.name === "review-bot-agent-installed")!;
   const reviewStep = review.find((s) => s.id === "review")!;
   assert.ok(download.uses?.startsWith("actions/download-artifact@"));
+  assert.match(String(download.with?.path), /review-bot\/agent-in$/);
+  assert.equal(download.if, "vars.REVIEW_BOT_AGENT_DIR != ''");
   assert.ok(review.indexOf(download) < review.indexOf(reviewStep));
   assert.equal(reviewStep.with?.["agent-dir"], "${{ vars.REVIEW_BOT_AGENT_DIR }}");
   assert.equal(reviewStep.with?.["agent-dir-repo"], undefined, "only the gate fetches");

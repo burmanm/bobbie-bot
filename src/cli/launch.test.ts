@@ -216,6 +216,27 @@ export default function (pi) {
     }
   });
 
+  test("a module that leaves a timer behind does not hold pi after the run (R-1a step 6)", async () => {
+    // Seen with a real package in the action image: the review finished and
+    // pi stayed up until the job's time limit.
+    const agentDir = fresh("lingering-agent");
+    const pkg = join(agentDir, "lingering");
+    mkdirSync(pkg);
+    writeFileSync(join(pkg, "package.json"), JSON.stringify({ name: "fixture-pi-lingering", version: "1.0.0", type: "module", pi: { extensions: ["./index.js"] } }));
+    writeFileSync(join(pkg, "index.js"), "export default function () { setInterval(() => {}, 1000); }\n");
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ packages: ["./lingering"] }));
+    const dir = fresh("lingering");
+    const started = Date.now();
+    const launcher = spawnLauncher([...fixtureArgs(dir), "--agent-dir", agentDir]);
+    const timer = setTimeout(() => launcher.child.kill("SIGKILL"), 60_000);
+    const result = await launcher.exited;
+    clearTimeout(timer);
+    assert.equal(result.code, 0, result.stderr);
+    assert.ok(Date.now() - started < 45_000, "ended after the grace period, not at a time limit");
+    assert.match(result.stderr, /pi had not exited 5s after the run/);
+    assert.equal(JSON.parse(readFileSync(join(dir, "out.json"), "utf8")).check_run.conclusion, "success");
+  });
+
   test("row 8: --no-approve and an empty working directory; the caller's project is not loaded", async () => {
     const launch = prepareLaunch(fixtureArgs(fresh("trust-args")));
     try {

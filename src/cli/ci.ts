@@ -9,11 +9,13 @@
  *   review-bot unpack-snapshot  extract the prepared snapshot artifact safely
  *   review-bot fetch-agent-dir  copy the operator's agent directory from the
  *                               default branch or a pinned commit (F-7)
+ *   review-bot unpack-agent-dir extract the agent directory with its packages
+ *                               installed by the setup job (F-7, C-4)
  *
  * The GitHub token comes from GH_TOKEN (or GITHUB_TOKEN) and is never
  * printed. Exit codes: 0 done, 1 failed, 2 usage error.
  */
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { completeIfUnfinished } from "../ci/check.ts";
@@ -25,9 +27,13 @@ import { type AgentSettings, ConfigError, readAgentSettings } from "../pipeline/
 import { Github, type Fetch } from "../ci/github.ts";
 import { unpackSnapshot } from "../ci/snapshot.ts";
 import { fetchAgentDir } from "../ci/agent-dir.ts";
+import { unpackTarGz } from "../ci/tar.ts";
 import type { Io } from "./main.ts";
 
-export const CI_COMMANDS = ["gate", "complete-check", "remove-label", "unpack-snapshot", "fetch-agent-dir"] as const;
+/** The one top-level entry of the setup job's archive (action/run.sh `setup`). */
+export const AGENT_ARCHIVE_TOP = "agent";
+
+export const CI_COMMANDS = ["gate", "complete-check", "remove-label", "unpack-snapshot", "fetch-agent-dir", "unpack-agent-dir"] as const;
 export type CiCommand = (typeof CI_COMMANDS)[number];
 
 export const CI_USAGE = `CI commands (used by the action; see docs/installing.md):
@@ -42,6 +48,10 @@ export const CI_USAGE = `CI commands (used by the action; see docs/installing.md
   review-bot fetch-agent-dir --path P --dest D [--repo o/r] [--ref SHA]
                   The agent directory P of o/r at the default branch's head,
                   or at the pinned commit SHA; never from a PR (F-7, D-19)
+  review-bot unpack-agent-dir --archive F --dest D [--max-gb N]
+                  The setup job's archive of the agent directory with its
+                  packages installed (one top-level agent/), extracted with
+                  the snapshot's validating extractor (F-7, C-4)
 
 Defaults come from the Actions environment (GITHUB_REPOSITORY,
 GITHUB_EVENT_NAME, GITHUB_EVENT_PATH, GITHUB_OUTPUT, GITHUB_API_URL). The
@@ -276,6 +286,19 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
         const gh = github(env, a.repo, deps.fetch);
         const got = await fetchAgentDir(gh, { path: a.path, dest: resolve(a.dest), ...(ref === undefined ? {} : { ref }) });
         log(`agent directory ${a.path} from ${got.repo}@${got.sha}${got.branch === undefined ? " (pinned)" : ` (default branch ${got.branch})`}: ${got.files} files, ${got.bytes} bytes`);
+        return 0;
+      }
+      case "unpack-agent-dir": {
+        const a = parseArgs({ args: argv, options: { archive: { type: "string" }, dest: { type: "string" }, "max-gb": { type: "string" } }, strict: true }).values;
+        if (a.archive === undefined || a.dest === undefined) throw new UsageError("--archive and --dest are required");
+        const gb = a["max-gb"] === undefined ? 4 : Number(a["max-gb"]);
+        if (!(gb > 0)) throw new UsageError(`invalid --max-gb: ${a["max-gb"]}`);
+        const dest = resolve(a.dest);
+        // Same rules as the snapshot: no hard links or devices, no `..`, nothing
+        // written through a symlink, files read-only and never executable.
+        const stats = await unpackTarGz(resolve(a.archive), dest, { allowedTop: [AGENT_ARCHIVE_TOP], maxBytes: gb * 1024 ** 3 });
+        if (!existsSync(join(dest, AGENT_ARCHIVE_TOP))) throw new Error(`the agent directory archive has no ${AGENT_ARCHIVE_TOP}/ directory`);
+        log(`agent directory with installed packages: ${stats.files} files, ${stats.symlinks} symlinks, ${(stats.bytes / 1024 ** 2).toFixed(1)} MiB`);
         return 0;
       }
       case "unpack-snapshot": {

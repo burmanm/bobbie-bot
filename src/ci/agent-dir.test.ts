@@ -109,6 +109,69 @@ describe("fetch-agent-dir (F-7, D-19)", () => {
   });
 });
 
+describe("unpack-agent-dir: the setup job's archive in the review job (F-7, C-4, R-1a step 6)", () => {
+  const io = (err: string[]) => ({ stdout: () => {}, stderr: (s: string) => void err.push(s) });
+  // As action/run.sh packs it: one top-level agent/, packages installed inside.
+  function archive(build: (agent: string) => void): string {
+    const src = fresh();
+    const agent = join(src, "agent");
+    mkdirSync(agent, { recursive: true });
+    build(agent);
+    const file = join(fresh() + ".tar.gz");
+    const r = spawnSync("tar", ["-czf", file, "-C", src, "agent"], { env: { ...process.env, COPYFILE_DISABLE: "1" } });
+    assert.equal(r.status, 0, String(r.stderr));
+    return file;
+  }
+
+  test("extracts packages, hidden files and symlinks read-only; nothing executable", async () => {
+    const file = archive((agent) => {
+      writeFileSync(join(agent, "settings.json"), '{"packages":["npm:pi-x@1.0.0"]}');
+      writeFileSync(join(agent, ".npmrc"), "ignore-scripts=true\n");
+      const pkg = join(agent, "npm", "node_modules", "pi-x");
+      mkdirSync(join(pkg, "bin"), { recursive: true });
+      writeFileSync(join(pkg, "package.json"), '{"name":"pi-x","version":"1.0.0"}');
+      writeFileSync(join(pkg, "bin", "cli.js"), "#!/usr/bin/env node\n", { mode: 0o755 });
+      mkdirSync(join(agent, "npm", "node_modules", ".bin"));
+      spawnSync("ln", ["-s", "../pi-x/bin/cli.js", join(agent, "npm", "node_modules", ".bin", "pi-x")]);
+      mkdirSync(join(agent, "git", "example.com", "team", "pi-git", ".git"), { recursive: true });
+      writeFileSync(join(agent, "git", "example.com", "team", "pi-git", ".git", "HEAD"), `${"a".repeat(40)}\n`);
+    });
+    const dest = fresh();
+    const err: string[] = [];
+    assert.equal(await runCi("unpack-agent-dir", ["--archive", file, "--dest", dest], io(err), { env: {} }), 0, err.join(""));
+    const agent = join(dest, "agent");
+    assert.equal(readFileSync(join(agent, ".npmrc"), "utf8"), "ignore-scripts=true\n");
+    assert.ok(existsSync(join(agent, "git", "example.com", "team", "pi-git", ".git", "HEAD")), "verifyInstalled reads .git/HEAD");
+    const cli = join(agent, "npm", "node_modules", "pi-x", "bin", "cli.js");
+    assert.equal(statSync(cli).mode & 0o777, 0o444);
+    assert.equal(realpathSync(join(agent, "npm", "node_modules", ".bin", "pi-x")), realpathSync(cli));
+    assert.match(err.join(""), /agent directory with installed packages: \d+ files, 1 symlinks/);
+  });
+
+  test("refuses another top-level entry, a hard link, a non-empty destination; usage errors are 2", async () => {
+    const other = fresh();
+    mkdirSync(join(other, "evil"), { recursive: true });
+    writeFileSync(join(other, "evil", "x"), "");
+    const otherFile = join(fresh() + ".tar.gz");
+    spawnSync("tar", ["-czf", otherFile, "-C", other, "evil"], { env: { ...process.env, COPYFILE_DISABLE: "1" } });
+    const hard = archive((agent) => {
+      writeFileSync(join(agent, "a"), "x");
+      spawnSync("ln", [join(agent, "a"), join(agent, "b")]);
+    });
+    for (const file of [otherFile, hard]) {
+      const err: string[] = [];
+      assert.equal(await runCi("unpack-agent-dir", ["--archive", file, "--dest", fresh()], io(err), { env: {} }), 1, file);
+    }
+    const full = fresh();
+    mkdirSync(full);
+    writeFileSync(join(full, "x"), "");
+    const ok = archive((agent) => writeFileSync(join(agent, "settings.json"), "{}"));
+    assert.equal(await runCi("unpack-agent-dir", ["--archive", ok, "--dest", full], io([]), { env: {} }), 1);
+    assert.equal(await runCi("unpack-agent-dir", ["--archive", ok], io([]), { env: {} }), 2);
+    assert.equal(await runCi("unpack-agent-dir", ["--archive", ok, "--dest", fresh(), "--max-gb", "0"], io([]), { env: {} }), 2);
+  });
+});
+
 describe("gate configuration: defaults, settings, inputs, then the YAML (F-7)", () => {
   const settings = parseAgentSettings(
     JSON.stringify({ reviewBot: { authorization: { label: "s-label", lifetime: "per-pr" }, ci: { require: ["build"], onFailure: "review", timeout: "2h" } } }),
