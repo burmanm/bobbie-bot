@@ -477,25 +477,14 @@ the log and the job summary.
 - With the App identity, `gate` and `remove-label` hold the App private key
   (to mint a scoped token). Neither job runs anything from the PR. With
   `GITHUB_TOKEN` they hold no secret at all.
-- Install the agent directory's packages with `review-bot setup --agent-dir
-  <dir>` in a step that has no secrets (exit 0 installed, 1 an installer
-  failed, 2 usage, 3 configuration). Step 6 adds it to the workflow. A role's
-  `tools` can then name tools those packages provide. A package that replaces
-  one of the bot's tools is recorded in the run record and listed in the
-  review summary. A replacement that reads an argument other than `path` is
-  not confined.
-- Codemode is enabled per role with `"+codemode"` in the agent directory's
-  `reviewBot.roles.<role>.tools`; the base branch's YAML can only turn it
-  off. Scripts' tool calls pass the same checks as the model's, and the
-  executed scripts are saved to `scripts.json` next to the run record.
-  `reviewBot.codemode.models: true` gives scripts pi's `models` API, which is
-  not limited to `enabledModels`; leave it off unless you need it.
+- A package that replaces one of the bot's tools is recorded in the run
+  record and listed in the review summary. A replacement that reads an
+  argument other than `path` is not confined.
+- `reviewBot.codemode.models: true` lets scripts call models outside
+  `enabledModels`, and their cost counts only when the script ends; leave it
+  off unless you need it.
 - An agent directory containing `AGENTS.md`, `SYSTEM.md` or
   `APPEND_SYSTEM.md`, or overlapping a read root, is refused.
-- The runner must start the real `node` binary for `review-bot launch`
-  (R-1a step 6 switches the action to it). A version-manager shim such as
-  Volta's does not pass SIGTERM on, and a cancelled review then publishes
-  nothing.
 - A package listed in the agent directory's `settings.json` that is not
   installed stops the review as a configuration error (exit 1).
 - Until `action/image.lock` names a published digest, the action image is

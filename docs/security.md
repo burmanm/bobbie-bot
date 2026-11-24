@@ -63,6 +63,7 @@ or a pinned dependency.
 | [H-56](#open-findings) | Posted bodies have no length cap, so an injected model can make the post fail | Yes (from code) | Open |
 | [H-63](#open-findings) | The scrubber misses opaque tokens next to `_`, a digit or a URL escape | Second layer only | Open |
 | [H-65](#open-findings) | With `reviewBot.codemode.models: true`, scripts reach models outside `enabledModels` and their cost counts only when the script ends | Only when an operator turns it on | Open |
+| [H-69](#open-findings) | Artifacts are passed between jobs by name, so a job in the same run that could upload one could replace the snapshot or the installed agent directory | Only if a job in the run is made to run PR code | Open |
 | [H-60](#accepted-risks) | Modules share the process with the token and key | Once modules load | Accepted |
 
 ## Hostile attempts
@@ -91,6 +92,9 @@ or a pinned dependency.
 | H-46 | A git dependency's `.npmrc` names a program (`git=`, `node-options`) that npm runs despite `--ignore-scripts` | Works with plain npm 11. Blocked on the known routes in `src/setup/` (`0e7ede6`, not wired yet). Not proof that npm has no other route | Test: `src/setup/installer.test.ts`, `src/setup/setup.test.ts` |
 | H-48 | An install script runs, or an installer sees the GitHub token | Blocked in `src/setup/`. The control runs the script | Test: same; Probe P-E |
 | H-49 | A package source floats (range, tag, branch) or points into the PR | Blocked: refused | Test: `src/setup/sources.test.ts`; Probe P-E |
+| H-67 | Package downloads share a runner with the model key or a write token | Blocked since `9a657ec`: packages are installed in a separate `setup` job with `permissions: {}`, no secret and only `HOME` in the container; the review job downloads nothing but the artifacts | Test: `src/ci/workflow.test.ts`, `src/ci/run-sh.test.ts` |
+| H-68 | A hostile setup archive: absolute paths, `..`, hard links, devices, duplicate members, another top-level entry, writing through a symlink, setuid files | Blocked: refused by the snapshot's extractor, files read-only and never executable. Absolute symlinks are kept, as npm makes them; the archive is trusted as the setup job's output (H-69) | Test: `src/ci/agent-dir.test.ts`; Probe P-K |
+| H-75 | A package leaves a timer or file watcher running, so pi never exits and the job runs to its time limit | Worked until `9a657ec` (seen with a real package in the action image). Blocked: the command ends a print-mode pi 5 s after the run | Test: `src/cli/launch.test.ts` |
 
 ### Reading outside the snapshot
 
@@ -157,6 +161,14 @@ or a pinned dependency.
 None at the moment.
 
 ## Open findings
+
+**H-69: artifacts by name.** The review job downloads `review-bot-snapshot`
+and `review-bot-agent-installed` by name, with `overwrite: true` on upload.
+A step in the same run that can upload an artifact could replace either; the
+review job would then load packages from that archive (H-68 keeps absolute
+symlinks) or review a different snapshot. No job runs PR code today, so this
+needs another flaw first. It predates R-1a step 6. Fix: pass artifact IDs
+between jobs.
 
 **H-63: scrubber at other boundaries.** An opaque `ghp_` token is not
 redacted when `_` or a digit comes directly before it (`TOKEN_ghp_...`), when
@@ -329,6 +341,16 @@ the merged tree of `9b4b027`.
 4. The scrubber on a `ghp_` token in fourteen contexts: blocked after `\n`,
    `\r`, `\u000A`, `&#10;` and `\\n`; missed after `_`, a digit, `%0A`
    and `%22`, and before `_` (H-63).
+
+**P-K: the step 6 merge.** Run on 2026-11-24 against the merged tree of
+`9a657ec`. Twelve hand-made archives through `review-bot unpack-agent-dir`:
+absolute path, `..`, hard link to `/etc/passwd`, character device,
+duplicate member turning a file into a symlink, a second top-level entry, no
+`agent/` entry, a symlink at `agent/` or inside it with a file written
+through it, a setuid file, an absolute symlink, and a valid one. All were
+refused except the valid one, the setuid file (extracted read-only without
+the bit) and the absolute symlink (kept). Nothing was written outside the
+destination.
 
 ## Reproducing the automated evidence
 
