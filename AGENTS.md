@@ -18,5 +18,3 @@ cite them in commits and code comments where a rule comes from the plan.
 - Tests never use the network or a real model. Model steps are tested with
   pi's scripted ("faux") provider from `@earendil-works/pi-ai`.
 - Never write an API key to a file, a log, or a test fixture.
-- `spike/` is the ignored, throwaway R-0 spike. Read it for reference
-  (`spike/spike.ts`, `spike/extension/`), do not import from it.

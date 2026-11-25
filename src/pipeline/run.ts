@@ -14,7 +14,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Value } from "typebox/value";
 import type { AgentStep, AgentStepResult, ModelRef, ModuleTool, OutputTool, QueryTool, ReadRoots } from "../agent/index.ts";
-import { PI_VERSION, RUN_DEADLINE } from "../agent/index.ts";
+import { ACP_PROVIDER, PI_VERSION, RUN_DEADLINE } from "../agent/index.ts";
 import { scrubSecrets } from "../../pi-review/extension/query-tools.ts";
 import { SAVED_SCRIPTS_FILE, ScriptCollector } from "../core/saved-scripts.ts";
 import {
@@ -478,12 +478,22 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
     config = resolveConfig(o.inputs, knowledge.botConfig?.text, settings, enabled);
     if (config.limits.runTimeoutMs !== deadlineMs) armDeadline(config.limits.runTimeoutMs);
     for (const role of PIPELINE_ROLES) {
-      const tools = resolveRoleTools(config.tools[role], ROLE_DEFAULT_TOOLS);
+      let tools = resolveRoleTools(config.tools[role], ROLE_DEFAULT_TOOLS);
       // F-7: codemode is pi's (R-1a step 5b); other names are tools of the
       // listed packages, and each step refuses one that no loaded package
       // registers.
       const unknown = tools.filter((t) => !ROLE_DEFAULT_TOOLS.includes(t) && t !== CODEMODE);
-      if (tools.includes(CODEMODE)) log(`S-1 codemode enabled for the ${role} role`);
+      if (tools.includes(CODEMODE)) {
+        const model = config.roles[role];
+        if (model?.provider === ACP_PROVIDER) {
+          // An ACP agent brings its own tools; the bot cannot add codemode to
+          // it, so the role runs without it and the record says so.
+          tools = tools.filter((t) => t !== CODEMODE);
+          log(`S-1 codemode ignored for the ${role} role: it runs on the ACP agent "${model.id}", which brings its own tools`);
+        } else {
+          log(`S-1 codemode enabled for the ${role} role`);
+        }
+      }
       if (unknown.length > 0 && settings.packages.length === 0) {
         throw new ConfigError(`reviewBot.roles.${role}.tools in settings.json names ${unknown.join(", ")}, but no packages are listed; the bot offers ${ROLE_DEFAULT_TOOLS.join(", ")}`);
       }

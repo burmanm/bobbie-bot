@@ -130,6 +130,46 @@ describe("a run with codemode (A-6 scripts.json)", () => {
     assert.ok(!existsSync(join(result.runDir!, SAVED_SCRIPTS_FILE)));
   });
 
+  test("an ACP role: codemode is ignored, logged, and not recorded; a pi role keeps it", async () => {
+    // An ACP agent brings its own tools, so the bot cannot give it codemode.
+    // The step stands in for the routed one: it records each request and
+    // plays the scripted model for both roles.
+    const dir = join(work, `case-${n++}`);
+    const agent = join(dir, "agent");
+    mkdirSync(agent, { recursive: true });
+    const settings = { reviewBot: { roles: { reviewer: { tools: ["+codemode"] }, verifier: { tools: ["+codemode"] } } } };
+    writeFileSync(join(agent, "settings.json"), JSON.stringify(settings));
+    const pr = join(dir, "pr");
+    cpSync(BASIC, pr, { recursive: true });
+    const scripted = createScriptedProvider(JSON.parse(readFileSync(join(BASIC, "script.json"), "utf8")) as Script);
+    const pi = createPiSdkAgentStep({ providers: [scripted.provider], retry: { enabled: false }, abortGraceMs: 2_000, agentDir: agent });
+    const seen: Array<{ role: string; provider: string; codemode: boolean }> = [];
+    const fixture = new FixturePrReader(pr);
+    const logs: string[] = [];
+    const result = await runReview({
+      platform: new DryRunPlatform(fixture),
+      snapshots: fixture.snapshots(),
+      agentStep: {
+        run: (req) => {
+          seen.push({ role: req.role, provider: req.model.provider, codemode: req.codemode === true });
+          return pi.run({ ...req, model: { provider: "scripted", id: req.role } });
+        },
+      },
+      inputs: { models: { reviewer: "acp/bob", verifier: "scripted/verifier" } },
+      runsDir: join(dir, "runs"),
+      agent: { dir: agent, settings: parseAgentSettings(JSON.stringify(settings)) },
+      log: (l) => logs.push(l),
+    });
+    assert.notEqual(result.conclusion, "neutral", `${result.checkSummary}\n${logs.join("\n")}`);
+    assert.ok(logs.includes('S-1 codemode ignored for the reviewer role: it runs on the ACP agent "bob", which brings its own tools'), logs.join("\n"));
+    assert.ok(logs.includes("S-1 codemode enabled for the verifier role"), logs.join("\n"));
+    assert.ok(seen.some((s) => s.role === "reviewer" && s.provider === "acp" && !s.codemode), JSON.stringify(seen));
+    assert.ok(seen.some((s) => s.role === "verifier" && s.codemode), JSON.stringify(seen));
+    const record = JSON.parse(readFileSync(result.recordPath!, "utf8")) as RunRecord;
+    assert.ok(!record.run.versions.tools?.reviewer?.includes("codemode"), JSON.stringify(record.run.versions.tools));
+    assert.ok(record.run.versions.tools?.verifier?.includes("codemode"), JSON.stringify(record.run.versions.tools));
+  });
+
   test("the base branch's YAML cannot turn it on", async () => {
     const { result } = await run({}, "codemode: true\n");
     assert.equal(result.conclusion, "neutral");

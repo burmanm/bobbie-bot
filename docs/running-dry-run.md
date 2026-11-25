@@ -298,6 +298,12 @@ root. Use absolute paths for local scripts. It needs its own credentials
 it. Its isolation is weaker than the pi step's (see `src/agent/README.md`,
 "ACP agents"), and spend is only counted if the agent reports a cost.
 
+An ACP agent brings its own tools, so codemode does not apply to it: a role
+on `acp/<name>` runs without it even when `settings.json` gives the role
+`+codemode`. The log says `codemode ignored for the <role> role`, and the
+run record leaves it out of that role's tools. The other role, on a pi
+model, keeps it.
+
 ## Offline, with the scripted model
 
 The fixture PR used by the tests runs end to end with no network and no

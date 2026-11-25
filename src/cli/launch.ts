@@ -16,9 +16,9 @@
  * and SIGTERM, SIGINT and SIGHUP forwarded so the command can publish what
  * exists (S-9). The exit code is pi's, which the command sets.
  *
- * The parent pi's agent directory is `--agent-dir` (F-7); without it, an
- * empty private one, never the runner's `~/.pi/agent` (C-3a). The command
- * is given the same directory explicitly.
+ * The parent pi's agent directory is always an empty private one, never the
+ * runner's `~/.pi/agent` (C-3a). The command reads the operator's directory
+ * from `--agent-dir` (F-7); without it, the same empty one.
  */
 import { spawn } from "node:child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
@@ -108,15 +108,17 @@ export function prepareLaunch(argv: readonly string[], options: LaunchOptions = 
     } catch {
       throw new LaunchConfigError(`the temporary directory ${temp} has a .git entry or a context file in or above it (C-3a); set TMPDIR to another directory`);
     }
-    let agentDir = given;
-    if (agentDir === undefined) {
-      agentDir = mkdtempSync(join(temp, "review-bot-pi-agent-"));
-      created.push(agentDir);
-      reviewArgs.push("--agent-dir", agentDir);
-    }
+    // The parent pi's own agent directory is always a private empty one: it
+    // loads nothing from it (-ne), and pi locks settings.json even to read it,
+    // which fails on the read-only operator directory the action mounts
+    // ("Invalid settings file ... EROFS"). The command reads the operator's
+    // directory itself, given as --agent-dir (F-7, C-3a).
+    const piAgentDir = mkdtempSync(join(temp, "review-bot-pi-agent-"));
+    created.push(piAgentDir);
+    if (given === undefined) reviewArgs.push("--agent-dir", piAgentDir);
     const env: NodeJS.ProcessEnv = {
       ...(options.env ?? process.env),
-      PI_CODING_AGENT_DIR: agentDir,
+      PI_CODING_AGENT_DIR: piAgentDir,
       PI_OFFLINE: "1",
       PI_SKIP_VERSION_CHECK: "1",
       PI_TELEMETRY: "0",

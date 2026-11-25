@@ -6,7 +6,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -173,6 +173,32 @@ export default function (pi) {
     assert.equal(await runLaunch(fixtureArgs(dir), run.io), 0, run.out.stderr);
     assert.equal(run.out.stdout.trim(), "", "pi's stdout carries nothing");
     assert.equal(JSON.parse(readFileSync(join(dir, "out.json"), "utf8")).review.event, "COMMENT");
+  });
+
+  test("a read-only operator agent directory: no settings warning, and its settings still apply (R-1a acceptance)", async (t) => {
+    // The action mounts the operator's directory read-only; pi locks
+    // settings.json even to read it, so the parent pi must not be pointed there.
+    if (process.getuid?.() === 0) return t.skip("root ignores directory permissions");
+    const agentDir = fresh("readonly-agent");
+    writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ reviewBot: { limits: { runCostUsd: 3 } } }));
+    const launch = prepareLaunch(["--agent-dir", agentDir]);
+    try {
+      assert.notEqual(launch.env.PI_CODING_AGENT_DIR, agentDir, "the parent pi has its own agent directory");
+      assert.deepEqual(readdirSync(launch.env.PI_CODING_AGENT_DIR!), []);
+      assert.match(launch.args.at(-1)!, new RegExp(`--agent-dir ${agentDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    } finally {
+      launch.cleanup();
+    }
+    chmodSync(agentDir, 0o555);
+    try {
+      const dir = fresh("readonly");
+      const run = capture();
+      assert.equal(await runLaunch([...fixtureArgs(dir), "--agent-dir", agentDir], run.io), 0, run.out.stderr);
+      assert.doesNotMatch(run.out.stderr, /Invalid settings file/);
+      assert.equal(JSON.parse(readFileSync(join(dir, "out.json"), "utf8")).check_run.conclusion, "success");
+    } finally {
+      chmodSync(agentDir, 0o755);
+    }
   });
 
   test("row 5: a malformed settings.json stops the run with a configuration error", async () => {
