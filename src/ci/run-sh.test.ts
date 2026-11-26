@@ -4,7 +4,7 @@
  */
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,19 @@ for a in "$@"; do
   if [[ "$prev" == -v && "$a" == *:/agent-out ]]; then mkdir -p "\${a%:/agent-out}/dir"; fi
   prev="$a"
 done
+# fetch-agent-dir: its --dest under the /agent-out mount, with FAKE_FETCH_FILES in it.
+if [[ " $* " == *" fetch-agent-dir "* ]]; then
+  host="" dest="" p=""
+  for a in "$@"; do
+    [[ "$p" == -v && "$a" == *:/agent-out ]] && host="\${a%:/agent-out}"
+    [[ "$p" == --dest ]] && dest="$a"
+    p="$a"
+  done
+  d="$host\${dest#/agent-out}"
+  mkdir -p "$d"
+  for f in \${FAKE_FETCH_FILES:-}; do echo x > "$d/$f"; done
+  echo "fetched from o/r@$(printf 'c%.0s' {1..40})" >&2
+fi
 [[ " $* " == *" launch --pr "* ]] && exit "\${FAKE_EXIT:-0}"
 exit 0
 `;
@@ -329,4 +342,81 @@ test("setup (F-7, C-4): installs with network but no token or key, under /agent 
   assert.equal(missing.code, 2);
   assert.equal(missing.calls.filter((c) => c[0] === "run").length, 0);
   assert.equal((await run(setup(), { RB_COMMAND: "setup", RB_AGENT_DIR: "../x" })).code, 2);
+});
+
+test("knowledge (pilot prototype): the gate fetches it and the guidelines into the agent directory; the review passes --knowledge-dir and --acp-config", async () => {
+  const sha = "c".repeat(40);
+  const s = setup();
+  const r = await run(s, {
+    RB_COMMAND: "gate",
+    RB_AGENT_DIR: ".github/review-bot",
+    RB_KNOWLEDGE: "org/process:pilot/cass-operator",
+    RB_KNOWLEDGE_GUIDELINES: "shared/go-operator-guidelines.md\n",
+    FAKE_FETCH_FILES: "go-operator-guidelines.md",
+  });
+  assert.equal(r.code, 0, r.stderr);
+  const fetches = r.calls.filter((c) => c.includes("fetch-agent-dir")).map((c) => c.slice(c.indexOf("fetch-agent-dir")));
+  assert.deepEqual(fetches, [
+    ["fetch-agent-dir", "--path", ".github/review-bot", "--dest", "/agent-out/dir", "--repo", "k8ssandra/cass-operator"],
+    ["fetch-agent-dir", "--path", "pilot/cass-operator", "--dest", "/agent-out/dir/knowledge", "--repo", "org/process"],
+    // The guidelines at the commit the knowledge came from.
+    ["fetch-agent-dir", "--path", "shared", "--dest", "/agent-out/guidelines-1", "--repo", "org/process", "--ref", sha],
+  ]);
+  for (const f of r.calls.filter((c) => c.includes("fetch-agent-dir"))) {
+    assert.ok(!flagValues(f, "-e").some((e) => e.startsWith("OPENROUTER") || e.startsWith("AGENT")));
+  }
+  const knowledge = join(s.dir, "review-bot", "agent", "dir", "knowledge");
+  assert.equal(readFileSync(join(knowledge, ".review", "go-operator-guidelines.md"), "utf8"), "x\n");
+  assert.ok(!existsSync(join(s.dir, "review-bot", "agent", "guidelines-1")), "the temporary copy is removed");
+
+  // A pinned knowledge commit is used for both fetches.
+  const pinned = await run(setup(), { RB_COMMAND: "gate", RB_AGENT_DIR: "a", RB_KNOWLEDGE: `o/r@${"d".repeat(40)}:k`, RB_KNOWLEDGE_GUIDELINES: "x/y-guidelines.md", FAKE_FETCH_FILES: "y-guidelines.md" });
+  assert.equal(pinned.code, 0, pinned.stderr);
+  assert.deepEqual(pinned.calls.filter((c) => c.includes("fetch-agent-dir")).map((c) => flagValues(c, "--ref")), [[], ["d".repeat(40)], ["d".repeat(40)]]);
+
+  for (const bad of [
+    { RB_KNOWLEDGE: "o/r:pilot" }, // no agent-dir
+    { RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r" },
+    { RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r@main:pilot" },
+    { RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r:../x" },
+    { RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r:/abs" },
+    { RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r:k", RB_KNOWLEDGE_GUIDELINES: "shared/notes.md" },
+    { RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r:k", RB_KNOWLEDGE_GUIDELINES: "top-guidelines.md" },
+    { RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r:k", RB_KNOWLEDGE_GUIDELINES: "../x/y-guidelines.md" },
+    { RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r:k", RB_KNOWLEDGE_GUIDELINES: "x/missing-guidelines.md" },
+    { RB_ACP_CONFIG: "acp.json" }, // no agent-dir
+    { RB_AGENT_DIR: "a", RB_ACP_CONFIG: "../acp.json" },
+  ]) {
+    const res = await run(setup(), { RB_COMMAND: "gate", ...bad });
+    assert.equal(res.code, 2, `${JSON.stringify(bad)}\n${res.stderr}`);
+  }
+
+  // The review: knowledge/ and acp.json come from the setup job's archive.
+  const mk = () => {
+    const t = setup();
+    mkdirSync(join(t.dir, "review-bot", "in"), { recursive: true });
+    writeFileSync(join(t.dir, "review-bot", "in", "snapshot.tar.gz"), "");
+    mkdirSync(join(t.dir, "review-bot", "agent-in"), { recursive: true });
+    writeFileSync(join(t.dir, "review-bot", "agent-in", "agent-dir.tar.gz"), "");
+    return t;
+  };
+  // The fake unpack writes nothing, so the installed tree is planted after the
+  // step deletes it: run the step through a docker that creates it.
+  const t = mk();
+  const fake = readFileSync(join(t.bin, "docker"), "utf8").replace(
+    "#!/usr/bin/env bash\n",
+    `#!/usr/bin/env bash\nif [[ " $* " == *" unpack-agent-dir "* ]]; then o="${join(t.dir, "review-bot", "agent-installed", "agent")}"; mkdir -p "$o/knowledge"; echo '{}' > "$o/acp.json"; fi\n`,
+  );
+  writeFileSync(join(t.bin, "docker"), fake);
+  const rv = await run(t, { RB_COMMAND: "review", RB_PR: "5", RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r:k", RB_ACP_CONFIG: "acp.json", RB_PROVIDER_ENV: "AGENT_API_KEY", AGENT_API_KEY: "agent-secret" });
+  assert.equal(rv.code, 0, rv.stderr);
+  const review = rv.calls.filter((c) => c[0] === "run").at(-1)!;
+  assert.deepEqual(flagValues(review, "--knowledge-dir"), ["/agent/knowledge"]);
+  assert.deepEqual(flagValues(review, "--acp-config"), ["/agent/acp.json"]);
+  assert.ok(flagValues(review, "-e").includes("AGENT_API_KEY"));
+  assert.ok(!review.includes("fetch-agent-dir"));
+
+  const noAcp = await run(mk(), { RB_COMMAND: "review", RB_PR: "5", RB_AGENT_DIR: "a", RB_ACP_CONFIG: "acp.json" });
+  assert.equal(noAcp.code, 2);
+  assert.match(noAcp.stderr, /no file acp\.json/);
 });

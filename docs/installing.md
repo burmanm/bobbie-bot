@@ -511,6 +511,51 @@ the log and the job summary.
   group, so it cancels a review in flight for that PR; the always-run step
   completes that check as *neutral*. Push or dispatch to review again.
 
+## An ACP agent in the action
+
+A role can run on an external agent over the Agent Client Protocol
+(`acp/<name>`, see [running-dry-run.md](running-dry-run.md#using-an-acp-agent-instead-of-openrouter))
+in the action too:
+
+- **Install the agent with the agent directory.** Pin it as a dependency in
+  the agent directory's `package.json` and lockfile. The setup job installs
+  it with lifecycle scripts off, in a job with no secret and no token
+  permission. It is not loaded as a pi package unless `packages` lists it.
+  Files the review job unpacks are never executable (C-4), so start a
+  JavaScript agent with `node` and expect any native helper it ships to
+  fail.
+- **Define it in a file in the agent directory** and name that file with
+  the action's `acp-config` input. The review passes it as `--acp-config
+  /agent/<file>`, so the agent's paths start at `/agent`, for example
+  `{"agents": {"<name>": {"command": "/usr/local/bin/node", "args":
+  ["/agent/node_modules/<package>/<entry>.js", ...]}}}`.
+- **Pass its key with `provider-env`,** naming the variable the review step
+  sets from a secret. The agent gets the review container's environment
+  without GitHub tokens.
+- **Set the models to `acp/<name>`** in the `models` input.
+- **Leave the spend cap aside.** An agent that reports no cost is not
+  counted, so use the review step's time limit instead.
+
+## Knowledge from another repository (prototype)
+
+While a repository has no `REVIEW.md` of its own, the gate can fetch its
+knowledge from another repository: the action's `knowledge` input,
+`owner/name[@<40-hex SHA>]:<directory>`, names a directory whose
+`AGENTS.md`, `REVIEW.md` and `.review/` replace the base branch's.
+`knowledge-guidelines` adds files from the same repository and commit, one
+path per line, each named `<name>-guidelines.md`, as
+`.review/<name>-guidelines.md`.
+
+- It needs `agent-dir`: the gate fetches into the agent directory's
+  `knowledge/`, so it travels to the review job with it.
+- Give the review step the same `knowledge` value; it then passes
+  `--knowledge-dir`.
+- Without a SHA it is that repository's default branch head when the gate
+  runs. Whoever can push there changes what the bot is told; it is prompt
+  text, never code.
+- The gate's token must be able to read that repository; a public one
+  needs nothing extra.
+
 ## Trying it
 
 - Run the same pipeline locally, posting nothing:

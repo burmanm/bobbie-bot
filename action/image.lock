@@ -7,3 +7,4 @@
 # from this commit's action/Dockerfile; the workflow's summary prints the
 # line. With no reference below, the action builds action/Dockerfile in
 # each job instead (pinned and checksum-verified downloads, but downloads).
+ghcr.io/burmanm/review-bot-action@sha256:2696b965427c19237b04c5c0773d090d5501c71dd954a710ead5500136a411a8

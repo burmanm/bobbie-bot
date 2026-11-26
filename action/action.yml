@@ -58,6 +58,27 @@ inputs:
       owner/name@<40-hex SHA> (an organization configuration repository).
       The gate's token must be able to read it.
     default: ""
+  knowledge:
+    description: >-
+      gate, review (prototype for the pilot): read the repository's knowledge
+      (AGENTS.md, REVIEW.md, .review/) from another repository instead of the
+      base branch: owner/name[@<40-hex SHA>]:<directory>. Without a SHA, that
+      repository's default branch head at the time of the gate. Needs
+      agent-dir: the gate fetches it into the agent directory's knowledge/,
+      and the review passes --knowledge-dir. Prompt text only, never code.
+    default: ""
+  knowledge-guidelines:
+    description: >-
+      gate: files in the knowledge repository, one path per line, each named
+      <name>-guidelines.md, added as knowledge/.review/<name>-guidelines.md
+      (at the same commit as the knowledge directory).
+    default: ""
+  acp-config:
+    description: >-
+      review: an ACP agent definition file in the agent directory (the CLI's
+      --acp-config), for models named acp/<agent>. Its keys go through
+      provider-env; the agent never gets the GitHub token.
+    default: ""
   auth-label:
     description: >-
       Authorization label for PRs from authors without write access (C-4,
@@ -222,6 +243,9 @@ runs:
         RB_AUTH_LIFETIME: ${{ inputs.auth-label-lifetime }}
         RB_AGENT_DIR: ${{ inputs.agent-dir }}
         RB_AGENT_DIR_REPO: ${{ inputs.agent-dir-repo }}
+        RB_KNOWLEDGE: ${{ inputs.knowledge }}
+        RB_KNOWLEDGE_GUIDELINES: ${{ inputs.knowledge-guidelines }}
+        RB_ACP_CONFIG: ${{ inputs.acp-config }}
         RB_MODELS: ${{ inputs.models }}
         RB_THINKING: ${{ inputs.thinking }}
         RB_PROVIDERS: ${{ inputs.providers }}

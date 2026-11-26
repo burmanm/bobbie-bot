@@ -107,6 +107,65 @@ use_installed_agent_dir() {
   docker_args+=(-v "$out/agent:/agent:ro")
   args+=(--agent-dir /agent)
 }
+# Prototype for the pilot (R-2): the repository's knowledge (AGENTS.md,
+# REVIEW.md, .review/) read from another repository's directory instead of
+# the base branch (A-5), so the pilot's files can be edited in one place.
+# owner/name[@<40-hex SHA>]:<directory>; without a SHA, that repository's
+# default branch head. Never the PR (D-19). It is prompt text, not code. The
+# gate fetches it into the agent directory's knowledge/, so it travels to
+# the review job with that directory.
+knowledge="${RB_KNOWLEDGE:-}"
+knowledge_repo="" knowledge_ref="" knowledge_path=""
+if [[ -n "$knowledge" ]]; then
+  [[ -n "$agent_path" ]] || fail "knowledge needs agent-dir: it travels in the agent directory"
+  [[ "$knowledge" =~ ^([A-Za-z0-9-]+/[A-Za-z0-9._-]+)(@([0-9a-f]{40}))?:([A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*)$ ]] || fail "knowledge must be owner/name[@<40-hex commit SHA>]:<directory>: $knowledge"
+  knowledge_repo="${BASH_REMATCH[1]}" knowledge_ref="${BASH_REMATCH[3]}" knowledge_path="${BASH_REMATCH[4]}"
+  [[ ! "/$knowledge_path/" =~ /\.\.?/ ]] || fail "invalid knowledge directory: $knowledge_path"
+fi
+# An ACP agent definition (--acp-config): a file in the agent directory, so
+# it comes from the default branch like the rest of the configuration (F-7).
+acp_config="${RB_ACP_CONFIG:-}"
+if [[ -n "$acp_config" ]]; then
+  [[ -n "$agent_path" ]] || fail "acp-config needs agent-dir: it names a file in the agent directory"
+  [[ "$acp_config" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && ! "/$acp_config/" =~ /\.\.?/ ]] || fail "invalid acp-config (a file in the agent directory): $acp_config"
+fi
+# fetch-agent-dir into $work/agent (mounted at /agent-out), with GH_TOKEN only.
+fetch_dir() {
+  docker run --rm --init --cap-drop ALL --security-opt no-new-privileges --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,size=64m --user "$(id -u):$(id -g)" -e HOME=/tmp -e GH_TOKEN -e GITHUB_API_URL \
+    -v "$work/agent:/agent-out" "$image" fetch-agent-dir "$@"
+}
+# The gate: the knowledge directory, then each guidelines file of the same
+# repository at the same commit, as knowledge/.review/<name>-guidelines.md.
+fetch_knowledge() {
+  local dest="$agent_dir/knowledge" msg line n=0 base parent ref="$knowledge_ref" tmp
+  [[ ! -e "$dest" ]] || fail "the agent directory already has a knowledge/ entry; the knowledge input writes it"
+  local k=(--path "$knowledge_path" --dest /agent-out/dir/knowledge --repo "$knowledge_repo")
+  [[ -n "$ref" ]] && k+=(--ref "$ref")
+  if ! msg="$(fetch_dir "${k[@]}" 2>&1)"; then echo "$msg" >&2; fail "could not fetch knowledge $knowledge"; fi
+  echo "$msg"
+  if [[ -z "$ref" ]]; then
+    [[ "$msg" =~ @([0-9a-f]{40}) ]] || fail "could not tell which commit the knowledge came from"
+    ref="${BASH_REMATCH[1]}"
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    [[ "$line" =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ && ! "/$line/" =~ /\.\.?/ ]] || fail "invalid knowledge-guidelines path (a file in a directory of $knowledge_repo): $line"
+    base="${line##*/}" parent="${line%/*}"
+    [[ "$base" =~ ^[A-Za-z0-9._-]+-guidelines\.md$ ]] || fail "a knowledge-guidelines file must be named <name>-guidelines.md: $line"
+    n=$((n + 1)) tmp="guidelines-$n"
+    rm -rf "${work:?}/agent/$tmp"
+    if ! msg="$(fetch_dir --path "$parent" --dest "/agent-out/$tmp" --repo "$knowledge_repo" --ref "$ref" 2>&1)"; then echo "$msg" >&2; fail "could not fetch $line from $knowledge_repo"; fi
+    [[ -f "$work/agent/$tmp/$base" && ! -L "$work/agent/$tmp/$base" ]] || fail "$knowledge_repo@$ref has no file $line"
+    mkdir -p "$dest/.review"
+    [[ ! -e "$dest/.review/$base" ]] || fail "knowledge already has .review/$base"
+    cp "$work/agent/$tmp/$base" "$dest/.review/$base"
+    rm -rf "${work:?}/agent/$tmp"
+    echo "guidelines $line from $knowledge_repo@$ref"
+  done <<< "${RB_KNOWLEDGE_GUIDELINES:-}"
+}
 need_pr() { [[ "$1" =~ ^[1-9][0-9]*$ ]] || fail "pr must be a PR number"; }
 # Multi-line `role=value` inputs, one flag per non-empty line.
 role_lines() {
@@ -143,9 +202,8 @@ case "$cmd" in
         fetch+=(--repo "${BASH_REMATCH[1]}" --ref "${BASH_REMATCH[2]}")
       fi
       rm -rf "$work/agent" && mkdir -p "$work/agent"
-      docker run --rm --init --cap-drop ALL --security-opt no-new-privileges --read-only \
-        --tmpfs /tmp:rw,nosuid,nodev,size=64m --user "$(id -u):$(id -g)" -e HOME=/tmp -e GH_TOKEN -e GITHUB_API_URL \
-        -v "$work/agent:/agent-out" "$image" "${fetch[@]}"
+      fetch_dir "${fetch[@]:1}"
+      if [[ -n "$knowledge" ]]; then fetch_knowledge; fi
     fi
     # Label and lifetime only when given: unset inputs leave settings.json's (F-7).
     args=(gate --repo "$repo" --name "$name" --records-dir /github/out/records)
@@ -249,6 +307,15 @@ case "$cmd" in
     fi
     docker_args+=(-e GH_TOKEN -v "$work/snapshot:/snapshot:ro" -v "$work/runs:/runs")
     use_installed_agent_dir
+    installed="$work/agent-installed/agent"
+    if [[ -n "$knowledge" ]]; then
+      [[ -d "$installed/knowledge" && ! -L "$installed/knowledge" ]] || fail "knowledge is set but the agent directory has no knowledge/ (the gate fetches it)"
+      args+=(--knowledge-dir /agent/knowledge)
+    fi
+    if [[ -n "$acp_config" ]]; then
+      [[ -f "$installed/$acp_config" && ! -L "$installed/$acp_config" ]] || fail "acp-config is set but the agent directory has no file $acp_config"
+      args+=(--acp-config "/agent/$acp_config")
+    fi
     # Provider keys by name, from this step's environment (C-6). Never a GitHub token.
     provider_env="${RB_PROVIDER_ENV:-OPENROUTER_API_KEY}"
     for var in ${provider_env//,/ }; do
