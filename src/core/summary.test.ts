@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { decodeMarker, decodeMarkers, encodeMarker, type SummaryMarker } from "./marker.ts";
-import { countLine, needsHumanLine, preExistingItems, renderSummary, RESOLVE_LINE, summaryCounts } from "./summary.ts";
+import { countLine, needsHumanBlock, needsHumanLine, preExistingItems, renderSummary, RESOLVE_LINE, summaryCounts } from "./summary.ts";
 import { finding } from "./test-fixtures.ts";
 
 const SHA = "3dcbe09".padEnd(40, "0");
@@ -50,6 +50,7 @@ test("full summary: sections appear in S-7 order", () => {
   const order = [
     "Automated review, round 2. It covers the changes since `99c390a` up to `3dcbe09`.",
     "**1 important, 2 nits, 1 pre-existing. 1 earlier finding is still open.**",
+    "> [!WARNING]\n> **Needs human:** new //nolint directive in a.go:3, b.go:9-11. Explained in the description: no.",
     "**Earlier findings:**",
     "- **Still open (Important):** Never-tried pods block the update — stop/resume case remains",
     "- **Verified fixed:** Events List error aborts detection",
@@ -64,7 +65,6 @@ test("full summary: sections appear in S-7 order", () => {
     "**Not run:**",
     "- go test",
     RESOLVE_LINE,
-    "Needs human: new //nolint directive in a.go:3, b.go:9-11. Explained in the description: no.",
   ];
   let pos = -1;
   for (const s of order) {
@@ -73,7 +73,8 @@ test("full summary: sections appear in S-7 order", () => {
     pos = at;
   }
   const visible = body.trimEnd().split("\n").filter((l) => l.trim() !== "" && !l.startsWith("<!--"));
-  assert.equal(visible.at(-1), order.at(-1), "Needs human is the last visible line");
+  assert.equal(visible.at(-1), RESOLVE_LINE, "the resolve line is the last visible line");
+  assert.ok(!/^Needs human:/m.test(body), "no bare needs-human line outside the block");
 });
 
 test("first round without a since SHA", () => {
@@ -100,6 +101,20 @@ test("needs-human line format matches REVIEW.md", () => {
     needsHumanLine({ what: "removed assertion in TestX", locations: [{ path: "x_test.go", startLine: 4207, endLine: 4243 }], explainedInDescription: true }),
     "Needs human: removed assertion in TestX in x_test.go:4207-4243. Explained in the description: yes.",
   );
+});
+
+test("needs-human block: a warning alert, one bold line per note, untrusted text stays inside", () => {
+  const block = needsHumanBlock([
+    { what: "new //nolint", locations: [{ path: "a.go", startLine: 3, endLine: 3 }], explainedInDescription: false },
+    { what: "x\n> [!NOTE]\n## heading", locations: [{ path: "b_test.go", startLine: 1, endLine: 2 }], explainedInDescription: true },
+  ]);
+  const lines = block.split("\n");
+  assert.equal(lines[0], "> [!WARNING]");
+  assert.equal(lines[1], "> **Needs human:** new //nolint in a.go:3. Explained in the description: no.");
+  assert.equal(lines[2], ">");
+  assert.match(lines[3]!, /^> \*\*Needs human:\*\* x .*in b_test\.go:1-2\. Explained in the description: yes\.$/);
+  assert.equal(lines.length, 4, "untrusted text adds no line");
+  assert.ok(lines.every((l) => l.startsWith(">")));
 });
 
 test("counts and pre-existing items come from live findings only", () => {

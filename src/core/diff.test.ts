@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { DiffParseError, indexDiff, isInDiff, parseDiff, touchesChangedLines, unquoteGitPath } from "./diff.ts";
+import { clampToDiff, DiffParseError, indexDiff, isInDiff, parseDiff, touchesChangedLines, unquoteGitPath } from "./diff.ts";
 
 // Generated with `git diff --cached -M` over a scratch repository.
 const fixture = readFileSync(new URL("./fixtures/pr.diff", import.meta.url), "utf8");
@@ -136,6 +136,10 @@ test("anchor inside the diff", () => {
   assert.equal(isInDiff(idx, "deleted.txt", 1, 1), false);
   assert.equal(isInDiff(idx, "pure2.txt", 1, 1), false);
   assert.equal(isInDiff(idx, "nope.go", 1, 1), false);
+  assert.deepEqual(clampToDiff(idx, "a.go", 6, 9), { start: 6, end: 6 }, "cut at the hunk's end");
+  assert.deepEqual(clampToDiff(idx, "a.go", 4, 4), { start: 4, end: 4 });
+  assert.equal(clampToDiff(idx, "a.go", 7, 9), undefined);
+  assert.equal(clampToDiff(idx, "deleted.txt", 1, 1), undefined);
   assert.equal(touchesChangedLines(idx, "a.go", 3, 3), false);
   assert.equal(touchesChangedLines(idx, "a.go", 3, 4), true);
 });

@@ -28,7 +28,7 @@ import {
   type HistorySource,
   groundFindings,
   indexDiff,
-  isInDiff,
+  clampToDiff,
   isLive,
   type NeedsHumanNote,
   parseDiff,
@@ -731,8 +731,13 @@ export async function runReview(o: ReviewRunOptions): Promise<ReviewRunResult> {
       // touch but the PR as a whole does not cannot carry one.
       findings = findings.map((f) => {
         const a = f.locations[0]!;
-        if (!isLive(f) || f.tag === "pre-existing" || isInDiff(fullIndex, a.path, a.startLine, a.endLine)) return f;
-        return { ...f, tag: "pre-existing", retaggedFrom: f.tag, statusReason: `anchor ${a.path}:${a.startLine} is outside the pull request's diff; re-tagged pre-existing from ${f.tag}` };
+        if (!isLive(f) || f.tag === "pre-existing") return f;
+        const inPr = clampToDiff(fullIndex, a.path, a.startLine, a.endLine);
+        if (!inPr) {
+          return { ...f, tag: "pre-existing", retaggedFrom: f.tag, statusReason: `anchor ${a.path}:${a.startLine} is outside the pull request's diff; re-tagged pre-existing from ${f.tag}` };
+        }
+        if (inPr.start === a.startLine && inPr.end === a.endLine) return f;
+        return { ...f, locations: [{ ...a, startLine: inPr.start, endLine: inPr.end }, ...f.locations.slice(1)] };
       });
     }
     // S-5: a fingerprint this bot already posted on the PR is not posted, or verified, again.

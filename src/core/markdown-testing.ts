@@ -32,6 +32,8 @@ export function liveText(md: string): string {
       continue;
     }
     if (decodeMarkers(line).length === 1 || /^<!-- review-bot:failure bot=[\w./-]+ -->$/.test(line)) continue;
+    // The needs-human alert's first line, written by summary.ts (I-2 #5). Sanitized text never yields it: a "[" outside code becomes &#91;.
+    if (line === "> [!WARNING]") continue;
     out.push(line.replace(/(?<![`\\])(`+)(?!`)[^\n]*?(?<!`)\1(?!`)/g, " \u0001 "));
   }
   assert.equal(fence, undefined, "a fence is left open");

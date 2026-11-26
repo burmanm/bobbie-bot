@@ -5,17 +5,18 @@
  *   1. Round and commit range covered (optional).
  *   2. Count line: "N important, M nits, K pre-existing." or a plain
  *      "Nothing to fix" statement.
- *   3. Earlier findings: still open / verified fixed.
- *   4. Pre-existing items, each with a proposed tech-debt issue or a link.
- *   5. Questions for the author.
- *   6. Checked, nothing found.
- *   7. CI note (C-9), not run / partial-run note, extra tools from the
+ *   3. Needs human lines, in a warning block right under the count, so
+ *      they are seen first (I-2 #5).
+ *   4. Earlier findings: still open / verified fixed.
+ *   5. Pre-existing items, each with a proposed tech-debt issue or a link.
+ *   6. Questions for the author.
+ *   7. Checked, nothing found.
+ *   8. CI note (C-9), not run / partial-run note, extra tools from the
  *      operator's packages (F-7).
- *   8. How to resolve: [wrong] / [intentional] / [not-worth-it].
- *   9. Needs human lines.
+ *   9. How to resolve: [wrong] / [intentional] / [not-worth-it], last.
  *
  * The hidden summary marker (last reviewed SHA) follows on its own line; it
- * does not render, so the visible body still ends with the Needs-human line.
+ * does not render, so the visible body still ends with the resolve line.
  *
  * All free text (from the model or the PR) is passed through markdown.ts,
  * so it cannot forge the bot's state or become live Markdown (C-3, H-51).
@@ -127,6 +128,16 @@ export function needsHumanLine(n: NeedsHumanNote): string {
   return `Needs human: ${safeLine(n.what)} in ${where}. Explained in the description: ${n.explainedInDescription ? "yes" : "no"}.`;
 }
 
+/**
+ * The needs-human lines as a GitHub warning alert (I-2 #5). The alert syntax
+ * is written here, by code; each note is one safeLine, after a bold label,
+ * so untrusted text cannot end the block or open another.
+ */
+export function needsHumanBlock(notes: readonly NeedsHumanNote[]): string {
+  const lines = notes.map((n) => `> **Needs human:** ${needsHumanLine(n).slice("Needs human: ".length)}`);
+  return ["> [!WARNING]", lines.join("\n>\n")].join("\n");
+}
+
 function preExistingLine(p: PreExistingItem, repo: string | undefined): string {
   const where = p.location ? ` (${codeSpan(formatLocation(p.location))})` : "";
   let issue: string;
@@ -157,6 +168,8 @@ export function renderSummary(p: SummaryParts): string {
   const stillOpen = p.earlier?.stillOpen ?? [];
   const fixed = p.earlier?.verifiedFixed ?? [];
   blocks.push(countLine(p.counts, stillOpen.length));
+
+  if (p.needsHuman?.length) blocks.push(needsHumanBlock(p.needsHuman));
 
   if (stillOpen.length + fixed.length > 0) {
     const line = (label: string, e: EarlierFinding) => {
@@ -203,8 +216,6 @@ export function renderSummary(p: SummaryParts): string {
   if (notRun.length) blocks.push(notRun.join("\n\n"));
 
   blocks.push(RESOLVE_LINE);
-
-  if (p.needsHuman?.length) blocks.push(p.needsHuman.map(needsHumanLine).join("\n"));
 
   return blocks.join("\n\n") + "\n\n" + encodeMarker(p.marker) + "\n";
 }

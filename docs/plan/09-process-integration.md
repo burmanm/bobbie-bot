@@ -41,7 +41,7 @@ contract in I-2.
 | 2 | Post as a Bot-type identity (App or the Actions token). The state workflow counts unresolved threads whose first comment is by a Bot and contains the word `Important` | templates §12 |
 | 3 | Tag every finding **Important**, **Nit** or **Pre-existing**. The tag is the first word of the comment | RP §3 layer 3, templates §3 |
 | 4 | Pre-existing findings go in the summary only, each with a one-line proposed `tech-debt` issue, after checking whether an issue already exists | RP decision 2026-10-21 |
-| 5 | Changes that always need a human (new `//nolint`, changed or removed assertions in existing tests) are a `Needs human:` line at the end of the summary, **not findings**. A finding is raised only when the PR description does not explain the change | RP decision 2026-10-21 |
+| 5 | Changes that always need a human (new `//nolint`, changed or removed assertions in existing tests) are a `Needs human:` line, **not findings**. The bot puts these lines in a warning block right under the count line (changed from "at the end of the summary" after the pilot's first runs, where the line was easy to miss). A finding is raised only when the PR description does not explain the change | RP decision 2026-10-21 |
 | 6 | Trade-offs stated in the PR description are not flagged. If one leads to a failure listed in `REVIEW.md`, ask a question instead of reporting a finding | RP decision 2026-10-21 |
 | 7 | Never flag what lint or a CI check enforces; never flag the changelog category | templates §3, RP decision 2026-10-21 |
 | 8 | Never approve. Review event is `COMMENT`. Blocking comes from the branch rule "require conversation resolution" and the state workflow, not from the bot | RP §3 layer 5 |

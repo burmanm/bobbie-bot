@@ -62,6 +62,16 @@ test("grounding: important/nit outside the diff are re-tagged pre-existing; pre-
   assert.equal(g3, pre);
 });
 
+test("grounding: an anchor running past its hunk is cut to it, so GitHub takes it inline; other locations and the fingerprint stay", () => {
+  const f = finding({ locations: [at("pkg/a.go", 4, 12), at("pkg/other.go", 30, 40)] });
+  const [g] = groundFindings([f], ctx);
+  assert.equal(g!.tag, "important");
+  assert.deepEqual(g!.locations, [at("pkg/a.go", 4, 6), at("pkg/other.go", 30, 40)]);
+  assert.equal(g!.fingerprint, f.fingerprint);
+  const inside = finding({ locations: [at("pkg/a.go", 2, 5)] });
+  assert.equal(groundFindings([inside], ctx)[0], inside, "an anchor inside its hunk is the same object");
+});
+
 test("grounding: cross-field and schema violations are refuted (defence in depth)", () => {
   const bad = finding({ proposedIssue: "x" });
   const rev = finding({ locations: [at("pkg/a.go", 5, 4)] });

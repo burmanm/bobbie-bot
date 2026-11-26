@@ -358,6 +358,21 @@ export function isInDiff(index: DiffIndex, path: string, startLine: number, endL
   return ranges.some((h) => overlaps(h, r));
 }
 
+/**
+ * The anchor as GitHub can take it (S-5, S-7): the part of the range inside
+ * the first hunk it overlaps, or undefined when it overlaps none. GitHub
+ * rejects a multi-line comment whose start or end is not a diff line of one
+ * hunk, and with it the whole review; a model's range often runs past a
+ * hunk or past the end of a new file.
+ */
+export function clampToDiff(index: DiffIndex, path: string, startLine: number, endLine: number): LineRange | undefined {
+  const ranges = index.hunks.get(path);
+  if (!ranges) return undefined;
+  const r = { start: startLine, end: Math.max(startLine, endLine) };
+  const h = ranges.find((x) => overlaps(x, r));
+  return h ? { start: Math.max(h.start, r.start), end: Math.min(h.end, r.end) } : undefined;
+}
+
 /** Does the range overlap a line this diff adds? */
 export function touchesChangedLines(index: DiffIndex, path: string, startLine: number, endLine: number): boolean {
   const ranges = index.changed.get(path);

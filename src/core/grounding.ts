@@ -5,13 +5,15 @@
  * - Every evidence quote must appear at its cited root, path and lines;
  *   otherwise the finding is refuted ("evidence not found").
  * - An Important or Nit finding anchored outside the diff is re-tagged
- *   Pre-existing (it then goes to the summary, not inline).
+ *   Pre-existing (it then goes to the summary, not inline). One anchored
+ *   partly inside has its anchor cut to the hunk it overlaps, so GitHub
+ *   accepts it as an inline comment (the fingerprint was taken before).
  *
  * Also applies the verifier's verdict (S-5, adversarial step).
  *
  * Findings are never mutated; new objects are returned in the same order.
  */
-import { isInDiff, type DiffIndex } from "./diff.ts";
+import { clampToDiff, type DiffIndex } from "./diff.ts";
 import { normalizeAnchor, sliceLines, type FileLookup } from "./fingerprint.ts";
 import { ReportFindingParams, validateOutput, type Evidence, type Finding, type ProducerFinding, type Verdict } from "./schemas.ts";
 
@@ -68,7 +70,9 @@ export function groundFinding(f: Finding, ctx: GroundingContext): Finding {
   if (missing.length > 0) return refute(f, `evidence not found: ${missing.map(cite).join(", ")}`);
 
   const anchor = f.locations[0]!;
-  if (f.tag !== "pre-existing" && !isInDiff(ctx.diff, anchor.path, anchor.startLine, anchor.endLine)) {
+  if (f.tag === "pre-existing") return f;
+  const inDiff = clampToDiff(ctx.diff, anchor.path, anchor.startLine, anchor.endLine);
+  if (!inDiff) {
     return {
       ...f,
       tag: "pre-existing",
@@ -76,7 +80,8 @@ export function groundFinding(f: Finding, ctx: GroundingContext): Finding {
       statusReason: `anchor ${anchor.path}:${anchor.startLine} is outside the diff; re-tagged pre-existing from ${f.tag}`,
     };
   }
-  return f;
+  if (inDiff.start === anchor.startLine && inDiff.end === anchor.endLine) return f;
+  return { ...f, locations: [{ ...anchor, startLine: inDiff.start, endLine: inDiff.end }, ...f.locations.slice(1)] };
 }
 
 export function groundFindings(findings: readonly Finding[], ctx: GroundingContext): Finding[] {

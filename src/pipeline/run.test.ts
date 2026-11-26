@@ -11,7 +11,7 @@ import { after, describe, test } from "node:test";
 import { Value } from "typebox/value";
 import { fauxAssistantMessage, fauxText, type FauxResponseFactory } from "@earendil-works/pi-ai";
 import { createPiSdkAgentStep, createScriptedProvider, type Script } from "../agent/index.ts";
-import { decodeMarkers, encodeMarker, fingerprintFinding, RunRecord, type ProducerFinding, type WaitingInput } from "../core/index.ts";
+import { decodeMarkers, encodeMarker, fingerprintFinding, RESOLVE_LINE, RunRecord, type ProducerFinding, type WaitingInput } from "../core/index.ts";
 import { assertInert, assertNoCommandLines } from "../core/markdown-testing.ts";
 import { DryRunPlatform, FixturePrReader, type PrComment, type PrReader } from "../platform/index.ts";
 import { snapshotLookup } from "./lookup.ts";
@@ -115,17 +115,18 @@ describe("normal run (S-0 … S-8)", async () => {
     assert.match(review.comments[0]!.body, /```suggestion\n/);
   });
 
-  test("summary follows I-2 #11: count first, pre-existing with issue, questions, checked, not run, resolve line, needs-human last", () => {
+  test("summary follows I-2 #11: count first, pre-existing with issue, questions, checked, not run, needs-human under the count, resolve line last", () => {
     const body = out.review!.body;
     const blocks = body.split("\n\n");
     assert.match(blocks[0]!, /^Automated review, round 1\. It covers `89abcde`\./);
     assert.equal(blocks[1], "**1 important, 1 nit, 1 pre-existing.**");
+    assert.equal(blocks[2], "> [!WARNING]\n> **Needs human:** changed test data in pkg/store/store_test.go:7. Explained in the description: no.");
     assert.match(body, /\*\*Pre-existing:\*\*\n- Get returns an untyped not-found error \(`pkg\/store\/store\.go:19`\)\. Proposed `tech-debt` issue/);
     assert.match(body, /\*\*Questions for the author:\*\*\n- Put replaces/);
     assert.match(body, /\*\*Checked, nothing found:\*\*\n- Callers of Put and Reset/);
     assert.match(body, /\*\*Not run:\*\*\n- go test/);
     const visible = body.replace(/\n<!-- review-bot:summary [^\n]*-->\n$/, "").trimEnd();
-    assert.equal(visible.split("\n").pop(), "Needs human: changed test data in pkg/store/store_test.go:7. Explained in the description: no.");
+    assert.equal(visible.split("\n").pop(), RESOLVE_LINE);
     const summaryMarkers = decodeMarkers(body).filter((m) => m.kind === "summary");
     assert.equal(summaryMarkers.length, 1);
     assert.equal(summaryMarkers[0]!.kind === "summary" && summaryMarkers[0]!.sha, HEAD);

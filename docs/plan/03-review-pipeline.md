@@ -153,6 +153,10 @@ timed-out step is recorded and the run continues with what it has.
   `refuted: evidence not found`.
 - Important and Nit anchors must fall inside the PR diff. A finding
   anchored outside it is re-tagged Pre-existing or moved to the summary.
+  An anchor that overlaps a hunk but runs past it is cut to that hunk:
+  GitHub rejects a comment whose start or end is not a line of one hunk,
+  and with it the whole review (seen on the pilot, a range past the end of
+  a new file).
 - Schema validity is already enforced by pi when the tool is called — an
   invalid call is returned to the model as an error and never reaches the
   orchestrator as a finding. Cross-field rules (for example `proposedIssue`
@@ -223,14 +227,18 @@ Performed by code with the write token; no model involved.
   1. Round and commit range covered.
   2. Count line: "N important, M nits, K pre-existing", or a plain statement
      that there is nothing to fix.
-  3. Earlier findings: still open / verified fixed.
-  4. Pre-existing items, each with a proposed `tech-debt` issue title or a
+  3. `Needs human: <what> in <file:line>. Explained in the description:
+     yes/no.`, one line per note in a GitHub `[!WARNING]` alert right under
+     the count, so it is the first thing a reader sees (I-2 #5). The alert
+     syntax is written by code; each note is one sanitized line.
+  4. Earlier findings: still open / verified fixed.
+  5. Pre-existing items, each with a proposed `tech-debt` issue title or a
      link to the existing issue (I-2 #4).
-  5. Questions.
-  6. Checked, nothing found.
-  7. Not run / partial-run note, and any tools active beyond the default.
-  8. How to resolve: `[wrong]`, `[intentional]`, `[not-worth-it]`.
-  9. `Needs human: <what> in <file:line>. Explained in the description: yes/no.`
+  6. Questions.
+  7. Checked, nothing found.
+  8. Not run / partial-run note, and any tools active beyond the default.
+  9. How to resolve: `[wrong]`, `[intentional]`, `[not-worth-it]`, as the
+     last visible line.
 - Hidden HTML marker on every comment: bot ID, run ID, fingerprint,
   `fingerprintVersion`. The summary carries the last reviewed SHA. This is
   the bot's whole per-PR state ([D-5](README.md#key-decisions)), together
