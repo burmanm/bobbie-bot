@@ -405,13 +405,21 @@ test("knowledge (pilot prototype): the gate fetches it and the guidelines into t
   const t = mk();
   const fake = readFileSync(join(t.bin, "docker"), "utf8").replace(
     "#!/usr/bin/env bash\n",
-    `#!/usr/bin/env bash\nif [[ " $* " == *" unpack-agent-dir "* ]]; then o="${join(t.dir, "review-bot", "agent-installed", "agent")}"; mkdir -p "$o/knowledge"; echo '{}' > "$o/acp.json"; fi\n`,
+    `#!/usr/bin/env bash\nif [[ " $* " == *" unpack-agent-dir "* ]]; then o="${join(t.dir, "review-bot", "agent-installed", "agent")}"; mkdir -p "$o/knowledge"; echo r > "$o/knowledge/REVIEW.md"; echo '{}' > "$o/acp.json"; fi\n`,
   );
   writeFileSync(join(t.bin, "docker"), fake);
   const rv = await run(t, { RB_COMMAND: "review", RB_PR: "5", RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r:k", RB_ACP_CONFIG: "acp.json", RB_PROVIDER_ENV: "AGENT_API_KEY", AGENT_API_KEY: "agent-secret" });
   assert.equal(rv.code, 0, rv.stderr);
   const review = rv.calls.filter((c) => c[0] === "run").at(-1)!;
-  assert.deepEqual(flagValues(review, "--knowledge-dir"), ["/agent/knowledge"]);
+  // The knowledge leaves the agent directory: /agent stays outside every read root (F-7).
+  assert.deepEqual(flagValues(review, "--knowledge-dir"), ["/knowledge"]);
+  const installed = join(t.dir, "review-bot", "agent-installed", "agent");
+  assert.deepEqual(flagValues(review, "-v").filter((v) => v.endsWith(":/agent:ro") || v.endsWith(":/knowledge:ro")), [
+    `${installed}:/agent:ro`,
+    `${join(t.dir, "review-bot", "knowledge")}:/knowledge:ro`,
+  ]);
+  assert.ok(!existsSync(join(installed, "knowledge")), "knowledge/ is no longer in the agent directory");
+  assert.equal(readFileSync(join(t.dir, "review-bot", "knowledge", "REVIEW.md"), "utf8"), "r\n");
   assert.deepEqual(flagValues(review, "--acp-config"), ["/agent/acp.json"]);
   assert.ok(flagValues(review, "-e").includes("AGENT_API_KEY"));
   assert.ok(!review.includes("fetch-agent-dir"));

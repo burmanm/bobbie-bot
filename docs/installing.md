@@ -550,8 +550,10 @@ path per line, each named `<name>-guidelines.md`, as
 
 - It needs `agent-dir`: the gate fetches into the agent directory's
   `knowledge/`, so it travels to the review job with it.
-- Give the review step the same `knowledge` value; it then passes
-  `--knowledge-dir`.
+- Give the review step the same `knowledge` value; it then moves
+  `knowledge/` out of the agent directory to a read-only mount of its own
+  and passes that as `--knowledge-dir`. The agent directory must stay
+  outside every read root, so the review refuses knowledge inside it (F-7).
 - Without a SHA it is that repository's default branch head when the gate
   runs. Whoever can push there changes what the bot is told; it is prompt
   text, never code.

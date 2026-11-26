@@ -64,8 +64,9 @@ inputs:
       (AGENTS.md, REVIEW.md, .review/) from another repository instead of the
       base branch: owner/name[@<40-hex SHA>]:<directory>. Without a SHA, that
       repository's default branch head at the time of the gate. Needs
-      agent-dir: the gate fetches it into the agent directory's knowledge/,
-      and the review passes --knowledge-dir. Prompt text only, never code.
+      agent-dir: the gate fetches it into the agent directory's knowledge/;
+      the review moves it out of the agent directory to its own read-only
+      mount and passes --knowledge-dir. Prompt text only, never code.
     default: ""
   knowledge-guidelines:
     description: >-

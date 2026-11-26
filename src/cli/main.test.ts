@@ -151,6 +151,25 @@ test("--agent-dir (F-7): settings reach the run; a broken settings.json is a con
   assert.match(missing.out.stderr, /cannot read/);
 });
 
+test("--agent-dir with --knowledge-dir (F-7, A-5): knowledge beside the agent directory runs; knowledge inside it is refused", async () => {
+  const { cpSync, mkdirSync, writeFileSync } = await import("node:fs");
+  const agent = join(work, "agent-knowledge", "agent");
+  mkdirSync(agent, { recursive: true });
+  writeFileSync(join(agent, "settings.json"), "{}");
+  const base = ["review", "--dry-run", "--fixture", FIXTURE, "--script", join(FIXTURE, "script.json"), "--no-modcache", "--runs-dir", join(work, "runs"), "--quiet", "--agent-dir", agent];
+  const knowledge = join(work, "agent-knowledge", "knowledge");
+  cpSync(join(FIXTURE, "base"), knowledge, { recursive: true });
+  const ok = io();
+  assert.equal(await main([...base, "--knowledge-dir", knowledge], ok.io), 0, ok.out.stderr);
+
+  // The action's layout before the fix: knowledge/ inside the agent directory.
+  const inside = join(agent, "knowledge");
+  cpSync(knowledge, inside, { recursive: true });
+  const refused = io();
+  assert.equal(await main([...base, "--knowledge-dir", inside], refused.io), 1);
+  assert.match(refused.out.stderr, /configuration error: the agent directory resolves to .*, which overlaps the read root .*knowledge \(F-7\)/);
+});
+
 test("pi's thinking levels, the run-timeout ceiling, and help text that no longer says the YAML overrides", async () => {
   const base = ["review", "--dry-run", "--fixture", FIXTURE, "--script", join(FIXTURE, "script.json"), "--no-modcache", "--runs-dir", join(work, "runs"), "--quiet"];
   const ok = io();

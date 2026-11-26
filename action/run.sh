@@ -113,7 +113,8 @@ use_installed_agent_dir() {
 # owner/name[@<40-hex SHA>]:<directory>; without a SHA, that repository's
 # default branch head. Never the PR (D-19). It is prompt text, not code. The
 # gate fetches it into the agent directory's knowledge/, so it travels to
-# the review job with that directory.
+# the review job with that directory; the review job moves it out to its own
+# read-only mount, /knowledge, outside /agent (F-7).
 knowledge="${RB_KNOWLEDGE:-}"
 knowledge_repo="" knowledge_ref="" knowledge_path=""
 if [[ -n "$knowledge" ]]; then
@@ -310,7 +311,14 @@ case "$cmd" in
     installed="$work/agent-installed/agent"
     if [[ -n "$knowledge" ]]; then
       [[ -d "$installed/knowledge" && ! -L "$installed/knowledge" ]] || fail "knowledge is set but the agent directory has no knowledge/ (the gate fetches it)"
-      args+=(--knowledge-dir /agent/knowledge)
+      # The knowledge is a read root (prompt text) and the agent directory
+      # must stay outside every read root (F-7, C-3a): move it out of the
+      # unpacked agent directory to a sibling and mount that on its own, so
+      # nothing in /agent is knowledge and no package can load from it.
+      rm -rf "$work/knowledge"
+      mv "$installed/knowledge" "$work/knowledge"
+      docker_args+=(-v "$work/knowledge:/knowledge:ro")
+      args+=(--knowledge-dir /knowledge)
     fi
     if [[ -n "$acp_config" ]]; then
       [[ -f "$installed/$acp_config" && ! -L "$installed/$acp_config" ]] || fail "acp-config is set but the agent directory has no file $acp_config"
