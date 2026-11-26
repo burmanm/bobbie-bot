@@ -123,7 +123,7 @@ describe("unpack-agent-dir: the setup job's archive in the review job (F-7, C-4,
     return file;
   }
 
-  test("extracts packages, hidden files and symlinks read-only; nothing executable", async () => {
+  test("extracts packages, hidden files and symlinks read-only; a package's executable stays executable, nothing else is", async () => {
     const file = archive((agent) => {
       writeFileSync(join(agent, "settings.json"), '{"packages":["npm:pi-x@1.0.0"]}');
       writeFileSync(join(agent, ".npmrc"), "ignore-scripts=true\n");
@@ -143,7 +143,10 @@ describe("unpack-agent-dir: the setup job's archive in the review job (F-7, C-4,
     assert.equal(readFileSync(join(agent, ".npmrc"), "utf8"), "ignore-scripts=true\n");
     assert.ok(existsSync(join(agent, "git", "example.com", "team", "pi-git", ".git", "HEAD")), "verifyInstalled reads .git/HEAD");
     const cli = join(agent, "npm", "node_modules", "pi-x", "bin", "cli.js");
-    assert.equal(statSync(cli).mode & 0o777, 0o444);
+    // An ACP agent's bundled rg must run (F-7); the operator's packages run in the review anyway.
+    assert.equal(statSync(cli).mode & 0o7777, 0o555);
+    assert.equal(statSync(join(agent, "npm", "node_modules", "pi-x", "package.json")).mode & 0o777, 0o444);
+    assert.equal(statSync(join(agent, "settings.json")).mode & 0o777, 0o444);
     assert.equal(realpathSync(join(agent, "npm", "node_modules", ".bin", "pi-x")), realpathSync(cli));
     assert.match(err.join(""), /agent directory with installed packages: \d+ files, 1 symlinks/);
   });

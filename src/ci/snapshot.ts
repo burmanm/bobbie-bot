@@ -108,7 +108,7 @@ export async function unpackSnapshot(
   dest: string,
   o: Omit<UnpackOptions, "allowedTop"> = {},
 ): Promise<{ manifest: SnapshotManifest; stats: UnpackStats }> {
-  const stats = await unpackTarGz(archive, dest, { ...o, allowedTop: SNAPSHOT_TOP });
+  const stats = await unpackTarGz(archive, dest, { ...o, allowedTop: SNAPSHOT_TOP, keepExecutable: false });
   const manifest = readManifest(dest);
   return { manifest, stats };
 }

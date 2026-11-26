@@ -77,7 +77,7 @@ unset variable leaves the agent directory's `settings.json` in effect (F-7):
 | `REVIEW_BOT_AGENT_DIR` | — | The [agent directory](#the-agent-directory): a directory in this repository, read from the default branch's head |
 | `REVIEW_BOT_AGENT_DIR_REPO` | — | Take `REVIEW_BOT_AGENT_DIR` from another repository at a pinned commit instead: `owner/name@<40-hex SHA>` |
 | `REVIEW_BOT_SETUP_TIMEOUT_MINUTES` | 15 | Time limit of the setup job |
-| `REVIEW_BOT_GO_VERSION` | `stable` | Go used by `go mod download`. Pin it to at least the `go` line of your `go.mod`: with `GOTOOLCHAIN=local` an older Go fails, and the review then runs without a module cache |
+| `REVIEW_BOT_GO_VERSION` | `go.mod` | Go used by `go mod download`. `go.mod`: the `toolchain` line, else the `go` line, of the head commit's `go.mod` in the first `REVIEW_BOT_GO_MODULES` directory (`stable` if it has neither). Or a version such as `1.26.x`. With `GOTOOLCHAIN=local` an older Go than `go.mod` asks for fails, and the review then runs without a module cache |
 | `REVIEW_BOT_GO_MODULES` | `.` | Directories with a `go.mod`, space-separated |
 | `REVIEW_BOT_APP_ID` | — | Set it to use the GitHub App identity |
 | `REVIEW_BOT_RECORD_RETENTION_DAYS` | 90 | Retention of the run-record artifact |
@@ -521,9 +521,11 @@ in the action too:
   the agent directory's `package.json` and lockfile. The setup job installs
   it with lifecycle scripts off, in a job with no secret and no token
   permission. It is not loaded as a pi package unless `packages` lists it.
-  Files the review job unpacks are never executable (C-4), so start a
-  JavaScript agent with `node` and expect any native helper it ships to
-  fail.
+  Binaries its packages ship prebuilt, such as `@vscode/ripgrep`'s `rg`,
+  stay executable in the agent directory (owner-executable files become
+  read-only 0555, never setuid); install scripts never run, so a helper an
+  install script would download is missing. The snapshot's files are never
+  executable.
 - **Define it in a file in the agent directory** and name that file with
   the action's `acp-config` input. The review passes it as `--acp-config
   /agent/<file>`, so the agent's paths start at `/agent`, for example

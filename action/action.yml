@@ -151,8 +151,12 @@ inputs:
     description: "complete-check: how the review step ended (steps.<id>.outcome)"
     default: ""
   go-version:
-    description: Go toolchain for the prepare job's go mod download (pin it to match the repository's go.mod)
-    default: stable
+    description: >-
+      Go toolchain for the prepare job's go mod download. "go.mod" (the
+      default): the toolchain line, else the go line, of the head commit's
+      go.mod in the first go-modules directory; "stable" when it has none.
+      Otherwise a version actions/setup-go accepts.
+    default: go.mod
   go-modules:
     description: Directories in the head tree with a go.mod, space-separated
     default: "."
@@ -199,11 +203,22 @@ runs:
   using: composite
   steps:
     # ---- prepare: no secrets, no container -----------------------------
+    - name: Go version from go.mod
+      id: go-version
+      if: inputs.command == 'prepare'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        RB_REPO: ${{ inputs.repo }}
+        RB_HEAD_SHA: ${{ inputs.head-sha }}
+        RB_GO_VERSION: ${{ inputs.go-version }}
+        RB_GO_MODULES: ${{ inputs.go-modules }}
+      run: '"$GITHUB_ACTION_PATH/go-version.sh"'
     - name: Set up Go
       if: inputs.command == 'prepare'
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
-        go-version: ${{ inputs.go-version }}
+        go-version: ${{ steps.go-version.outputs.version }}
         # C-4: a pull_request_target job must not write the base branch's cache scope.
         cache: false
     - name: Prepare snapshots

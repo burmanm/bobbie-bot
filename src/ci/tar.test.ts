@@ -22,12 +22,14 @@ interface Entry {
   pax?: boolean;
   /** Emit a GNU 'L' long-name header. */
   gnuLong?: boolean;
+  /** Octal mode field, default 0000644. */
+  mode?: string;
 }
 
-function header(name: string, type: string, size: number, link = ""): Buffer {
+function header(name: string, type: string, size: number, link = "", mode = "0000644"): Buffer {
   const h = Buffer.alloc(512);
   h.write(name.slice(0, 100), 0, "utf8");
-  h.write("0000644\0", 100);
+  h.write(`${mode}\0`, 100);
   h.write("0000000\0", 108);
   h.write("0000000\0", 116);
   h.write(size.toString(8).padStart(11, "0") + "\0", 124);
@@ -67,7 +69,7 @@ function tarGz(entries: Entry[]): string {
       parts.push(header("././@LongLink", "L", ln.length), pad(ln));
     }
     const type = e.type ?? "0";
-    parts.push(header(e.pax || e.gnuLong ? "short-name-ignored" : e.name, type, type === "0" ? data.length : 0, e.link ?? ""));
+    parts.push(header(e.pax || e.gnuLong ? "short-name-ignored" : e.name, type, type === "0" ? data.length : 0, e.link ?? "", e.mode));
     if (type === "0") parts.push(pad(data));
   }
   parts.push(Buffer.alloc(1024));
@@ -182,4 +184,24 @@ test("safeSegments normalizes ./ and empty segments", () => {
   assert.deepEqual(safeSegments("./head//a/./b"), ["head", "a", "b"]);
   assert.deepEqual(safeSegments("./"), []);
   assert.throws(() => safeSegments("head/a\0b"), /NUL/);
+});
+
+test("keepExecutable (agent directory only): an owner-executable file is created 0555; otherwise every file is 0444", async () => {
+  const entries: Entry[] = [
+    { name: "agent/bin/rg", data: "#!/bin/sh\n", mode: "0000755" },
+    { name: "agent/bin/setuid", data: "x", mode: "0004755" },
+    { name: "agent/bin/group-only", data: "x", mode: "0000654" },
+    { name: "agent/lib.js", data: "x", mode: "0000644" },
+  ];
+  const kept = fresh();
+  await unpackTarGz(tarGz(entries), kept, { allowedTop: ["agent"], keepExecutable: true });
+  const mode = (dir: string, p: string) => statSync(join(dir, p)).mode & 0o7777;
+  assert.equal(mode(kept, "agent/bin/rg"), 0o555);
+  assert.equal(mode(kept, "agent/bin/setuid"), 0o555, "never setuid");
+  assert.equal(mode(kept, "agent/bin/group-only"), 0o444);
+  assert.equal(mode(kept, "agent/lib.js"), 0o444);
+
+  const plain = fresh();
+  await unpackTarGz(tarGz(entries), plain, { allowedTop: ["agent"] });
+  for (const p of ["agent/bin/rg", "agent/bin/setuid", "agent/lib.js"]) assert.equal(mode(plain, p), 0o444, p);
 });

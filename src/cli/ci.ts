@@ -295,8 +295,10 @@ export async function runCi(command: CiCommand, argv: string[], io: Io, deps: Ci
         if (!(gb > 0)) throw new UsageError(`invalid --max-gb: ${a["max-gb"]}`);
         const dest = resolve(a.dest);
         // Same rules as the snapshot: no hard links or devices, no `..`, nothing
-        // written through a symlink, files read-only and never executable.
-        const stats = await unpackTarGz(resolve(a.archive), dest, { allowedTop: [AGENT_ARCHIVE_TOP], maxBytes: gb * 1024 ** 3 });
+        // written through a symlink, files read-only. Unlike the snapshot, a
+        // file the setup job installed as executable stays executable: these
+        // are the operator's packages, which run in the review anyway (F-7).
+        const stats = await unpackTarGz(resolve(a.archive), dest, { allowedTop: [AGENT_ARCHIVE_TOP], maxBytes: gb * 1024 ** 3, keepExecutable: true });
         if (!existsSync(join(dest, AGENT_ARCHIVE_TOP))) throw new Error(`the agent directory archive has no ${AGENT_ARCHIVE_TOP}/ directory`);
         log(`agent directory with installed packages: ${stats.files} files, ${stats.symlinks} symlinks, ${(stats.bytes / 1024 ** 2).toFixed(1)} MiB`);
         return 0;

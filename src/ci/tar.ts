@@ -17,7 +17,9 @@
  *   are data; the agent's guard resolves them and rejects anything outside
  *   the snapshot roots (C-3).
  * - Files are created read-only (0444), never executable; modes, owners and
- *   times in the archive are ignored.
+ *   times in the archive are ignored. The one exception is `keepExecutable`,
+ *   for the operator's agent directory only (F-7): a file the archive marks
+ *   executable by its owner is created 0555. Never for the snapshot.
  * - Total size and member count are capped.
  *
  * Understands ustar, POSIX pax (`x` headers for long paths and sizes; `g`
@@ -35,6 +37,13 @@ export interface UnpackOptions {
   maxBytes?: number;
   /** Cap on the number of members. Default 2 million. */
   maxEntries?: number;
+  /**
+   * Create a file whose archive mode has the owner execute bit as 0555
+   * instead of 0444. Only for the operator's agent directory, whose packages
+   * already run in the review (F-7): a package's bundled binary, such as an
+   * ACP agent's `rg`, must be able to run. Never for PR content. Default off.
+   */
+  keepExecutable?: boolean;
 }
 
 export interface UnpackStats {
@@ -262,7 +271,8 @@ export async function unpackTarGz(archive: string, dest: string, o: UnpackOption
       stats.bytes += size;
       if (stats.bytes > maxBytes) throw new UnsafeArchiveError(`archive expands to more than ${maxBytes} bytes`);
       stats.dirs += ensureDirs(dest, segs.slice(0, -1));
-      const fd = openSync(target, "wx", 0o444);
+      const executable = o.keepExecutable === true && (parseNumber(h.subarray(100, 108)) & 0o100) !== 0;
+      const fd = openSync(target, "wx", executable ? 0o555 : 0o444);
       try {
         await reader.pipe(size, (chunk) => {
           let off = 0;

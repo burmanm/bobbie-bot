@@ -209,7 +209,7 @@ jobs:
           pr: ${{ needs.gate.outputs.pr }}
           base-sha: ${{ needs.gate.outputs.base-sha }}
           head-sha: ${{ needs.gate.outputs.head-sha }}
-          go-version: ${{ vars.REVIEW_BOT_GO_VERSION || 'stable' }}
+          go-version: ${{ vars.REVIEW_BOT_GO_VERSION || 'go.mod' }}
           go-modules: ${{ vars.REVIEW_BOT_GO_MODULES || '.' }}
       - name: Upload the snapshot
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
