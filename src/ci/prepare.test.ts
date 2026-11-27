@@ -14,6 +14,7 @@ import { after, test } from "node:test";
 import { main } from "../cli/main.ts";
 import { assertInert } from "../core/markdown-testing.ts";
 import { PreparedSnapshots, unpackSnapshot } from "./snapshot.ts";
+import { runnerCommands } from "./workflow-commands-testing.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PREPARE = join(HERE, "..", "..", "action", "prepare.sh");
@@ -51,6 +52,7 @@ set -euo pipefail
 env | sort > "$HOME/go-env.txt"
 pwd > "$HOME/go-cwd.txt"
 if grep -q EVIL go.mod; then echo 'go: x\`![p](https://evil.example/p?q=1) @org/team <img src=x>' >&2; exit 1; fi
+if grep -q HASH go.mod; then echo 'go: example.com/vendor/##[error]Your token expired@v1: 404' >&2; exit 1; fi
 if grep -q FAIL go.mod; then echo "go: example.com/evil@v0.0.1: reading https://proxy/...: 404 Not Found" >&2; exit 1; fi
 mkdir -p "$GOMODCACHE/example.com/lib@v1.2.3" "$GOMODCACHE/cache/download/example.com/lib/@v"
 echo "package lib" > "$GOMODCACHE/example.com/lib@v1.2.3/lib.go"
@@ -188,4 +190,12 @@ test("the review side only hands out the prepared SHAs, for the prepared PR", as
   await assert.rejects(prepared.extract("head", "f".repeat(40), join(s.dir, "x")), /PR changed after the snapshots were prepared/);
   await prepared.extract("head", PR.headSha, join(s.dir, "y"));
   assert.ok(existsSync(join(s.dir, "y", "go.mod")));
+});
+
+test("H-55: go's error text (from the PR's go.mod) is logged with workflow commands stopped", async () => {
+  const s = setup("hash", (head) => writeFileSync(join(head, "go.mod"), "module example.com/widget\n\n// HASH\n"));
+  const r = await runPrepare(s);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stderr, /vendor\/##\[error\]Your token expired/);
+  assert.deepEqual(runnerCommands(r.stderr), []);
 });
