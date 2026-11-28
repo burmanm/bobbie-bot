@@ -27,6 +27,17 @@ export COPYFILE_DISABLE=1 # no AppleDouble files when run on macOS (tests)
 
 fail() { echo "prepare: $*" >&2; exit 1; }
 log() { echo "prepare: $*" >&2; }
+# Text from the PR (go's errors about its go.mod) is logged with workflow
+# commands stopped under a fresh random token: the runner acts on the legacy
+# `##[name]` anywhere in a line (H-55, C-3; see untrusted() in run.sh).
+log_untrusted() {
+  local token
+  token="rb$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  [[ "$token" =~ ^rb[0-9a-f]{32}$ ]] || fail "no random stop token"
+  echo "::stop-commands::$token" >&2
+  log "$*"
+  echo "::$token::" >&2
+}
 
 [[ "${RB_REPO:-}" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || fail "RB_REPO must be owner/name"
 [[ "${RB_PR:-}" =~ ^[1-9][0-9]*$ ]] || fail "RB_PR must be a PR number"
@@ -109,7 +120,7 @@ if command -v go >/dev/null 2>&1; then
           ${timeout_cmd[@]+"${timeout_cmd[@]}"} go mod download >"$work/go-mod-download.log" 2>&1); then
         modcache_status="failed"
         modcache_detail="go mod download failed in ${dir}: $(tail -n 3 "$work/go-mod-download.log" | tr -d '\000-\037"\\' | cut -c1-300)"
-        log "$modcache_detail"
+        log_untrusted "$modcache_detail"
         break
       fi
     done

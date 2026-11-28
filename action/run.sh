@@ -26,6 +26,25 @@ set -f
 
 image="review-bot-action:local"
 fail() { echo "::error title=review-bot::$*" >&2; exit 2; }
+# The containers print PR and model text (file names, errors, the result
+# JSON), and the runner acts on workflow commands in any step output
+# (H-55, C-3): `::name::` at a line start, the legacy `##[name]` anywhere in
+# a line, on stdout and stderr, with a lone \r also ending a line
+# (actions/runner ActionCommand.TryParse/TryParseV2, ProcessInvoker). So a
+# container's output passes with commands stopped, under a fresh random
+# token the container never sees. Its stdout joins stderr: the runner reads
+# the two streams as separate queues and hands a batch's stderr lines over
+# first, so on one stream the stop, the text and the resume stay in order.
+# For the same reason this script's own commands go to stderr.
+untrusted() {
+  local token status=0
+  token="rb$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+  [[ "$token" =~ ^rb[0-9a-f]{32}$ ]] || { echo "::error title=review-bot::no random stop token" >&2; exit 2; }
+  echo "::stop-commands::$token" >&2
+  "$@" >&2 || status=$?
+  echo "::$token::" >&2
+  return "$status"
+}
 
 # A prebuilt image is only ever named by digest: the digest is the content.
 digest_ref='^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:[0-9]+)?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)+@sha256:[0-9a-f]{64}$'
@@ -100,7 +119,7 @@ use_installed_agent_dir() {
   local in="$work/agent-in" out="$work/agent-installed"
   [[ -f "$in/agent-dir.tar.gz" && ! -L "$in/agent-dir.tar.gz" ]] || fail "agent-dir is set but $in/agent-dir.tar.gz is missing (the setup job makes it; the review job downloads it)"
   rm -rf "$out" && mkdir -p "$out"
-  docker run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges --read-only \
+  untrusted docker run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges --read-only \
     --tmpfs /tmp:rw,nosuid,nodev,size=64m --user "$(id -u):$(id -g)" -e HOME=/tmp \
     -v "$in:/in:ro" -v "$out:/out" \
     "$image" unpack-agent-dir --archive /in/agent-dir.tar.gz --dest /out
@@ -143,8 +162,8 @@ fetch_knowledge() {
   [[ ! -e "$dest" ]] || fail "the agent directory already has a knowledge/ entry; the knowledge input writes it"
   local k=(--path "$knowledge_path" --dest /agent-out/dir/knowledge --repo "$knowledge_repo")
   [[ -n "$ref" ]] && k+=(--ref "$ref")
-  if ! msg="$(fetch_dir "${k[@]}" 2>&1)"; then echo "$msg" >&2; fail "could not fetch knowledge $knowledge"; fi
-  echo "$msg"
+  if ! msg="$(fetch_dir "${k[@]}" 2>&1)"; then untrusted printf '%s\n' "$msg"; fail "could not fetch knowledge $knowledge"; fi
+  untrusted printf '%s\n' "$msg"
   if [[ -z "$ref" ]]; then
     [[ "$msg" =~ @([0-9a-f]{40}) ]] || fail "could not tell which commit the knowledge came from"
     ref="${BASH_REMATCH[1]}"
@@ -158,7 +177,7 @@ fetch_knowledge() {
     [[ "$base" =~ ^[A-Za-z0-9._-]+-guidelines\.md$ ]] || fail "a knowledge-guidelines file must be named <name>-guidelines.md: $line"
     n=$((n + 1)) tmp="guidelines-$n"
     rm -rf "${work:?}/agent/$tmp"
-    if ! msg="$(fetch_dir --path "$parent" --dest "/agent-out/$tmp" --repo "$knowledge_repo" --ref "$ref" 2>&1)"; then echo "$msg" >&2; fail "could not fetch $line from $knowledge_repo"; fi
+    if ! msg="$(fetch_dir --path "$parent" --dest "/agent-out/$tmp" --repo "$knowledge_repo" --ref "$ref" 2>&1)"; then untrusted printf '%s\n' "$msg"; fail "could not fetch $line from $knowledge_repo"; fi
     [[ -f "$work/agent/$tmp/$base" && ! -L "$work/agent/$tmp/$base" ]] || fail "$knowledge_repo@$ref has no file $line"
     mkdir -p "$dest/.review"
     [[ ! -e "$dest/.review/$base" ]] || fail "knowledge already has .review/$base"
@@ -203,7 +222,7 @@ case "$cmd" in
         fetch+=(--repo "${BASH_REMATCH[1]}" --ref "${BASH_REMATCH[2]}")
       fi
       rm -rf "$work/agent" && mkdir -p "$work/agent"
-      fetch_dir "${fetch[@]:1}"
+      untrusted fetch_dir "${fetch[@]:1}"
       if [[ -n "$knowledge" ]]; then fetch_knowledge; fi
     fi
     # Label and lifetime only when given: unset inputs leave settings.json's (F-7).
@@ -230,7 +249,7 @@ case "$cmd" in
       args+=(--ci-timeout "$RB_CI_TIMEOUT")
     fi
     if [[ "${RB_IGNORE_CI:-}" == true && "${GITHUB_EVENT_NAME:-}" == workflow_dispatch ]]; then args+=(--ignore-ci); fi
-    docker "${docker_args[@]}" "$image" "${args[@]}"
+    untrusted docker "${docker_args[@]}" "$image" "${args[@]}"
     # Pass on only well-formed outputs.
     while IFS= read -r line; do
       if [[ "$line" =~ ^[a-z-]+= && "$line" != *$'\r'* ]]; then echo "$line" >> "${GITHUB_OUTPUT:?}"; else fail "unexpected gate output line"; fi
@@ -249,13 +268,13 @@ case "$cmd" in
     [[ -d "$agent_dir" && ! -L "$agent_dir" ]] || fail "agent-dir is set but $agent_dir is missing (the gate job fetches it; the setup job downloads it)"
     out="$work/agent-out"
     rm -rf "$out" && mkdir -p "$out"
-    docker run --rm --init --cap-drop ALL --security-opt no-new-privileges --read-only \
+    untrusted docker run --rm --init --cap-drop ALL --security-opt no-new-privileges --read-only \
       --tmpfs /tmp:rw,nosuid,nodev,size=2g --pids-limit 1024 --user "$(id -u):$(id -g)" -e HOME=/tmp \
       -v "$agent_dir:/agent" \
       "$image" setup --agent-dir /agent --read-root /snapshot --read-root /runs
     # Pack it for the review job without network. Hard links become files
     # (the review job's extractor refuses them); symlinks stay symlinks.
-    docker run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges --read-only \
+    untrusted docker run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges --read-only \
       --tmpfs /tmp:rw,nosuid,nodev,size=64m --user "$(id -u):$(id -g)" -e HOME=/tmp \
       -v "$agent_dir:/in/agent:ro" -v "$out:/out" --entrypoint tar \
       "$image" --create --gzip --file /out/agent-dir.tar.gz --hard-dereference --numeric-owner --owner=0 --group=0 --directory /in agent
@@ -266,13 +285,13 @@ case "$cmd" in
     outcome="${RB_OUTCOME:-}"
     [[ -z "$outcome" || "$outcome" =~ ^(success|failure|cancelled|skipped)$ ]] || fail "invalid outcome: $outcome"
     docker_args+=(-e GH_TOKEN)
-    docker "${docker_args[@]}" "$image" complete-check --repo "$repo" --name "$name" --head-sha "$RB_HEAD_SHA" --outcome "$outcome"
+    untrusted docker "${docker_args[@]}" "$image" complete-check --repo "$repo" --name "$name" --head-sha "$RB_HEAD_SHA" --outcome "$outcome"
     ;;
 
   remove-label)
     need_pr "${RB_PR:-}"
     docker_args+=(-e GH_TOKEN)
-    docker "${docker_args[@]}" "$image" remove-label --repo "$repo" --pr "$RB_PR" --label "${RB_AUTH_LABEL:-ai-review/approved}"
+    untrusted docker "${docker_args[@]}" "$image" remove-label --repo "$repo" --pr "$RB_PR" --label "${RB_AUTH_LABEL:-ai-review/approved}"
     ;;
 
   review)
@@ -281,7 +300,7 @@ case "$cmd" in
     [[ -f "$archive" ]] || fail "no snapshot archive at $archive (the prepare job did not produce one)"
     # 1. Extract the artifact with the validating extractor. No tokens, no keys.
     rm -rf "$work/snapshot" && mkdir -p "$work/snapshot" "$work/runs"
-    docker run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges --read-only \
+    untrusted docker run --rm --init --network none --cap-drop ALL --security-opt no-new-privileges --read-only \
       --tmpfs /tmp:rw,nosuid,nodev,size=64m --user "$(id -u):$(id -g)" -e HOME=/tmp \
       -v "$work/in:/in:ro" -v "$work/snapshot:/snapshot" \
       "$image" unpack-snapshot --archive /in/snapshot.tar.gz --dest /snapshot
@@ -329,7 +348,7 @@ case "$cmd" in
     for var in ${provider_env//,/ }; do
       [[ "$var" =~ ^[A-Z_][A-Z0-9_]*$ ]] || fail "invalid provider-env name: $var"
       [[ "$var" =~ ^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_.*|ACTIONS_.*|RUNNER_.*)$ ]] && fail "provider-env cannot pass $var"
-      if [[ -n "${!var:-}" ]]; then docker_args+=(-e "$var"); else echo "::warning title=review-bot::$var is not set"; fi
+      if [[ -n "${!var:-}" ]]; then docker_args+=(-e "$var"); else echo "::warning title=review-bot::$var is not set" >&2; fi
     done
 
     # The step's own limit, a minute inside the workflow's timeout-minutes so
@@ -348,14 +367,14 @@ case "$cmd" in
     container="review-bot-$$-${GITHUB_RUN_ID:-local}"
     docker_args+=(--name "$container")
     set +e
-    timeout --signal=TERM --kill-after=45 "$seconds" docker "${docker_args[@]}" "$image" "${args[@]}"
+    untrusted timeout --signal=TERM --kill-after=45 "$seconds" docker "${docker_args[@]}" "$image" "${args[@]}"
     status=$?
     set -e
     docker rm -f "$container" >/dev/null 2>&1 || true
     case "$status" in
       0) ;;
-      1) echo "::warning title=review-bot::the review could not complete; ai-review/$name is neutral (see the log and the run record artifact)" ;;
-      124|137) echo "::error title=review-bot::the review hit its ${minutes}-minute limit"; exit 1 ;;
+      1) echo "::warning title=review-bot::the review could not complete; ai-review/$name is neutral (see the log and the run record artifact)" >&2 ;;
+      124|137) echo "::error title=review-bot::the review hit its ${minutes}-minute limit" >&2; exit 1 ;;
       *) exit "$status" ;;
     esac
     ;;

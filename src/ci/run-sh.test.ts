@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { after, test } from "node:test";
+import { runnerCommands } from "./workflow-commands-testing.ts";
 
 const ACTION = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "action");
 const work = realpathSync(mkdtempSync(join(tmpdir(), "review-bot-runsh-")));
@@ -19,6 +20,8 @@ const FAKE_DOCKER = `#!/usr/bin/env bash
 (IFS=$'\\t'; echo "$*") >> "$FAKE_LOG"
 [[ "$1" == image ]] && exit "\${FAKE_IMAGE_MISSING:-0}"
 [[ "$1" == rm ]] && exit 0
+# What a container prints: PR and model text (H-55).
+if [[ "$1" == run ]]; then printf '%s' "\${FAKE_STDOUT:-}"; printf '%s' "\${FAKE_STDERR:-}" >&2; fi
 prev=""
 for a in "$@"; do
   if [[ "$prev" == -v && "$a" == *:/github/out ]]; then
@@ -67,7 +70,7 @@ function setup() {
   return { dir, bin, log: join(dir, "docker.log") };
 }
 
-function run(s: ReturnType<typeof setup>, env: Record<string, string>, mode = "run", actionDir = ACTION): Promise<{ code: number; stderr: string; calls: string[][] }> {
+function run(s: ReturnType<typeof setup>, env: Record<string, string>, mode = "run", actionDir = ACTION): Promise<{ code: number; stderr: string; out: string; err: string; calls: string[][] }> {
   return new Promise((done) => {
     execFile(
       "bash",
@@ -94,8 +97,8 @@ function run(s: ReturnType<typeof setup>, env: Record<string, string>, mode = "r
         } catch {
           calls = [];
         }
-        // Workflow commands (::warning::) go to stdout; both streams are the step log.
-        done({ code: error ? ((error as { code?: number }).code ?? 1) : 0, stderr: `${String(stdout)}${String(stderr)}`, calls });
+        // Both streams are the step log; `out` and `err` keep them apart (H-55).
+        done({ code: error ? ((error as { code?: number }).code ?? 1) : 0, stderr: `${String(stdout)}${String(stderr)}`, out: String(stdout), err: String(stderr), calls });
       },
     );
   });
@@ -427,4 +430,73 @@ test("knowledge (pilot prototype): the gate fetches it and the guidelines into t
   const noAcp = await run(mk(), { RB_COMMAND: "review", RB_PR: "5", RB_AGENT_DIR: "a", RB_ACP_CONFIG: "acp.json" });
   assert.equal(noAcp.code, 2);
   assert.match(noAcp.stderr, /no file acp\.json/);
+});
+
+// H-55: PR and model text in a container's output. The deps-only skip
+// reason names files; a newline in a logged error starts a line; a lone \r
+// splits a line for the runner; the result JSON goes to stdout.
+const HOSTILE_ERR = [
+  "[review-bot] S-1 skipped (deps-only): only dependency files changed (vendor/##[error]Your token expired)",
+  "[review-bot] review failed: boom",
+  "::error title=Security::Re-authenticate at evil.example",
+  "x\r::warning::split at a carriage return",
+  "##[add-mask]nothing",
+  "",
+].join("\n");
+const HOSTILE_OUT = `{"reason":"##[set-output name=review;]true"}\n::set-output name=head-sha::${"b".repeat(40)}\n`;
+
+test("H-55: nothing a container prints is a workflow command; the script's own commands still work", async () => {
+  const s = setup();
+  mkdirSync(join(s.dir, "review-bot", "in"), { recursive: true });
+  writeFileSync(join(s.dir, "review-bot", "in", "snapshot.tar.gz"), "");
+  // Exit 1: run.sh then prints its own ::warning:: after the container.
+  const r = await run(s, { RB_COMMAND: "review", RB_PR: "5", FAKE_EXIT: "1", FAKE_STDOUT: HOSTILE_OUT, FAKE_STDERR: HOSTILE_ERR, OPENROUTER_API_KEY: "" });
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(runnerCommands(r.out), [], "stdout carries no command");
+  assert.deepEqual(
+    runnerCommands(r.err).map((c) => c.line),
+    ["::warning title=review-bot::OPENROUTER_API_KEY is not set", "::warning title=review-bot::the review could not complete; ai-review/main is neutral (see the log and the run record artifact)"],
+  );
+  // The text is still in the log, between a stop and its resume.
+  assert.match(r.err, /vendor\/##\[error\]Your token expired/);
+  const tokens = [...r.err.matchAll(/^::stop-commands::(.+)$/gm)].map((m) => m[1]!);
+  assert.equal(tokens.length, 2, "unpack and review each stop commands");
+  assert.notEqual(tokens[0], tokens[1], "a new token each time");
+  for (const t of tokens) {
+    assert.match(t, /^rb[0-9a-f]{32}$/);
+    assert.ok(r.err.includes(`\n::${t}::\n`), "and resume");
+  }
+  // The container never learns the token.
+  for (const c of r.calls) assert.ok(!tokens.some((t) => c.join(" ").includes(t)));
+  // A timeout: the script's ::error:: is still carried out.
+  const late = await run(s, { RB_COMMAND: "review", RB_PR: "5", FAKE_EXIT: "124", FAKE_STDERR: HOSTILE_ERR });
+  assert.equal(late.code, 1);
+  assert.deepEqual(runnerCommands(late.err).map((c) => c.name), ["warning", "error"]);
+  assert.match(runnerCommands(late.err)[1]!.line, /hit its 40-minute limit/);
+});
+
+test("H-55: gate, setup, complete-check, remove-label and the knowledge fetch print container text with commands stopped", async () => {
+  const hostile = { FAKE_STDOUT: HOSTILE_OUT, FAKE_STDERR: HOSTILE_ERR };
+  const runs = [
+    await run(setup(), { RB_COMMAND: "gate", RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r:k", RB_KNOWLEDGE_GUIDELINES: "x/y-guidelines.md", FAKE_FETCH_FILES: "y-guidelines.md", ...hostile }),
+    await run(setup(), { RB_COMMAND: "complete-check", RB_HEAD_SHA: "a".repeat(40), RB_OUTCOME: "success", ...hostile }),
+    await run(setup(), { RB_COMMAND: "remove-label", RB_PR: "5", ...hostile }),
+  ];
+  const setupJob = setup();
+  mkdirSync(join(setupJob.dir, "review-bot", "agent", "dir"), { recursive: true });
+  runs.push(await run(setupJob, { RB_COMMAND: "setup", RB_AGENT_DIR: "a", ...hostile }));
+  for (const r of runs) {
+    assert.equal(r.code, 0, r.stderr);
+    assert.deepEqual(runnerCommands(r.out), []);
+    assert.deepEqual(runnerCommands(r.err), []);
+    assert.match(r.err, /vendor\/##\[error\]Your token expired/);
+  }
+  // A failed knowledge fetch: its text is shown, then the script's own ::error::.
+  const failing = setup();
+  writeFileSync(join(failing.bin, "docker"), `#!/usr/bin/env bash\n[[ "$1" == run ]] || exit 0\nmkdir -p "$RUNNER_TEMP/review-bot/agent/dir"\n[[ " $* " == *" --dest /agent-out/dir "* ]] && exit 0\nprintf '%s' "$FAKE_STDERR" >&2\nexit 1\n`);
+  const r = await run(failing, { RB_COMMAND: "gate", RB_AGENT_DIR: "a", RB_KNOWLEDGE: "o/r:k", ...hostile });
+  assert.equal(r.code, 2);
+  assert.deepEqual(runnerCommands(r.out), []);
+  assert.deepEqual(runnerCommands(r.err).map((c) => c.line), ["::error title=review-bot::could not fetch knowledge o/r:k"]);
+  assert.match(r.err, /vendor\/##\[error\]Your token expired/);
 });
