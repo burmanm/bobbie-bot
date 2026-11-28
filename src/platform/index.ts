@@ -24,7 +24,7 @@ export {
   findCheckRun,
   openCheckRun,
 } from "./github-checks.ts";
-export { failureMarker, hasFailureMarker, isOwnFailureComment, isOwnFindingRoot } from "./github-markers.ts";
+export { failureMarker, hasFailureMarker, isOwnFindingRoot, readFailureMarker } from "./github-markers.ts";
 export {
   assertIsolatedLocation,
   CONTEXT_NAMES,

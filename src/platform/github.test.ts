@@ -392,13 +392,44 @@ describe("superseded run (S-9)", () => {
   });
 });
 
+describe("echoed failure markers (S-9, H-50)", () => {
+  const APP: FakeUser = { login: "review-bot[bot]", type: "Bot" };
+  for (const [identity, as] of [["App", APP], ["Actions token", ACTIONS_BOT]] as const) {
+    for (const [source, echo] of [["another App's bot", OTHER_APP], ["another workflow under the Actions login", ACTIONS_BOT]] as const) {
+      test(`${identity}: a comment echoed by ${source} is neither updated nor retired`, async () => {
+        const gh = new FakeGitHub({ as });
+        const echoed = gh.addIssueComment(echo, `Coverage report for the PR description:\n<!-- review-bot:failure bot=${BOT} -->\n<!-- review-bot:failure bot=${BOT} sha=${gh.headSha} -->`);
+        const single = gh.addIssueComment(echo, `Coverage report\n\n<!-- review-bot:failure bot=${BOT} sha=${gh.headSha} -->\n`);
+        const before = [echoed.body, single.body];
+        const { platform } = setup(gh);
+        const pr = await platform.getPullRequest();
+        await platform.startCheck(BOT, pr.headSha);
+        await platform.publish({ threadReplies: [], resolveThreads: [], failureComment: "Automated review could not complete for `bbbbbbb`: boom.\n" });
+        assert.deepEqual([echoed.body, single.body], before, "echoes untouched");
+        assert.equal(gh.issueComments.length, 3, "the bot posts its own comment");
+
+        const next = setup(gh).platform;
+        await next.getPullRequest();
+        await next.publish({ review: review(gh), threadReplies: [], resolveThreads: [] });
+        assert.deepEqual([echoed.body, single.body], before, "echoes not retired");
+        assert.match(gh.issueComments[2]!.body, /The review of `bbbbbbb` completed/, "its own is retired");
+      });
+    }
+  }
+});
+
 describe("failure comment (S-9)", () => {
   test("created once, then updated in place by marker; never someone else's; retired after a completed review", async () => {
     const { gh, platform } = setup();
+    const open = async (p: GitHubPlatform) => {
+      // The pipeline opens the check first; the comment's record goes on it.
+      const pr = await p.getPullRequest();
+      await p.startCheck(BOT, pr.headSha);
+    };
     // A human quoting the marker, and another workflow's comment under the same login.
     gh.addIssueComment(HUMAN, `quote\n<!-- review-bot:failure bot=${BOT} -->`);
     gh.addIssueComment(ACTIONS_BOT, "Deploy preview ready");
-    await platform.getPullRequest();
+    await open(platform);
     const first = await platform.publish({ threadReplies: [], resolveThreads: [], failureComment: "Automated review could not complete for `bbbbbbb`: boom.\n" });
     assert.equal(gh.issueComments.length, 3);
     const mine = gh.issueComments[2]!;
@@ -408,7 +439,7 @@ describe("failure comment (S-9)", () => {
     // Next push, same failure: updated in place, not repeated.
     gh.push("c".repeat(40));
     const second = new GitHubPlatform({ client: setup(gh).client, repo: gh.repo, number: gh.number, botId: BOT });
-    await second.getPullRequest();
+    await open(second);
     const again = await second.publish({ threadReplies: [], resolveThreads: [], failureComment: "Automated review could not complete for `ccccccc`: boom again.\n" });
     assert.deepEqual(again.commentIds, [String(mine.id)]);
     assert.equal(gh.issueComments.length, 3);
@@ -416,12 +447,32 @@ describe("failure comment (S-9)", () => {
 
     // A later completed review updates it so it no longer says the review failed.
     const third = new GitHubPlatform({ client: setup(gh).client, repo: gh.repo, number: gh.number, botId: BOT });
-    await third.getPullRequest();
+    await open(third);
     await third.publish({ review: review(gh), threadReplies: [], resolveThreads: [] });
     assert.equal(gh.issueComments.length, 3);
     assert.match(mine.body, /The review of `ccccccc` completed/);
     assert.ok(hasFailureMarker(mine.body, BOT));
     assert.match(gh.issueComments[0]!.body, /^quote/, "the human's comment is untouched");
+  });
+
+  test("its own comment without a record is left alone; an unreadable record or a retried post never edits or doubles (H-50)", async () => {
+    // An old-format comment of this bot (before records) and one whose head's check runs cannot be read.
+    const gh = new FakeGitHub();
+    const old = gh.addIssueComment(ACTIONS_BOT, `Automated review could not complete.\n\n<!-- review-bot:failure bot=${BOT} -->\n`);
+    const odd = "e".repeat(40);
+    const unreadable = gh.addIssueComment(ACTIONS_BOT, `x\n\n<!-- review-bot:failure bot=${BOT} sha=${odd} -->\n`);
+    gh.faults.push({ method: "GET", path: new RegExp(`/commits/${odd}/check-runs$`), status: 500, times: 99 });
+    // The comment POST reaches GitHub but its answer is lost: found again by its attempt line, not posted twice.
+    gh.faults.push({ method: "POST", path: /\/issues\/7\/comments$/, status: 502, afterEffect: true });
+    const before = [old.body, unreadable.body];
+    const { platform } = setup(gh);
+    const pr = await platform.getPullRequest();
+    await platform.startCheck(BOT, pr.headSha);
+    const r = await platform.publish({ threadReplies: [], resolveThreads: [], failureComment: "Automated review could not complete for `bbbbbbb`: boom.\n" });
+    assert.deepEqual([old.body, unreadable.body], before);
+    assert.equal(gh.issueComments.length, 3);
+    assert.deepEqual(r.commentIds, [String(gh.issueComments[2]!.id)]);
+    assert.equal(gh.checkRuns[0]!.external_id, `review-bot:failure=${gh.issueComments[2]!.id}`);
   });
 
   test("a failure marker inside a code block or for another bot does not count", () => {

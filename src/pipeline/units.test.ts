@@ -206,13 +206,13 @@ describe("prior state from markers (S-1, D-5)", () => {
 });
 
 describe("dedupe against comments by anyone (S-6, I-2 #9)", () => {
-  test("a live finding whose anchor carries someone else's thread is a duplicate", () => {
+  test("a live Nit whose anchor carries someone else's thread is a duplicate", () => {
     const others: PrComment[] = [{ id: "7", kind: "review-comment", author: user, path: "pkg/a.go", line: 5, startLine: 3, body: "hm" }];
     const [hit, miss, outdated] = dedupeAgainstComments(
       [
-        finding({ locations: [{ path: "pkg/a.go", startLine: 4, endLine: 4 }] }),
-        finding({ locations: [{ path: "pkg/a.go", startLine: 6, endLine: 8 }] }),
-        finding({ locations: [{ path: "pkg/b.go", startLine: 4, endLine: 4 }] }),
+        finding({ tag: "nit", locations: [{ path: "pkg/a.go", startLine: 4, endLine: 4 }] }),
+        finding({ tag: "nit", locations: [{ path: "pkg/a.go", startLine: 6, endLine: 8 }] }),
+        finding({ tag: "nit", locations: [{ path: "pkg/b.go", startLine: 4, endLine: 4 }] }),
       ],
       [...others, { id: "8", kind: "review-comment", author: user, path: "pkg/b.go", body: "outdated, no line" }],
     );
@@ -220,6 +220,13 @@ describe("dedupe against comments by anyone (S-6, I-2 #9)", () => {
     assert.match(hit!.statusReason!, /dev in comment 7/);
     assert.equal(miss!.status, "proposed");
     assert.equal(outdated!.status, "proposed");
+  });
+
+  test("an Important or pre-existing finding is never hidden by a comment on its line (H-54)", () => {
+    const others: PrComment[] = [{ id: "7", kind: "review-comment", author: user, path: "pkg/a.go", line: 4, body: "ok" }];
+    const at = [{ path: "pkg/a.go", startLine: 4, endLine: 4 }];
+    const out = dedupeAgainstComments([finding({ tag: "important", locations: at }), finding({ tag: "pre-existing", locations: at })], others);
+    assert.deepEqual(out.map((f) => f.status), ["proposed", "proposed"]);
   });
 });
 

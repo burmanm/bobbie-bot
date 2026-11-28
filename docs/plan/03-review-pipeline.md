@@ -186,7 +186,11 @@ worth it.
   and category.
 - Against existing comments on the PR (I-2 #9):
   - same issue already raised by anyone, thread open or resolved → do not
-    post again;
+    post again. The reviewer sees every comment and judges this. Code adds
+    one mechanical rule: a Nit whose lines already carry someone else's
+    thread is not posted. It never drops an Important finding, because a
+    line comment says nothing about the issue and anyone, the PR author
+    too, can leave one (H-54);
   - this bot's earlier finding, thread still open → re-check it against the
     new head and prepare a **thread reply**: "Verified fixed at `<sha>`"
     with what was checked, or "Still open at `<sha>`" with the remaining
@@ -252,9 +256,11 @@ Performed by code with the write token; no model involved.
   that review's ID; a finding only if it was posted with such a review. Any
   other marker is plain text, also one from before records existed or whose
   check run GitHub has deleted: the next run reviews in full and leaves
-  those threads to people. The "could not complete" comment (S-9) has no
-  record and is found by Bot author and marker alone; it carries no review
-  state.
+  those threads to people. The "could not complete" comment (S-9) is
+  recorded the same way: its marker names the head it was written for, and
+  that head's check run records the comment's ID. The bot edits only a
+  comment so recorded; when the record is missing or cannot be read it
+  posts a new one.
 - **Complete the check run** `ai-review/<name>` with a conclusion and a
   one-line summary. The conclusion reports whether the *review ran*, not
   whether findings exist: `success` (reviewed), `skipped`, or `neutral`

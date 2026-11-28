@@ -23,7 +23,17 @@
  */
 import { completeCheckRun, listCheckRuns, openCheckRun, recordOnCheckRun } from "./github-checks.ts";
 import { type GitHubClient, GitHubApiError, RateLimitError } from "./github-client.ts";
-import { attributeComments, failureMarker, isOwnFailureComment, isOwnFindingRoot, newPostMarker, reviewRecord, stripMarkers } from "./github-markers.ts";
+import {
+  attributeComments,
+  failureCandidate,
+  failureMarker,
+  failureRecord,
+  isOwnFindingRoot,
+  isRecordedBy,
+  newPostMarker,
+  reviewRecord,
+  stripMarkers,
+} from "./github-markers.ts";
 import type {
   Author,
   CheckRunCompletion,
@@ -173,7 +183,7 @@ export class GitHubPlatform implements Platform {
   private checkRunId: number | undefined;
   /** The App this run acts as, from the check run it opened. */
   private app: string | undefined;
-  /** The review this run posted, to record on its check. */
+  /** The review or failure comment this run posted, to record on its check. */
   private posted: { headSha: string; record: string } | undefined;
   private superseded: SupersededError | undefined;
 
@@ -353,6 +363,16 @@ export class GitHubPlatform implements Platform {
       return { commentIds: [] };
     }
 
+    // Found before the review is posted: a re-run that reuses this head's open
+    // check run replaces the failure comment's record with the review's.
+    let earlierFailure: Awaited<ReturnType<GitHubPlatform["findFailureComment"]>>;
+    if (p.review !== undefined && p.failureComment === undefined) {
+      earlierFailure = await this.findFailureComment().catch((e: unknown) => {
+        warn(`earlier failure comment not looked up: ${message(e)}`);
+        return undefined;
+      });
+    }
+
     if (p.review !== undefined) {
       const posted = await this.createReview(p.review, warn);
       ids.push(...posted);
@@ -383,12 +403,12 @@ export class GitHubPlatform implements Platform {
     }
 
     if (p.failureComment !== undefined) {
-      const id = await this.upsertFailureComment(p.failureComment);
+      const id = await this.upsertFailureComment(p.failureComment, warn);
       ids.push(id);
       this.report.failure_comment_id = id;
     } else if (p.review !== undefined) {
       try {
-        await this.retireFailureComment(p.review.commit_id);
+        if (earlierFailure !== undefined) await this.retireFailureComment(p.review.commit_id, earlierFailure);
       } catch (e) {
         warn(`earlier failure comment not updated: ${message(e)}`);
       }
@@ -441,12 +461,16 @@ export class GitHubPlatform implements Platform {
    * Written before anything else can fail, so a re-run posts nothing new (C-1).
    */
   private async recordReview(id: string, headSha: string, warn: (w: string) => void): Promise<void> {
-    this.posted = { headSha, record: reviewRecord(id) };
+    await this.record(headSha, reviewRecord(id), `review ${id}`, warn);
+  }
+
+  private async record(headSha: string, record: string, what: string, warn: (w: string) => void): Promise<void> {
+    this.posted = { headSha, record };
     if (this.checkRunId === undefined) return; // completeCheck writes it
     try {
-      await recordOnCheckRun(this.client, this.repo, this.checkRunId, this.posted.record);
+      await recordOnCheckRun(this.client, this.repo, this.checkRunId, record);
     } catch (e) {
-      warn(`review ${id} not yet recorded on the check run, retried when the check completes: ${message(e)}`);
+      warn(`${what} not yet recorded on the check run, retried when the check completes: ${message(e)}`);
     }
   }
 
@@ -496,35 +520,54 @@ export class GitHubPlatform implements Platform {
 
   // ---- failure comment (S-9) -------------------------------------------------
 
-  private async findFailureComment(): Promise<PrComment | undefined> {
-    const all = await this.client.paginate<IssueCommentJson>(`${this.base}/issues/${this.number}/comments`);
-    const own = all.map(issueCommentOf).filter((c) => isOwnFailureComment(c, this.botId));
-    return own[own.length - 1];
+  /**
+   * This bot's failure comment and the head its marker names: the newest
+   * candidate that the check run on that head records (H-50). A record that
+   * cannot be read counts as none, so the worst case is a second comment,
+   * never an edit of someone else's.
+   */
+  private async findFailureComment(): Promise<{ comment: PrComment; sha: string } | undefined> {
+    const all = (await this.client.paginate<IssueCommentJson>(`${this.base}/issues/${this.number}/comments`)).map(issueCommentOf);
+    for (const c of all.reverse()) {
+      const sha = failureCandidate(c, this.botId);
+      if (sha === undefined) continue;
+      const runs = await listCheckRuns(this.client, this.repo, this.botId, sha).catch((e: unknown) => {
+        this.log(`check runs of ${short(sha)} not read (${message(e)}); comment ${c.id} not taken as the failure comment`);
+        return [];
+      });
+      if (isRecordedBy(runs, c.author.login, failureRecord(c.id), this.app)) return { comment: c, sha };
+    }
+    return undefined;
   }
 
-  private async upsertFailureComment(text: string): Promise<string> {
-    const body = `${text.trimEnd()}\n\n${failureMarker(this.botId)}\n`;
+  private async upsertFailureComment(text: string, warn: (w: string) => void): Promise<string> {
+    const head = (this.pr ?? (await this.getPullRequest())).headSha;
+    const body = `${text.trimEnd()}\n\n${failureMarker(this.botId, head)}\n`;
     const existing = await this.findFailureComment();
+    let id: string;
     if (existing !== undefined) {
-      if (existing.body !== body) await this.client.request("PATCH", `${this.base}/issues/comments/${existing.id}`, { body: { body } });
-      return existing.id;
+      id = existing.comment.id;
+      if (existing.comment.body !== body) await this.client.request("PATCH", `${this.base}/issues/comments/${id}`, { body: { body } });
+    } else {
+      const attempt = newPostMarker();
+      const res = await this.client.request<{ id: number }>("POST", `${this.base}/issues/${this.number}/comments`, {
+        body: { body: `${text.trimEnd()}\n\n${attempt}\n${failureMarker(this.botId, head)}\n` },
+        probe: async () => {
+          const posted = await this.client.paginate<IssueCommentJson>(`${this.base}/issues/${this.number}/comments`);
+          return posted.find((c) => c.user?.type === "Bot" && (c.body ?? "").split(/\r?\n/).some((l) => l.trim() === attempt));
+        },
+      });
+      id = String(res.data.id);
     }
-    const res = await this.client.request<{ id: number }>("POST", `${this.base}/issues/${this.number}/comments`, {
-      body: { body },
-      probe: async () => {
-        const c = await this.findFailureComment();
-        return c === undefined ? undefined : { id: Number(c.id) };
-      },
-    });
-    return String(res.data.id);
+    await this.record(head, failureRecord(id), `failure comment ${id}`, warn);
+    return id;
   }
 
   /** After a completed review, an earlier failure comment no longer tells the truth: update it in place. */
-  private async retireFailureComment(headSha: string): Promise<void> {
-    const existing = await this.findFailureComment();
-    if (existing === undefined) return;
-    const body = `An earlier automated review attempt on this pull request could not complete. The review of \`${short(headSha)}\` completed; see the latest review.\n\n${failureMarker(this.botId)}\n`;
-    if (existing.body !== body) await this.client.request("PATCH", `${this.base}/issues/comments/${existing.id}`, { body: { body } });
+  private async retireFailureComment(headSha: string, existing: { comment: PrComment; sha: string }): Promise<void> {
+    // The marker keeps naming the head whose check run records the comment.
+    const body = `An earlier automated review attempt on this pull request could not complete. The review of \`${short(headSha)}\` completed; see the latest review.\n\n${failureMarker(this.botId, existing.sha)}\n`;
+    if (existing.comment.body !== body) await this.client.request("PATCH", `${this.base}/issues/comments/${existing.comment.id}`, { body: { body } });
   }
 }
 

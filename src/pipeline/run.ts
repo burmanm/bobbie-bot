@@ -1039,14 +1039,17 @@ function recheckPrompt(p: PriorFinding, sinceSha: string | undefined, headSha: s
 }
 
 /**
- * S-6, against comments by anyone else (I-2 #9): a live finding whose anchor
+ * S-6, against comments by anyone else (I-2 #9): a live Nit whose anchor
  * lines carry an existing inline thread by a human or another bot is not
- * posted again. Mechanical and line-based; the reviewer also sees every
- * comment in context.md and is told not to repeat them.
+ * posted again. Mechanical and line-based, so it cannot tell what a comment
+ * says: anyone, the PR author too, can comment on a line. An Important
+ * finding is therefore never dropped this way (H-54, owner, 2026-11-28).
+ * The reviewer also sees every comment in context.md and is told not to
+ * repeat them.
  */
 export function dedupeAgainstComments(findings: readonly Finding[], others: readonly PrComment[]): Finding[] {
   return findings.map((f) => {
-    if (!isLive(f)) return f;
+    if (!isLive(f) || f.tag !== "nit") return f;
     const a = f.locations[0]!;
     const hit = others.find((c) => {
       if (c.path !== a.path || c.line === undefined) return false;

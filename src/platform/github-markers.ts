@@ -15,8 +15,10 @@
  *   review, hides a finding or gets a thread resolved.
  *
  * The "review could not complete" comment (S-9) has its own marker, so it is
- * found and updated in place instead of repeated per push. It is recognised
- * by Bot author and marker alone:
+ * found and updated in place instead of repeated per push. Its marker names
+ * the head it was last written for, and that head's check run records the
+ * comment id (`review-bot:failure=<id>`), so an echoed marker is never taken
+ * for it and another bot's comment is never edited:
  *
  *   <!-- review-bot:failure bot=ai-review/main -->
  *
@@ -75,12 +77,7 @@ export async function attributeComments(
       at = await runsAt(m.sha);
       runs.set(m.sha, at);
     }
-    const recorded = at.some((r) => {
-      const slug = r.app?.slug;
-      if (slug === undefined || (app !== undefined && slug !== app)) return false;
-      return c.author.login === `${slug}[bot]` && r.external_id === reviewRecord(c.id);
-    });
-    if (recorded) reviews.add(c.id);
+    if (isRecordedBy(at, c.author.login, reviewRecord(c.id), app)) reviews.add(c.id);
   }
   return comments.map((c) => {
     if (!isBotAuthor(c) || c.inReplyTo !== undefined) return c;
@@ -98,16 +95,24 @@ export function newPostMarker(): string {
   return `<!-- ${MARKER_PREFIX}:post id=${randomBytes(16).toString("hex")} -->`;
 }
 
-export function failureMarker(botId: string): string {
+/** The failure comment's marker; `sha` is the head it was written for (comments before H-50's fix have none). */
+export function failureMarker(botId: string, sha?: string): string {
   if (!BOT_RE.test(botId)) throw new Error(`invalid bot id: ${botId}`);
-  return `<!-- review-bot:failure bot=${botId} -->`;
+  if (sha !== undefined && !FAILURE_SHA_RE.test(sha)) throw new Error(`invalid head SHA: ${sha}`);
+  return `<!-- review-bot:failure bot=${botId}${sha === undefined ? "" : ` sha=${sha}`} -->`;
 }
 
-/** Whether the body holds exactly this bot's failure marker on its own line, outside code fences. */
-export function hasFailureMarker(body: string, botId: string): boolean {
-  const marker = failureMarker(botId);
+// 40 hex only: GitHub answers 500 to some well-formed 64-hex SHAs, and the bot reads this one back.
+const FAILURE_SHA_RE = /^[0-9a-f]{40}$/;
+
+/**
+ * This bot's failure marker in a body: exactly one, on its own line, outside
+ * code fences. `sha` when it names one.
+ */
+export function readFailureMarker(body: string, botId: string): { sha?: string } | undefined {
+  const re = /^<!-- review-bot:failure bot=(\S+?)(?: sha=([0-9a-f]{40}))? -->$/;
   let fence: string | undefined;
-  let count = 0;
+  const found: Array<{ sha?: string }> = [];
   for (const raw of body.split(/\r?\n/)) {
     const f = /^ {0,3}(`{3,}|~{3,})/.exec(raw);
     if (f) {
@@ -115,14 +120,39 @@ export function hasFailureMarker(body: string, botId: string): boolean {
       else if (f[1]![0] === fence[0] && f[1]!.length >= fence.length) fence = undefined;
       continue;
     }
-    if (fence === undefined && raw.trim() === marker) count++;
+    const m = fence === undefined ? re.exec(raw.trim()) : null;
+    if (m && m[1] === botId) found.push(m[2] === undefined ? {} : { sha: m[2] });
   }
-  return count === 1;
+  return found.length === 1 ? found[0] : undefined;
 }
 
-/** This bot's failure comment: a Bot-authored issue comment with its failure marker. */
-export function isOwnFailureComment(c: PrComment, botId: string): boolean {
-  return c.kind === "issue-comment" && isBotAuthor(c) && hasFailureMarker(c.body, botId);
+/** Whether the body holds exactly one failure marker of this bot. */
+export function hasFailureMarker(body: string, botId: string): boolean {
+  return readFailureMarker(body, botId) !== undefined;
+}
+
+/** `external_id` of the check run of the run that wrote a failure comment. */
+export function failureRecord(commentId: string): string {
+  return `${MARKER_PREFIX}:failure=${commentId}`;
+}
+
+/**
+ * A candidate for this bot's failure comment: a Bot-authored issue comment
+ * whose marker names a head. It is the bot's only if that head's check run
+ * records it (`isRecordedBy`).
+ */
+export function failureCandidate(c: PrComment, botId: string): string | undefined {
+  if (c.kind !== "issue-comment" || !isBotAuthor(c)) return undefined;
+  return readFailureMarker(c.body, botId)?.sha;
+}
+
+/** Whether a check run of the comment's author's App records this value. */
+export function isRecordedBy(runs: readonly RecordingRun[], author: string, record: string, app?: string): boolean {
+  return runs.some((r) => {
+    const slug = r.app?.slug;
+    if (slug === undefined || (app !== undefined && slug !== app)) return false;
+    return author === `${slug}[bot]` && r.external_id === record;
+  });
 }
 
 /** Remove marker lines of any kind (for text moved out of its comment). */

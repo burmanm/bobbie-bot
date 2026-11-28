@@ -317,3 +317,20 @@ describe("state echoed by other bots is not the bot's own (H-50, D-5, C-5)", () 
     });
   }
 });
+
+describe("comments by others do not hide findings by line alone (H-54, S-6, I-2 #9)", () => {
+  const important = (gh: FakeGitHub) => gh.reviewComments.filter((c) => c.user.type === "Bot" && c.body.startsWith("**Important"));
+
+  test("an author's comment on every changed line of a file hides no Important finding", async () => {
+    const base = fakeGitHub();
+    await run(base);
+    const expected = important(base).length;
+    assert.ok(expected > 0);
+
+    const gh = fakeGitHub();
+    for (let line = 1; line <= 60; line++) gh.addThreadRoot({ login: "pr-author", type: "User" }, "ok", STORE, line);
+    const { result } = await run(gh);
+    assert.equal(result.conclusion, "success", result.checkSummary);
+    assert.equal(important(gh).length, expected);
+  });
+});
